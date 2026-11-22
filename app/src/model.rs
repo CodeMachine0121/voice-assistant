@@ -111,6 +111,8 @@ impl SettingsSession {
             self.notice = Some(Notice::Problem(problem.to_string()));
             return;
         }
+        // A word typed but not yet added would otherwise be silently dropped.
+        self.form.add_word();
         let settings = self.form.to_settings();
         match (services.save_settings)(&settings) {
             Ok(()) => {
@@ -258,6 +260,20 @@ mod tests {
     }
 
     #[test]
+    fn saving_keeps_a_word_typed_but_not_yet_added() {
+        let (services, _probe) = test_services();
+        let mut session = SettingsSession::open(&services);
+        session.form.new_word = "Kubernetes".to_string();
+        session.save(&services);
+        assert_eq!(session.notice, Some(Notice::Saved));
+        assert_eq!(
+            services.settings_store.load().dictionary.words(),
+            ["Kubernetes".to_string()]
+        );
+        assert!(session.form.new_word.is_empty());
+    }
+
+    #[test]
     fn a_problem_outcome_also_reloads_history() {
         let (services, probe) = test_services();
         let now = Instant::now();
@@ -355,16 +371,6 @@ mod tests {
         assert!(!services.settings_store.load().cleanup_enabled);
         assert_eq!(probe.engine_settings().len(), 1);
         assert_eq!(probe.applied_settings().len(), 1);
-    }
-
-    #[test]
-    fn save_keeps_a_typed_word_out_of_the_dictionary_until_added() {
-        let (services, _probe) = test_services();
-        let mut session = SettingsSession::open(&services);
-        session.form.new_word = "Kubernetes".into();
-        assert!(session.is_dirty());
-        session.save(&services);
-        assert!(services.settings_store.load().dictionary.is_empty());
     }
 
     #[test]
