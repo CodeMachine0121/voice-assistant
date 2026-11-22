@@ -48,3 +48,20 @@ impl Default for Settings {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_launch_defaults() {
+        let s = Settings::default();
+        assert_eq!(s.push_to_talk, Shortcut::RightOption);
+        assert_eq!(s.hands_free, Shortcut::ControlOptionSpace);
+        assert_eq!(s.assistant_url, "http://localhost:1234/v1");
+        assert_eq!(s.microphone, None, "system default microphone");
+        assert!(s.cleanup_enabled);
+        assert!(s.dictionary.is_empty());
+        assert_eq!(s.speech_model_path, None);
+    }
+}
