@@ -25,6 +25,10 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "target/$profile/voice-assistant" "$app/Contents/MacOS/voice-assistant"
 cp app/Info.plist "$app/Contents/Info.plist"
 
-# An ad-hoc signature gives macOS a stable identity to attach permissions to.
-codesign --force --sign - "$app" >/dev/null
+# Signing identity: set CODESIGN_IDENTITY to a certificate in your keychain (a
+# self-signed "Code Signing" certificate is enough) so macOS keeps the microphone,
+# accessibility and input-monitoring grants across rebuilds. Without one the app is
+# signed ad hoc; that signature is tied to this exact binary, so every rebuild looks
+# like a new app and the permissions must be granted again.
+codesign --force --sign "${CODESIGN_IDENTITY:--}" "$app" >/dev/null
 echo "Built $app"
