@@ -95,3 +95,4 @@ fabric.properties
 /target/
 **/*.rs.bk
 .DS_Store
+.make.local
