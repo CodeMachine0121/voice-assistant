@@ -195,3 +195,23 @@ service/account/sync, or non-Mac platform).
   - **AC-21:** likely shows "No speech heard" instead of the microphone message on real macOS.
   - **BR-6:** non-text clipboard content is erased.
   - **AC-30:** the defaults are not pinned by any test.
+
+---
+
+## Resolution of findings (follow-up pass)
+
+| Clause | Finding | Resolution |
+|---|---|---|
+| AC-21 | A denied microphone records silence on macOS, so "No speech heard" was shown | **Fixed.** Recording now checks the system microphone permission before opening the device, and asks macOS on first use. Tests cover denied, not-asked and granted. |
+| BR-6 | Only text clipboard contents were restored | **Fixed.** The full pasteboard (every item and type) is snapshotted and restored, and the restore is skipped if something else wrote to the clipboard meanwhile. |
+| NFR-4 | Bundle declared macOS 12 | **Fixed.** Minimum is now macOS 13, arm64 only, and the bundle script refuses other hosts. |
+| NFR-2 | Listening was published only after the microphone opened | **Fixed.** Listening is shown immediately. A test with a slow microphone asserts the indicator appears in under 100 ms. |
+| AC-30 | Defaults test compared against itself | **Fixed.** A test now pins right Option, Control+Option+Space, the LM Studio address, the system microphone, cleanup on and an empty dictionary. |
+| AC-19 (risk) | An answer that stalled after its headers was treated as invalid (status Done) | **Fixed.** I/O errors while reading the body now count as unreachable. |
+| AC-12 / BR-3 (risk) | A dictated `</transcript>` could end the data block | **Fixed.** Tag-like text is neutralised. Few-shot examples no longer reuse the acceptance sentences, and now cover mixed Chinese/English and lists. |
+| AC-8–11, 14, 15 | What the model actually outputs cannot be verified statically | **Accepted limit.** Prompt rules, data wrapping, dictionary and fallbacks are tested. Output quality must be checked manually with the user's chosen model. |
+| AC-6 | No end-to-end test of a 5-minute dictation | **Accepted.** The automatic stop is tested. Whisper handles long audio in 30 s windows, which is a quality concern, not a contract breach. |
+| AC-27 | Copy button has no test | **Accepted.** One-line egui call (`ctx.copy_text`), covered by manual check. |
+| AC-2 | Press length is timed when the engine receives the event | **Accepted.** Channel latency is sub-millisecond, so a port change isn't justified. |
+| NFR-1, NFR-3, NFR-5 | No automated latency / network-destination tests | **Accepted.** Verified by reading the code; latency depends on the user's model and hardware. |
+| Orphans | Model list, demo mode, extra shortcuts, etc. | **Kept.** The model list only shows what LM Studio has already loaded, so it does not choose or download models for the user. The others are supporting behaviour. |
