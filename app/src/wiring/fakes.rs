@@ -247,7 +247,9 @@ pub fn fake_permissions() -> Permissions {
     let accessibility = Arc::new(AtomicBool::new(false));
     let granted = accessibility.clone();
     Permissions {
-        microphone_granted: Arc::new(|| true),
+        microphone_granted: Arc::new(|| Some(true)),
+        request_microphone: Arc::new(|| log::info!("fake: would ask for the microphone")),
+        shortcuts_listening: Arc::new(|| true),
         accessibility_granted: Arc::new(move || granted.load(Ordering::SeqCst)),
         prompt_accessibility: Arc::new(move || accessibility.store(true, Ordering::SeqCst)),
         open_privacy_settings: Arc::new(|pane: PrivacyPane| {
@@ -494,7 +496,7 @@ mod tests {
     #[test]
     fn fake_permissions_flip_after_prompt() {
         let p = fake_permissions();
-        assert!((p.microphone_granted)());
+        assert_eq!((p.microphone_granted)(), Some(true));
         assert!(!(p.accessibility_granted)());
         (p.prompt_accessibility)();
         assert!((p.accessibility_granted)());

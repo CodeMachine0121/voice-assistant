@@ -1,13 +1,13 @@
 //! The Settings window.
 use crate::model::{Notice, SettingsSession};
-use crate::permissions_view;
+use crate::permissions_view::{self, Access};
 use crate::shortcut_names::{friendly_name, ALL_SHORTCUTS};
 use crate::wiring::Services;
 use eframe::egui::{
     self, Color32, ComboBox, Grid, ProgressBar, RichText, ScrollArea, TextEdit, ViewportBuilder,
     ViewportCommand, ViewportId,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub fn id() -> ViewportId {
     ViewportId::from_hash_of("settings")
@@ -48,7 +48,7 @@ fn draw(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
             });
             section(ui, "Dictionary", |ui| dictionary(ui, session));
             section(ui, "Speech model", |ui| speech_model(ui, session, services));
-            section(ui, "Permissions", |ui| permissions(ui, services));
+            section(ui, "Permissions", |ui| permissions(ui, session, services));
         });
 }
 
@@ -225,23 +225,27 @@ fn speech_model(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Ser
     }
 }
 
-fn permissions(ui: &mut egui::Ui, services: &Services) {
+fn permissions(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
+    let rows = session
+        .permissions
+        .current(&services.permissions, Instant::now())
+        .to_vec();
     Grid::new("permissions")
         .num_columns(3)
         .spacing([16.0, 8.0])
         .show(ui, |ui| {
-            for row in permissions_view::rows(&services.permissions) {
+            for row in rows {
                 ui.vertical(|ui| {
                     ui.label(row.name);
                     ui.label(RichText::new(row.why).weak().small());
                 });
-                let colour = match row.granted {
-                    Some(true) => Color32::from_rgb(52, 199, 89),
-                    Some(false) => Color32::from_rgb(255, 99, 88),
-                    None => ui.visuals().weak_text_color(),
+                let colour = match row.access {
+                    Access::Granted => Color32::from_rgb(52, 199, 89),
+                    Access::Denied => Color32::from_rgb(255, 99, 88),
+                    Access::NotAsked | Access::Unknown => ui.visuals().weak_text_color(),
                 };
                 ui.colored_label(colour, row.status_text());
-                if ui.button("Open System Settings").clicked() {
+                if ui.button(row.button_text()).clicked() {
                     permissions_view::open_settings(&services.permissions, &row);
                 }
                 ui.end_row();

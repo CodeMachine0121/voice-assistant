@@ -1,6 +1,7 @@
 //! State of the running app, apart from how it is drawn.
 use crate::actions::save_settings;
 use crate::indicator::IndicatorState;
+use crate::permissions_view::PermissionSnapshot;
 use crate::settings_form::SettingsForm;
 use crate::tasks::{
     download_target, spawn_download, spawn_list_models, ModelsState, TaskEvent, TaskState,
@@ -25,6 +26,8 @@ pub struct SettingsSession {
     pub devices: Vec<String>,
     pub tasks: TaskState,
     pub notice: Option<Notice>,
+    /// What macOS allows, re-read while the window is open.
+    pub permissions: PermissionSnapshot,
     events_tx: Sender<TaskEvent>,
     events_rx: Receiver<TaskEvent>,
 }
@@ -39,6 +42,7 @@ impl SettingsSession {
             devices: (services.list_input_devices)(),
             tasks: TaskState::default(),
             notice: None,
+            permissions: PermissionSnapshot::take(&services.permissions, Instant::now()),
             events_tx,
             events_rx,
         }

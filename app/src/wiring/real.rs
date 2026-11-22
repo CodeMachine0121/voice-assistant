@@ -199,13 +199,10 @@ fn spawn_shortcut_listener(
 
 fn mac_permissions() -> Permissions {
     Permissions {
-        microphone_granted: Arc::new(|| match MacPermissions::microphone_granted() {
-            Some(granted) => granted,
-            None => {
-                MacPermissions::request_microphone();
-                false
-            }
-        }),
+        microphone_granted: Arc::new(MacPermissions::microphone_granted),
+        request_microphone: Arc::new(MacPermissions::request_microphone),
+        // Replaced by the shortcut listener's own state once it reports it.
+        shortcuts_listening: Arc::new(|| false),
         accessibility_granted: Arc::new(MacPermissions::accessibility_granted),
         prompt_accessibility: Arc::new(|| {
             MacPermissions::prompt_accessibility();

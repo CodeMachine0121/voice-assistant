@@ -74,9 +74,11 @@ pub fn test_services() -> (Services, Probe) {
         default_model_path: Arc::new(|| "/default/model.bin".into()),
         download_model: Arc::new(|_, _| Ok(())),
         permissions: Permissions {
-            microphone_granted: Arc::new(|| true),
+            microphone_granted: Arc::new(|| Some(true)),
+            request_microphone: Arc::new(|| {}),
             accessibility_granted: Arc::new(|| true),
             prompt_accessibility: Arc::new(|| {}),
+            shortcuts_listening: Arc::new(|| true),
             open_privacy_settings: Arc::new(|_| {}),
         },
         apply_settings: Arc::new(move |s: &Settings| recorded.lock().unwrap().push(s.clone())),

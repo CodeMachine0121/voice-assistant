@@ -35,10 +35,15 @@ pub enum PrivacyPane {
 /// What the app may ask of macOS about permissions.
 #[derive(Clone)]
 pub struct Permissions {
-    pub microphone_granted: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// `None` = the user has not been asked yet. Must not ask by itself.
+    pub microphone_granted: Arc<dyn Fn() -> Option<bool> + Send + Sync>,
+    /// Shows macOS's microphone request (only when not asked yet).
+    pub request_microphone: Arc<dyn Fn() + Send + Sync>,
     pub accessibility_granted: Arc<dyn Fn() -> bool + Send + Sync>,
     /// Asks macOS to show its accessibility prompt.
     pub prompt_accessibility: Arc<dyn Fn() + Send + Sync>,
+    /// Whether the global shortcut listener is running (it needs Input Monitoring).
+    pub shortcuts_listening: Arc<dyn Fn() -> bool + Send + Sync>,
     pub open_privacy_settings: Arc<dyn Fn(PrivacyPane) + Send + Sync>,
 }
 
