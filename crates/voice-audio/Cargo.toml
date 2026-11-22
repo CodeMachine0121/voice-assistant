@@ -7,3 +7,5 @@ license.workspace = true
 [dependencies]
 voice-core.workspace = true
 log.workspace = true
+crossbeam-channel.workspace = true
+cpal = "0.18.2"
