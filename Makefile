@@ -1,16 +1,25 @@
 # Voice Assistant — build, install and development tasks.
 # Run `make help` to list targets.
 
-APP_NAME   := Voice Assistant
-PROFILE    ?= release
-APP        := target/$(PROFILE)/$(APP_NAME).app
+# Per-machine settings (git-ignored), e.g. `CODESIGN_IDENTITY := My Cert`.
+-include .make.local
+
+APP_NAME    := Voice Assistant
+BINARY      := voice-assistant
+PROFILE     ?= release
+APP         := target/$(PROFILE)/$(APP_NAME).app
 INSTALL_DIR ?= /Applications
 # Optional: name of a code-signing certificate in your keychain, so macOS keeps
-# permissions across rebuilds (ad-hoc signing is used when empty).
+# permissions across rebuilds (ad-hoc signing is used when empty). Set it on the
+# command line, in the environment, or once in .make.local.
 CODESIGN_IDENTITY ?=
+export CODESIGN_IDENTITY
+# Same target for every build so cargo never rebuilds whisper.cpp when switching
+# between `make run` and `make build`.
+export MACOSX_DEPLOYMENT_TARGET := 13.0
 
 .DEFAULT_GOAL := help
-.PHONY: help deps build debug open install uninstall run demo test lint fmt check clean
+.PHONY: help deps build debug open install uninstall quit run demo test lint fmt check clean
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -21,21 +30,24 @@ deps: ## Check build prerequisites (Xcode CLT, CMake, Rust)
 	@command -v cargo >/dev/null || { echo "Missing Rust: see https://rustup.rs"; exit 1; }
 	@echo "All prerequisites found."
 
-build: deps ## Build the release app bundle (target/release/Voice Assistant.app)
-	@CODESIGN_IDENTITY="$(CODESIGN_IDENTITY)" scripts/bundle.sh release
+build: deps ## Build the app bundle (target/<profile>/Voice Assistant.app; PROFILE=release or debug)
+	@scripts/bundle.sh $(PROFILE)
 
-debug: deps ## Build a debug app bundle (target/debug/Voice Assistant.app)
-	@CODESIGN_IDENTITY="$(CODESIGN_IDENTITY)" scripts/bundle.sh debug
+debug: ## Build a debug app bundle (target/debug/Voice Assistant.app)
+	@$(MAKE) --no-print-directory build PROFILE=debug
 
-open: build ## Build and launch the app
+quit: ## Quit the app if it is running
+	@pkill -x $(BINARY) 2>/dev/null && sleep 1 || true
+
+open: build quit ## Build and launch the app (restarting a running one)
 	@open "$(APP)"
 
-install: build ## Build and copy the app to /Applications (override with INSTALL_DIR=...)
+install: build quit ## Build and copy the app to /Applications (override with INSTALL_DIR=...)
 	@rm -rf "$(INSTALL_DIR)/$(APP_NAME).app"
 	@cp -R "$(APP)" "$(INSTALL_DIR)/"
 	@echo "Installed $(INSTALL_DIR)/$(APP_NAME).app"
 
-uninstall: ## Remove the app from /Applications (settings and models are kept)
+uninstall: quit ## Remove the app from /Applications (settings and models are kept)
 	@rm -rf "$(INSTALL_DIR)/$(APP_NAME).app"
 	@echo "Removed $(INSTALL_DIR)/$(APP_NAME).app"
 
