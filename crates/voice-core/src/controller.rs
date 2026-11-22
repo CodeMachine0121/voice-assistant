@@ -17,6 +17,8 @@ pub enum ControllerEvent {
     Tick,
     /// The pipeline finished the previous dictation; new ones may start.
     ProcessingFinished,
+    /// The recorder could not start: the dictation never began.
+    RecordingFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +66,7 @@ impl SessionController {
 
     /// Feed one event observed at `now`; returns the command to execute, if any.
     pub fn handle(&mut self, event: ControllerEvent, now: Instant) -> Option<Command> {
-        use ControllerEvent::{ProcessingFinished, Shortcut, Tick};
+        use ControllerEvent::{ProcessingFinished, RecordingFailed, Shortcut, Tick};
         use ShortcutEvent::{EscapePressed, HandsFreePressed, PushToTalkDown, PushToTalkUp};
 
         let (next, command) = match (self.state, event) {
@@ -80,6 +82,7 @@ impl SessionController {
                 (Mode::PushToTalk, Shortcut(PushToTalkUp))
                 | (Mode::HandsFree, Shortcut(HandsFreePressed)) => Self::finish(since, now),
                 (_, Shortcut(EscapePressed)) => (State::Idle, Some(Command::Cancel)),
+                (_, RecordingFailed) => (State::Idle, None),
                 (_, Tick) if now.saturating_duration_since(since) >= MAX_DICTATION => {
                     (State::Processing, Some(Command::StopAndProcess))
                 }
@@ -90,6 +93,11 @@ impl SessionController {
         };
         self.state = next;
         command
+    }
+
+    /// Whether a dictation is being captured right now.
+    pub fn is_listening(&self) -> bool {
+        matches!(self.state, State::Listening { .. })
     }
 
     fn listening(mode: Mode, since: Instant) -> State {
@@ -110,7 +118,7 @@ impl SessionController {
 mod tests {
     use super::*;
     use std::time::Duration;
-    use ControllerEvent::{ProcessingFinished, Shortcut, Tick};
+    use ControllerEvent::{ProcessingFinished, RecordingFailed, Shortcut, Tick};
     use ShortcutEvent::{EscapePressed, HandsFreePressed, PushToTalkDown, PushToTalkUp};
 
     const ALL_SHORTCUTS: [ShortcutEvent; 4] = [
@@ -357,5 +365,67 @@ mod tests {
         let mut c = SessionController::default();
 
         assert_idle(&mut c, Instant::now());
+    }
+
+    #[test]
+    fn recording_failure_during_push_to_talk_returns_to_idle_without_a_command() {
+        let t0 = Instant::now();
+        let mut c = push_to_talk_started(t0);
+
+        assert_eq!(c.handle(RecordingFailed, t0), None);
+        assert!(!c.is_listening());
+        assert_eq!(c.handle(Shortcut(PushToTalkUp), t0 + ms(4000)), None);
+        assert_idle(&mut c, t0 + ms(4100));
+    }
+
+    #[test]
+    fn recording_failure_during_hands_free_returns_to_idle_without_a_command() {
+        let t0 = Instant::now();
+        let mut c = hands_free_started(t0);
+
+        assert_eq!(c.handle(RecordingFailed, t0), None);
+        assert!(!c.is_listening());
+        assert_eq!(c.handle(Tick, t0 + MAX_DICTATION), None);
+        assert_idle(&mut c, t0 + MAX_DICTATION);
+    }
+
+    #[test]
+    fn recording_failure_is_ignored_while_idle() {
+        let t0 = Instant::now();
+        let mut c = SessionController::new();
+
+        assert_eq!(c.handle(RecordingFailed, t0), None);
+        assert_idle(&mut c, t0);
+    }
+
+    #[test]
+    fn recording_failure_is_ignored_while_processing() {
+        let t0 = Instant::now();
+        let mut c = processing(t0);
+
+        assert_eq!(c.handle(RecordingFailed, t0 + ms(5000)), None);
+        assert_eq!(c.handle(Shortcut(PushToTalkDown), t0 + ms(5100)), None);
+        assert_eq!(c.handle(ProcessingFinished, t0 + ms(5200)), None);
+        assert_idle(&mut c, t0 + ms(5300));
+    }
+
+    #[test]
+    fn is_listening_only_while_a_dictation_is_captured() {
+        let t0 = Instant::now();
+        let mut c = SessionController::new();
+        assert!(!c.is_listening(), "idle");
+
+        c.handle(Shortcut(HandsFreePressed), t0);
+        assert!(c.is_listening(), "hands-free");
+
+        c.handle(Shortcut(HandsFreePressed), t0 + ms(3000));
+        assert!(!c.is_listening(), "processing");
+
+        c.handle(ProcessingFinished, t0 + ms(4000));
+        c.handle(Shortcut(PushToTalkDown), t0 + ms(5000));
+        assert!(c.is_listening(), "push-to-talk");
+
+        c.handle(Shortcut(EscapePressed), t0 + ms(6000));
+        assert!(!c.is_listening(), "cancelled");
     }
 }
