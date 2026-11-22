@@ -107,19 +107,17 @@ impl Worker {
 
     fn execute(&mut self, command: Command) {
         match command {
-            Command::StartRecording => match self.recorder.start() {
-                Ok(()) => {
-                    self.publish(Status::Listening {
-                        level: self.recorder.level(),
-                    });
-                }
-                Err(problem) => {
+            Command::StartRecording => {
+                // Show the indicator before the microphone opens: opening it can take
+                // a noticeable moment (first use, Bluetooth headsets).
+                self.publish(Status::Listening { level: 0.0 });
+                if let Err(problem) = self.recorder.start() {
                     // The dictation never began: forget it entirely.
                     self.controller
                         .handle(ControllerEvent::RecordingFailed, Instant::now());
                     self.publish(Status::Problem(problem));
                 }
-            },
+            }
             Command::StopAndProcess => {
                 self.publish(Status::Working);
                 let recording = self.recorder.stop();
@@ -169,11 +167,13 @@ mod tests {
     struct FakeRecorder {
         log: Arc<Mutex<RecorderLog>>,
         start_result: Result<(), Problem>,
+        start_delay: Duration,
         level: f32,
     }
 
     impl Recorder for FakeRecorder {
         fn start(&mut self) -> Result<(), Problem> {
+            thread::sleep(self.start_delay);
             self.log.lock().unwrap().starts += 1;
             self.start_result.clone()
         }
@@ -213,6 +213,7 @@ mod tests {
 
     struct Options {
         start_result: Result<(), Problem>,
+        start_delay: Duration,
         transcriber: Arc<dyn crate::Transcriber>,
     }
 
@@ -220,6 +221,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 start_result: Ok(()),
+                start_delay: Duration::ZERO,
                 transcriber: FakeTranscriber::new(Ok("hello team")),
             }
         }
@@ -243,6 +245,7 @@ mod tests {
                     recorder: Box::new(FakeRecorder {
                         log: recorder.clone(),
                         start_result: options.start_result,
+                        start_delay: options.start_delay,
                         level: 0.42,
                     }),
                     pipeline,
@@ -277,11 +280,12 @@ mod tests {
             }
         }
 
+        /// Listening is shown at once (level 0), then with the live level.
         fn expect_listening(&self) {
-            assert_eq!(
+            assert!(matches!(
                 self.handle.status.recv_timeout(WAIT).expect("status"),
-                Status::Listening { level: 0.42 }
-            );
+                Status::Listening { .. }
+            ));
         }
 
         fn log<T>(&self, f: impl FnOnce(&RecorderLog) -> T) -> T {
@@ -321,6 +325,21 @@ mod tests {
         assert_eq!(rig.next_status(), Status::Done);
         assert_eq!(rig.inserter.inserted(), ["Hello team."]);
         assert_eq!(rig.log(|l| (l.starts, l.stops, l.cancels)), (1, 1, 0));
+    }
+
+    #[test]
+    fn listening_is_shown_before_a_slow_microphone_finishes_opening() {
+        let rig = Rig::new(Options {
+            start_delay: Duration::from_millis(400),
+            ..Options::default()
+        });
+
+        let pressed = Instant::now();
+        rig.press(PushToTalkDown);
+        let first = rig.handle.status.recv_timeout(WAIT).expect("status");
+
+        assert_eq!(first, Status::Listening { level: 0.0 });
+        assert!(pressed.elapsed() < Duration::from_millis(100));
     }
 
     #[test]
@@ -393,6 +412,10 @@ mod tests {
         rig.press(PushToTalkDown);
         assert_eq!(
             rig.handle.status.recv_timeout(WAIT).expect("status"),
+            Status::Listening { level: 0.0 }
+        );
+        assert_eq!(
+            rig.handle.status.recv_timeout(WAIT).expect("status"),
             Status::Problem(Problem::MicrophonePermission)
         );
         hold(TICK_INTERVAL * 3);
@@ -459,10 +482,10 @@ mod tests {
         hold(Duration::from_millis(50));
 
         shortcuts.send(PushToTalkDown).unwrap();
-        assert_eq!(
+        assert!(matches!(
             status.recv_timeout(WAIT).unwrap(),
-            Status::Listening { level: 0.42 }
-        );
+            Status::Listening { .. }
+        ));
     }
 
     #[test]
@@ -502,6 +525,7 @@ mod tests {
                 recorder: Box::new(FakeRecorder {
                     log: recorder,
                     start_result: Ok(()),
+                    start_delay: Duration::ZERO,
                     level: 0.0,
                 }),
                 pipeline: DictationPipeline::new(
