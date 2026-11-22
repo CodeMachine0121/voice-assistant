@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "app"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+rust-version = "1.80"
+
+[workspace.dependencies]
+voice-core = { path = "crates/voice-core" }
+voice-audio = { path = "crates/voice-audio" }
+voice-stt = { path = "crates/voice-stt" }
+voice-polish = { path = "crates/voice-polish" }
+voice-storage = { path = "crates/voice-storage" }
+voice-macos = { path = "crates/voice-macos" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+crossbeam-channel = "0.5"
+log = "0.4"
