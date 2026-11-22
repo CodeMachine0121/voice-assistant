@@ -144,6 +144,56 @@ impl<R: Recorder> Recorder for SharedRecorder<R> {
     }
 }
 
+/// Asks macOS whether the microphone may be used: `Some(true)` allowed,
+/// `Some(false)` denied, `None` not asked yet.
+type MicrophoneCheck = dyn Fn() -> Option<bool> + Send + Sync;
+
+/// Checks the microphone permission before every recording. A denied microphone
+/// does not fail on macOS — it records silence — so without this check the user
+/// would be told "no speech heard" instead of how to grant access.
+pub struct PermissionCheckedRecorder<R> {
+    inner: R,
+    check: Box<MicrophoneCheck>,
+    request: Box<dyn Fn() + Send + Sync>,
+}
+
+impl<R> PermissionCheckedRecorder<R> {
+    pub fn new(
+        inner: R,
+        check: Box<MicrophoneCheck>,
+        request: Box<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            inner,
+            check,
+            request,
+        }
+    }
+}
+
+impl<R: Recorder> Recorder for PermissionCheckedRecorder<R> {
+    fn start(&mut self) -> Result<(), Problem> {
+        match (self.check)() {
+            Some(true) => self.inner.start(),
+            Some(false) => Err(Problem::MicrophonePermission),
+            None => {
+                // First use: show macOS's own request; this dictation cannot proceed.
+                (self.request)();
+                Err(Problem::MicrophonePermission)
+            }
+        }
+    }
+    fn stop(&mut self) -> Recording {
+        self.inner.stop()
+    }
+    fn cancel(&mut self) {
+        self.inner.cancel()
+    }
+    fn level(&self) -> f32 {
+        self.inner.level()
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -203,7 +253,11 @@ pub fn build() -> Services {
     let wake = repaint.clone();
     let engine = Engine::spawn(
         EngineDeps {
-            recorder: Box::new(recorder.clone()),
+            recorder: Box::new(PermissionCheckedRecorder::new(
+                recorder.clone(),
+                Box::new(MacPermissions::microphone_granted),
+                Box::new(MacPermissions::request_microphone),
+            )),
             pipeline,
             settings: settings.clone(),
         },
@@ -360,6 +414,47 @@ mod tests {
                 0.0
             }
         }
+    }
+
+    fn checked(granted: Option<bool>) -> (PermissionCheckedRecorder<Mic>, Arc<AtomicUsize>) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = requests.clone();
+        let rec = PermissionCheckedRecorder::new(
+            Mic::default(),
+            Box::new(move || granted),
+            Box::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        (rec, requests)
+    }
+
+    #[test]
+    fn denied_microphone_is_reported_and_nothing_is_recorded() {
+        let (mut rec, requests) = checked(Some(false));
+        assert_eq!(rec.start(), Err(Problem::MicrophonePermission));
+        assert_eq!(rec.level(), 0.0);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn undecided_microphone_asks_macos_and_does_not_record() {
+        let (mut rec, requests) = checked(None);
+        assert_eq!(rec.start(), Err(Problem::MicrophonePermission));
+        assert_eq!(rec.level(), 0.0);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn granted_microphone_records_normally() {
+        let (mut rec, requests) = checked(Some(true));
+        rec.start().unwrap();
+        assert_eq!(rec.level(), 1.0);
+        assert_eq!(rec.stop(), Recording::new(vec![0.5]));
+        rec.start().unwrap();
+        rec.cancel();
+        assert_eq!(rec.level(), 0.0);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
     }
 
     #[test]
