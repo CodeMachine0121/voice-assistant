@@ -55,7 +55,7 @@ impl Polisher for LmStudioPolisher {
             .map_err(unreachable)?
             .body_mut()
             .read_json()
-            .map_err(|e| PolishError::InvalidResponse(format!("unreadable answer: {e}")))?;
+            .map_err(body_error)?;
         let content = reply
             .choices
             .into_iter()
@@ -96,6 +96,15 @@ fn agent(timeout: Duration) -> ureq::Agent {
 
 fn unreachable(e: ureq::Error) -> PolishError {
     PolishError::Unreachable(e.to_string())
+}
+
+/// Reading the answer can fail because it is not valid JSON (an unusable answer) or
+/// because the assistant stalled or dropped the connection mid-answer (unreachable).
+fn body_error(e: ureq::Error) -> PolishError {
+    match e {
+        ureq::Error::Json(e) => PolishError::InvalidResponse(format!("unreadable answer: {e}")),
+        other => unreachable(other),
+    }
 }
 
 #[derive(Deserialize)]
@@ -302,6 +311,29 @@ mod tests {
         let out = p.polish("x", &no_dict());
         assert!(matches!(out, Err(PolishError::Unreachable(_))), "{out:?}");
         assert!(started.elapsed() < Duration::from_millis(1400));
+    }
+
+    #[test]
+    fn answer_that_stalls_midway_is_unreachable() {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut buf = [0u8; 65536];
+                let _ = conn.read(&mut buf);
+                let _ = conn.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                      Content-Length: 200\r\n\r\n{\"choi",
+                );
+                let _ = conn.flush();
+                thread::sleep(Duration::from_millis(1500));
+            }
+        });
+        let p = LmStudioPolisher::new(format!("http://127.0.0.1:{port}/v1"), "m".into())
+            .with_timeout(Duration::from_millis(300));
+        let out = p.polish("x", &no_dict());
+        assert!(matches!(out, Err(PolishError::Unreachable(_))), "{out:?}");
     }
 
     #[test]
