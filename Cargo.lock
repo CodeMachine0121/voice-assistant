@@ -4775,14 +4775,15 @@ dependencies = [
 name = "voice-macos"
 version = "0.1.0"
 dependencies = [
- "arboard",
  "block2 0.6.2",
  "core-foundation 0.10.1",
  "core-graphics 0.25.0",
  "crossbeam-channel",
  "log",
  "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
  "objc2-av-foundation",
+ "objc2-foundation 0.3.2",
  "voice-core",
 ]
 
