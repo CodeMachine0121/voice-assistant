@@ -5,7 +5,6 @@
 //! (microphone, speech model file, assistant address and model, shortcuts).
 //! Each is wrapped in a small "configurable" adapter that `apply` reconfigures.
 use super::{settings_saver, Permissions, PrivacyPane, RepaintHandle, Services};
-use crossbeam_channel::{unbounded, Sender};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use voice_audio::CpalRecorder;
@@ -13,7 +12,7 @@ use voice_core::{
     DictationPipeline, Engine, EngineDeps, HistoryStore, PersonalDictionary, PolishError, Polisher,
     Problem, Recorder, Recording, Settings, SettingsStore, Transcriber,
 };
-use voice_macos::{EventTapShortcuts, MacPermissions, PasteInserter, ShortcutConfig};
+use voice_macos::{MacPermissions, PasteInserter, ShortcutConfig, ShortcutHandle, ShortcutService};
 use voice_polish::LmStudioPolisher;
 use voice_storage::{JsonHistoryStore, JsonSettingsStore};
 use voice_stt::WhisperTranscriber;
@@ -149,13 +148,6 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn shortcut_config(settings: &Settings) -> ShortcutConfig {
-    ShortcutConfig {
-        push_to_talk: settings.push_to_talk.clone(),
-        hands_free: settings.hands_free.clone(),
-    }
-}
-
 fn polisher_for(settings: &Settings) -> Arc<dyn Polisher> {
     Arc::new(LmStudioPolisher::new(
         settings.assistant_url.clone(),
@@ -163,46 +155,13 @@ fn polisher_for(settings: &Settings) -> Arc<dyn Polisher> {
     ))
 }
 
-/// Runs the global shortcut listener on its own thread (the listener is tied to the
-/// thread that created it) and returns a sender for new shortcut settings.
-/// When macOS refuses the listener, the user is sent to the Input Monitoring pane
-/// and the next settings change retries.
-fn spawn_shortcut_listener(
-    initial: ShortcutConfig,
-    sink: Sender<voice_core::ShortcutEvent>,
-) -> Sender<ShortcutConfig> {
-    let (tx, rx) = unbounded::<ShortcutConfig>();
-    std::thread::Builder::new()
-        .name("shortcut-listener".into())
-        .spawn(move || {
-            let start =
-                |config: ShortcutConfig| match EventTapShortcuts::start(config, sink.clone()) {
-                    Ok(listener) => Some(listener),
-                    Err(problem) => {
-                        log::warn!("global shortcuts unavailable: {problem}");
-                        MacPermissions::prompt_accessibility();
-                        None
-                    }
-                };
-            let mut listener = start(initial);
-            for config in rx {
-                match &listener {
-                    Some(l) => l.update(config),
-                    None => listener = start(config),
-                }
-            }
-        })
-        .map_err(|e| log::error!("cannot start the shortcut listener thread: {e}"))
-        .ok();
-    tx
-}
-
-fn mac_permissions() -> Permissions {
+/// Asks macOS for permissions; `shortcuts` tells whether the shortcut listener runs
+/// (which needs Input Monitoring).
+fn mac_permissions(shortcuts: Arc<ShortcutHandle>) -> Permissions {
     Permissions {
         microphone_granted: Arc::new(MacPermissions::microphone_granted),
         request_microphone: Arc::new(MacPermissions::request_microphone),
-        // Replaced by the shortcut listener's own state once it reports it.
-        shortcuts_listening: Arc::new(|| false),
+        shortcuts_listening: Arc::new(move || shortcuts.is_listening()),
         accessibility_granted: Arc::new(MacPermissions::accessibility_granted),
         prompt_accessibility: Arc::new(|| {
             MacPermissions::prompt_accessibility();
@@ -250,7 +209,17 @@ pub fn build() -> Services {
         },
         Box::new(move || wake.request()),
     );
-    let shortcuts = spawn_shortcut_listener(shortcut_config(&settings), engine.shortcuts.clone());
+    // The service keeps retrying until macOS allows the listener, so granting the
+    // permission later takes effect without a restart.
+    let shortcuts = Arc::new(ShortcutService::spawn(
+        ShortcutConfig::from(&settings),
+        engine.shortcuts.clone(),
+    ));
+    if !MacPermissions::accessibility_granted() {
+        // Pasting into other apps needs it; macOS's prompt also lists the app.
+        MacPermissions::prompt_accessibility();
+    }
+    let listener = shortcuts.clone();
 
     let save_settings = settings_saver(
         settings_store.clone(),
@@ -259,7 +228,7 @@ pub fn build() -> Services {
             transcriber.set_path(speech_model_path(s));
             polisher.replace(polisher_for(s));
             recorder.with(|r| r.set_device(s.microphone.clone()));
-            let _ = shortcuts.send(shortcut_config(s));
+            listener.apply(ShortcutConfig::from(s));
         },
     );
     Services {
@@ -274,7 +243,7 @@ pub fn build() -> Services {
         download_model: Arc::new(|dest, progress| {
             voice_stt::download_default_model(dest, progress)
         }),
-        permissions: mac_permissions(),
+        permissions: mac_permissions(shortcuts),
     }
 }
 
@@ -366,17 +335,6 @@ mod tests {
         assert_eq!(speech_model_path(&s), voice_stt::default_model_path());
         s.speech_model_path = Some(PathBuf::from("/models/custom.bin"));
         assert_eq!(speech_model_path(&s), PathBuf::from("/models/custom.bin"));
-    }
-
-    #[test]
-    fn shortcut_settings_reach_the_listener_config() {
-        let s = Settings {
-            push_to_talk: voice_core::Shortcut::Fn,
-            ..Settings::default()
-        };
-        let c = shortcut_config(&s);
-        assert_eq!(c.push_to_talk, voice_core::Shortcut::Fn);
-        assert_eq!(c.hands_free, s.hands_free);
     }
 
     #[derive(Default)]
