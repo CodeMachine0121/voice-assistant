@@ -20,7 +20,7 @@
 | Personal Dictionary | TBD | Dictionary | User-maintained list of words that must be spelled exactly. No blanks, no duplicates. | Confirmed |
 | History Entry | TBD | History | A finished dictation: time, raw transcript, polished text. At most 200 kept, newest first. | Confirmed |
 | Push-to-talk Shortcut | TBD | Hold to talk | Held down to dictate; release ends dictation. Default: right Option key. | Confirmed |
-| Hands-free Shortcut | TBD | Hands-free | Pressed once to start, again to stop. Default: Control + Option + Space. | Confirmed |
+| Hands-free Shortcut | TBD | Hands-free | Pressed once to start, again to stop. Default: Control + Shift + Space (Control + Option + Space is macOS's input-source switch). | Confirmed |
 | Status | TBD | — | What the user sees about the current dictation: Idle, Listening, Working, Done, Cancelled, Problem. | Confirmed |
 
 ---

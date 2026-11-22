@@ -236,7 +236,7 @@ Scenario: First launch uses sensible defaults
   Given the app has never been configured
   When it starts
   Then push-to-talk is the right Option key
-  And hands-free is Control + Option + Space
+  And hands-free is Control + Shift + Space
   And the writing assistant address is the default local address of LM Studio
   And the system default microphone is used
 ```

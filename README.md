@@ -30,7 +30,7 @@ On first launch:
 | Action | Default |
 | --- | --- |
 | Push-to-talk | hold **right Option** |
-| Hands-free start/stop | **Control + Option + Space** |
+| Hands-free start/stop | **Control + Shift + Space** |
 | Cancel | **Escape** |
 
 Presses shorter than 0.5 s are ignored, and a dictation stops on its own after 5 minutes. If LM Studio is not reachable (or takes longer than 20 s), the raw transcript is inserted. The last 200 dictations are kept under **History…**.

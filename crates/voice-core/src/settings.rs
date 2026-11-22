@@ -38,7 +38,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             push_to_talk: Shortcut::RightOption,
-            hands_free: Shortcut::ControlOptionSpace,
+            hands_free: Shortcut::ControlShiftSpace,
             microphone: None,
             assistant_url: "http://localhost:1234/v1".to_string(),
             assistant_model: String::new(),
@@ -57,7 +57,7 @@ mod tests {
     fn first_launch_defaults() {
         let s = Settings::default();
         assert_eq!(s.push_to_talk, Shortcut::RightOption);
-        assert_eq!(s.hands_free, Shortcut::ControlOptionSpace);
+        assert_eq!(s.hands_free, Shortcut::ControlShiftSpace);
         assert_eq!(s.assistant_url, "http://localhost:1234/v1");
         assert_eq!(s.microphone, None, "system default microphone");
         assert!(s.cleanup_enabled);
