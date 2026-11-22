@@ -1,4 +1,4 @@
-//! Business thresholds from the PRD, in one place.
+//! Business thresholds, in one place.
 use std::time::Duration;
 
 /// Presses shorter than this are accidental. A press of exactly this length counts.
