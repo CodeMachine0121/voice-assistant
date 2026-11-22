@@ -110,37 +110,65 @@ impl Polisher for ConfigurablePolisher {
     }
 }
 
+/// A recorder whose input device can be switched.
+pub trait SwitchableDevice {
+    fn set_device(&mut self, device: Option<String>);
+}
+
+impl SwitchableDevice for CpalRecorder {
+    fn set_device(&mut self, device: Option<String>) {
+        CpalRecorder::set_device(self, device);
+    }
+}
+
 /// A recorder the engine owns while the app keeps a handle to change the microphone.
-pub struct SharedRecorder<R>(Arc<Mutex<R>>);
+/// A device change is only noted and applied at the next start, so saving settings
+/// never waits for a microphone that is still opening.
+pub struct SharedRecorder<R> {
+    recorder: Arc<Mutex<R>>,
+    next_device: Arc<Mutex<Option<Option<String>>>>,
+}
 
 impl<R> Clone for SharedRecorder<R> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self {
+            recorder: self.recorder.clone(),
+            next_device: self.next_device.clone(),
+        }
     }
 }
 
 impl<R> SharedRecorder<R> {
     pub fn new(recorder: R) -> Self {
-        Self(Arc::new(Mutex::new(recorder)))
+        Self {
+            recorder: Arc::new(Mutex::new(recorder)),
+            next_device: Arc::new(Mutex::new(None)),
+        }
     }
 
-    pub fn with<T>(&self, f: impl FnOnce(&mut R) -> T) -> T {
-        f(&mut lock(&self.0))
+    /// Uses `device` from the next dictation on. Never blocks on the recorder.
+    pub fn choose_device(&self, device: Option<String>) {
+        *lock(&self.next_device) = Some(device);
     }
 }
 
-impl<R: Recorder> Recorder for SharedRecorder<R> {
+impl<R: Recorder + SwitchableDevice> Recorder for SharedRecorder<R> {
     fn start(&mut self) -> Result<(), Problem> {
-        self.with(|r| r.start())
+        let next = lock(&self.next_device).take();
+        let mut recorder = lock(&self.recorder);
+        if let Some(device) = next {
+            recorder.set_device(device);
+        }
+        recorder.start()
     }
     fn stop(&mut self) -> Recording {
-        self.with(|r| r.stop())
+        lock(&self.recorder).stop()
     }
     fn cancel(&mut self) {
-        self.with(|r| r.cancel())
+        lock(&self.recorder).cancel()
     }
     fn level(&self) -> f32 {
-        lock(&self.0).level()
+        lock(&self.recorder).level()
     }
 }
 
@@ -281,7 +309,7 @@ pub fn build() -> Services {
         move |s: &Settings| {
             transcriber.set_path(speech_model_path(s));
             polisher.replace(polisher_for(s));
-            recorder.with(|r| r.set_device(s.microphone.clone()));
+            recorder.choose_device(s.microphone.clone());
             listener.apply(ShortcutConfig::from(s));
         },
     );
@@ -394,6 +422,13 @@ mod tests {
     #[derive(Default)]
     struct Mic {
         started: bool,
+        device: Option<String>,
+    }
+
+    impl SwitchableDevice for Mic {
+        fn set_device(&mut self, device: Option<String>) {
+            self.device = device;
+        }
     }
     impl Recorder for Mic {
         fn start(&mut self) -> Result<(), Problem> {
@@ -458,15 +493,33 @@ mod tests {
     }
 
     #[test]
-    fn shared_recorder_delegates_and_stays_reachable_from_the_app() {
+    fn shared_recorder_delegates_to_the_engine_side() {
         let app_side = SharedRecorder::new(Mic::default());
         let mut engine_side: Box<dyn Recorder> = Box::new(app_side.clone());
         engine_side.start().unwrap();
         assert_eq!(engine_side.level(), 1.0);
-        assert!(app_side.with(|m| m.started));
         assert_eq!(engine_side.stop(), Recording::new(vec![0.5]));
         engine_side.start().unwrap();
         engine_side.cancel();
         assert_eq!(engine_side.level(), 0.0);
+    }
+
+    #[test]
+    fn device_change_applies_at_the_next_start_without_waiting_for_the_recorder() {
+        let app_side = SharedRecorder::new(Mic::default());
+        let mut engine_side = app_side.clone();
+        let busy = lock(&app_side.recorder); // a microphone still opening
+        app_side.choose_device(Some("USB Headset".into())); // must not block
+        drop(busy);
+        assert_eq!(lock(&app_side.recorder).device, None);
+        engine_side.start().unwrap();
+        assert_eq!(
+            lock(&app_side.recorder).device.as_deref(),
+            Some("USB Headset")
+        );
+        engine_side.cancel();
+        lock(&app_side.recorder).device = Some("Other".into());
+        engine_side.start().unwrap();
+        assert_eq!(lock(&app_side.recorder).device.as_deref(), Some("Other"));
     }
 }
