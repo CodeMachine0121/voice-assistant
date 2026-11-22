@@ -1,10 +1,10 @@
 //! Composition root: the only place that knows which adapters back the ports.
 //!
-//! The rest of the app talks to `Services` and nothing else. On this branch
-//! `build_services` is backed by in-process fakes (see `fakes`) so the app runs
-//! without audio, speech, network or macOS adapters; the integrator swaps the
-//! body for the real ones.
+//! The rest of the app talks to `Services` and nothing else. `real` wires the
+//! production adapters; `fakes` backs a demo mode (`VOICE_ASSISTANT_DEMO=1`) that
+//! runs without microphone, speech model, writing assistant or permissions.
 mod fakes;
+mod real;
 #[cfg(test)]
 pub mod testing;
 
@@ -20,8 +20,9 @@ pub type ModelListFn = Arc<dyn Fn(&str) -> Result<Vec<String>, String> + Send + 
 /// Downloads the default speech model to a path, reporting `(downloaded, total)` bytes.
 pub type ModelDownloadFn =
     Arc<dyn Fn(&Path, &mut dyn FnMut(u64, Option<u64>)) -> Result<(), String> + Send + Sync>;
-/// Tells the global shortcut listener about new settings.
-pub type ShortcutUpdateFn = Arc<dyn Fn(&Settings) + Send + Sync>;
+/// Hands saved settings to the adapters that depend on them (shortcuts, microphone,
+/// speech model, writing assistant).
+pub type SettingsApplyFn = Arc<dyn Fn(&Settings) + Send + Sync>;
 
 /// Panes of System Settings › Privacy & Security the app can send the user to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,12 +72,24 @@ pub struct Services {
     pub default_model_path: Arc<dyn Fn() -> PathBuf + Send + Sync>,
     pub download_model: ModelDownloadFn,
     pub permissions: Permissions,
-    pub update_shortcuts: ShortcutUpdateFn,
+    pub apply_settings: SettingsApplyFn,
 }
+
+/// Environment variable that switches the app to demo mode.
+pub const DEMO_ENV: &str = "VOICE_ASSISTANT_DEMO";
 
 /// Builds the services the app runs on.
 pub fn build_services() -> Services {
-    fakes::build()
+    if demo_mode(std::env::var(DEMO_ENV).ok().as_deref()) {
+        log::info!("demo mode: using simulated dictation");
+        fakes::build()
+    } else {
+        real::build()
+    }
+}
+
+fn demo_mode(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 #[cfg(test)]
@@ -99,8 +112,17 @@ mod tests {
     }
 
     #[test]
-    fn build_services_gives_a_working_engine_handle() {
-        let services = build_services();
+    fn demo_mode_only_when_explicitly_enabled() {
+        assert!(demo_mode(Some("1")));
+        assert!(demo_mode(Some("TRUE")));
+        assert!(!demo_mode(Some("0")));
+        assert!(!demo_mode(Some("")));
+        assert!(!demo_mode(None));
+    }
+
+    #[test]
+    fn demo_services_give_a_working_engine_handle() {
+        let services = fakes::build();
         assert!(services.engine.status.try_recv().is_err());
     }
 }

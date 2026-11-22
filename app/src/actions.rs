@@ -11,7 +11,7 @@ pub fn save_settings(services: &Services, settings: &Settings) -> Result<(), Str
         .settings
         .send(settings.clone())
         .map_err(|_| "The dictation engine is not running.".to_string())?;
-    (services.update_shortcuts)(settings);
+    (services.apply_settings)(settings);
     Ok(())
 }
 

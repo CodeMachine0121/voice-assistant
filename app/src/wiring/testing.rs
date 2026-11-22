@@ -79,7 +79,7 @@ pub fn test_services() -> (Services, Probe) {
             prompt_accessibility: Arc::new(|| {}),
             open_privacy_settings: Arc::new(|_| {}),
         },
-        update_shortcuts: Arc::new(move |s: &Settings| recorded.lock().unwrap().push(s.clone())),
+        apply_settings: Arc::new(move |s: &Settings| recorded.lock().unwrap().push(s.clone())),
     };
     (
         services,

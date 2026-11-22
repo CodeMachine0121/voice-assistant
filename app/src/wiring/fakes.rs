@@ -299,7 +299,7 @@ pub fn build() -> Services {
         default_model_path: Arc::new(fake_default_model_path),
         download_model: Arc::new(fake_download),
         permissions: fake_permissions(),
-        update_shortcuts: Arc::new(|s: &Settings| {
+        apply_settings: Arc::new(|s: &Settings| {
             log::info!(
                 "fake: shortcuts now {:?} / {:?}",
                 s.push_to_talk,
@@ -520,7 +520,7 @@ mod tests {
         assert_eq!((s.list_input_devices)().len(), 2);
         assert_eq!((s.list_models)("http://x").unwrap().len(), 2);
         assert_eq!(s.settings_store.load(), Settings::default());
-        (s.update_shortcuts)(&Settings::default());
+        (s.apply_settings)(&Settings::default());
         assert!((s.default_model_path)().ends_with("ggml-small.bin"));
     }
 }
