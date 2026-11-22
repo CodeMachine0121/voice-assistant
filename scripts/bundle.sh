@@ -7,6 +7,12 @@ profile="${1:-release}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+  echo "Voice Assistant is built for macOS on Apple silicon (arm64)." >&2
+  exit 1
+fi
+export MACOSX_DEPLOYMENT_TARGET=13.0
+
 case "$profile" in
   release) cargo build --release -p voice-assistant ;;
   debug) cargo build -p voice-assistant ;;
