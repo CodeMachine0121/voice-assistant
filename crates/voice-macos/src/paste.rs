@@ -13,8 +13,9 @@ use objc2_foundation::{NSArray, NSData, NSString};
 use std::time::Duration;
 use voice_core::{Problem, TextInserter};
 
-/// How long the front app gets to read the clipboard before it is restored.
-const PASTE_SETTLE: Duration = Duration::from_millis(150);
+/// How long the front app gets to read the clipboard before it is restored. Apps that
+/// handle ⌘V asynchronously (Electron apps, busy browsers) read it noticeably late.
+const PASTE_SETTLE: Duration = Duration::from_millis(500);
 /// Virtual key code of "V".
 const KEY_V: u16 = 9;
 
