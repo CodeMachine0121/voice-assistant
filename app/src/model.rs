@@ -143,10 +143,12 @@ impl AppModel {
         }
     }
 
-    /// Takes in every status the engine has published; history is reloaded after each Done.
+    /// Takes in every status the engine has published; history is reloaded after each
+    /// finished dictation (Done, or a problem that may still have recorded an entry,
+    /// such as cleanup being skipped).
     pub fn drain_statuses(&mut self, services: &Services, now: Instant) {
         for status in services.engine.status.try_iter() {
-            if status == Status::Done {
+            if matches!(status, Status::Done | Status::Problem(_)) {
                 self.history = services.history_store.load();
             }
             self.indicator.set_status(status, now);
@@ -251,6 +253,17 @@ mod tests {
         let mut model = AppModel::new(now);
         store_history(&services, &["Hello."]);
         publish(&probe, &[Status::Done]);
+        model.drain_statuses(&services, now);
+        assert_eq!(model.history.entries().len(), 1);
+    }
+
+    #[test]
+    fn a_problem_outcome_also_reloads_history() {
+        let (services, probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+        store_history(&services, &["hello there"]);
+        publish(&probe, &[Status::Problem(Problem::AssistantUnreachable)]);
         model.drain_statuses(&services, now);
         assert_eq!(model.history.entries().len(), 1);
     }
