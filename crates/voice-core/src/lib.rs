@@ -3,6 +3,8 @@
 pub mod controller;
 pub mod dictionary;
 pub mod engine;
+#[cfg(test)]
+mod fakes;
 pub mod history;
 pub mod pipeline;
 pub mod ports;
