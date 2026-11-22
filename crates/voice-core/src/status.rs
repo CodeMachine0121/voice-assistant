@@ -41,3 +41,32 @@ pub enum Status {
     Cancelled,
     Problem(Problem),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn problems_read_as_the_messages_shown_to_the_user() {
+        let cases = [
+            (Problem::NoSpeech, "No speech heard"),
+            (
+                Problem::AssistantUnreachable,
+                "Cleanup skipped – assistant unreachable",
+            ),
+            (
+                Problem::MicrophonePermission,
+                "Microphone access needed – System Settings › Privacy & Security › Microphone",
+            ),
+            (
+                Problem::AccessibilityPermission,
+                "Accessibility access needed – System Settings › Privacy & Security › Accessibility",
+            ),
+            (Problem::Other("model missing".into()), "model missing"),
+        ];
+
+        for (problem, message) in cases {
+            assert_eq!(problem.to_string(), message);
+        }
+    }
+}
