@@ -1,5 +1,4 @@
 //! State of the running app, apart from how it is drawn.
-use crate::actions::save_settings;
 use crate::indicator::IndicatorState;
 use crate::permissions_view::PermissionSnapshot;
 use crate::settings_form::SettingsForm;
@@ -113,7 +112,7 @@ impl SettingsSession {
             return;
         }
         let settings = self.form.to_settings();
-        match save_settings(services, &settings) {
+        match (services.save_settings)(&settings) {
             Ok(()) => {
                 self.form = SettingsForm::from_settings(&settings);
                 self.stored = settings;
@@ -342,7 +341,7 @@ mod tests {
         assert!(!session.is_dirty());
         assert!(!services.settings_store.load().cleanup_enabled);
         assert_eq!(probe.engine_settings().len(), 1);
-        assert_eq!(probe.shortcut_updates().len(), 1);
+        assert_eq!(probe.applied_settings().len(), 1);
     }
 
     #[test]

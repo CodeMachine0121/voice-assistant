@@ -4,7 +4,7 @@
 //! Several adapters depend on settings the user can change while the app runs
 //! (microphone, speech model file, assistant address and model, shortcuts).
 //! Each is wrapped in a small "configurable" adapter that `apply` reconfigures.
-use super::{Permissions, PrivacyPane, RepaintHandle, Services};
+use super::{settings_saver, Permissions, PrivacyPane, RepaintHandle, Services};
 use crossbeam_channel::{unbounded, Sender};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -252,7 +252,18 @@ pub fn build() -> Services {
     );
     let shortcuts = spawn_shortcut_listener(shortcut_config(&settings), engine.shortcuts.clone());
 
+    let save_settings = settings_saver(
+        settings_store.clone(),
+        engine.settings.clone(),
+        move |s: &Settings| {
+            transcriber.set_path(speech_model_path(s));
+            polisher.replace(polisher_for(s));
+            recorder.with(|r| r.set_device(s.microphone.clone()));
+            let _ = shortcuts.send(shortcut_config(s));
+        },
+    );
     Services {
+        save_settings,
         settings_store,
         history_store,
         engine,
@@ -264,12 +275,6 @@ pub fn build() -> Services {
             voice_stt::download_default_model(dest, progress)
         }),
         permissions: mac_permissions(),
-        apply_settings: Arc::new(move |s: &Settings| {
-            transcriber.set_path(speech_model_path(s));
-            polisher.replace(polisher_for(s));
-            recorder.with(|r| r.set_device(s.microphone.clone()));
-            let _ = shortcuts.send(shortcut_config(s));
-        }),
     }
 }
 

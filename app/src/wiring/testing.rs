@@ -1,5 +1,5 @@
 //! Services for unit tests: in-memory stores and recorders of what was asked of them.
-use super::{fakes, Permissions, RepaintHandle, Services};
+use super::{fakes, settings_saver, Permissions, RepaintHandle, Services};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use voice_core::{EngineHandle, HistoryStore, Settings, SettingsStore, Status};
@@ -30,7 +30,7 @@ pub struct Probe {
     settings: Arc<FlakySettings>,
     engine_settings: Receiver<Settings>,
     status_tx: Sender<Status>,
-    shortcut_updates: Arc<Mutex<Vec<Settings>>>,
+    applied: Arc<Mutex<Vec<Settings>>>,
 }
 
 impl Probe {
@@ -47,8 +47,9 @@ impl Probe {
         self.engine_settings.try_iter().collect()
     }
 
-    pub fn shortcut_updates(&self) -> Vec<Settings> {
-        self.shortcut_updates.lock().unwrap().clone()
+    /// Settings handed to the adapters, in order.
+    pub fn applied_settings(&self) -> Vec<Settings> {
+        self.applied.lock().unwrap().clone()
     }
 }
 
@@ -65,7 +66,7 @@ pub fn test_services() -> (Services, Probe) {
         history_store: history,
         engine: EngineHandle {
             shortcuts: shortcuts_tx,
-            settings: settings_tx,
+            settings: settings_tx.clone(),
             status: status_rx,
         },
         repaint: RepaintHandle::default(),
@@ -81,7 +82,9 @@ pub fn test_services() -> (Services, Probe) {
             shortcuts_listening: Arc::new(|| true),
             open_privacy_settings: Arc::new(|_| {}),
         },
-        apply_settings: Arc::new(move |s: &Settings| recorded.lock().unwrap().push(s.clone())),
+        save_settings: settings_saver(settings.clone(), settings_tx, move |s: &Settings| {
+            recorded.lock().unwrap().push(s.clone())
+        }),
     };
     (
         services,
@@ -89,7 +92,7 @@ pub fn test_services() -> (Services, Probe) {
             settings,
             engine_settings: settings_rx,
             status_tx,
-            shortcut_updates: updates,
+            applied: updates,
         },
     )
 }

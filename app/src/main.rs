@@ -1,6 +1,5 @@
 //! Voice Assistant: menu-bar dictation app. `wiring` is the only module that knows
 //! the concrete adapters.
-mod actions;
 mod app;
 mod history_view;
 mod indicator;

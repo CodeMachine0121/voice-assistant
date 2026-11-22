@@ -281,8 +281,20 @@ pub fn build() -> Services {
     let settings_store: Arc<dyn SettingsStore> = Arc::new(InMemorySettings::default());
     let history_store: Arc<dyn HistoryStore> = Arc::new(InMemoryHistory::default());
     let repaint = RepaintHandle::default();
+    let engine = spawn_engine(history_store.clone(), repaint.clone());
     Services {
-        engine: spawn_engine(history_store.clone(), repaint.clone()),
+        save_settings: super::settings_saver(
+            settings_store.clone(),
+            engine.settings.clone(),
+            |s| {
+                log::info!(
+                    "demo: shortcuts now {:?} / {:?}",
+                    s.push_to_talk,
+                    s.hands_free
+                );
+            },
+        ),
+        engine,
         settings_store,
         history_store,
         repaint,
@@ -301,13 +313,6 @@ pub fn build() -> Services {
         default_model_path: Arc::new(fake_default_model_path),
         download_model: Arc::new(fake_download),
         permissions: fake_permissions(),
-        apply_settings: Arc::new(|s: &Settings| {
-            log::info!(
-                "fake: shortcuts now {:?} / {:?}",
-                s.push_to_talk,
-                s.hands_free
-            );
-        }),
     }
 }
 
@@ -522,7 +527,7 @@ mod tests {
         assert_eq!((s.list_input_devices)().len(), 2);
         assert_eq!((s.list_models)("http://x").unwrap().len(), 2);
         assert_eq!(s.settings_store.load(), Settings::default());
-        (s.apply_settings)(&Settings::default());
+        (s.save_settings)(&Settings::default()).unwrap();
         assert!((s.default_model_path)().ends_with("ggml-small.bin"));
     }
 }

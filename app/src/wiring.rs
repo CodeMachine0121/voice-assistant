@@ -8,6 +8,7 @@ mod real;
 #[cfg(test)]
 pub mod testing;
 
+use crossbeam_channel::Sender;
 use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -20,9 +21,8 @@ pub type ModelListFn = Arc<dyn Fn(&str) -> Result<Vec<String>, String> + Send + 
 /// Downloads the default speech model to a path, reporting `(downloaded, total)` bytes.
 pub type ModelDownloadFn =
     Arc<dyn Fn(&Path, &mut dyn FnMut(u64, Option<u64>)) -> Result<(), String> + Send + Sync>;
-/// Hands saved settings to the adapters that depend on them (shortcuts, microphone,
-/// speech model, writing assistant).
-pub type SettingsApplyFn = Arc<dyn Fn(&Settings) + Send + Sync>;
+/// Saves settings and puts them into effect everywhere; nothing changes on failure.
+pub type SettingsSaveFn = Arc<dyn Fn(&Settings) -> Result<(), String> + Send + Sync>;
 
 /// Panes of System Settings › Privacy & Security the app can send the user to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,7 +77,7 @@ pub struct Services {
     pub default_model_path: Arc<dyn Fn() -> PathBuf + Send + Sync>,
     pub download_model: ModelDownloadFn,
     pub permissions: Permissions,
-    pub apply_settings: SettingsApplyFn,
+    pub save_settings: SettingsSaveFn,
 }
 
 /// Environment variable that switches the app to demo mode.
@@ -91,6 +91,24 @@ pub fn build_services() -> Services {
     } else {
         real::build()
     }
+}
+
+/// The one way settings change: persist them, then hand them to the engine and to
+/// the adapters that depend on them (`apply`). Nothing is applied when persisting
+/// fails.
+fn settings_saver(
+    store: Arc<dyn SettingsStore>,
+    engine: Sender<Settings>,
+    apply: impl Fn(&Settings) + Send + Sync + 'static,
+) -> SettingsSaveFn {
+    Arc::new(move |settings: &Settings| {
+        store.save(settings)?;
+        engine
+            .send(settings.clone())
+            .map_err(|_| "The dictation engine is not running.".to_string())?;
+        apply(settings);
+        Ok(())
+    })
 }
 
 fn demo_mode(value: Option<&str>) -> bool {
@@ -114,6 +132,48 @@ mod tests {
         handle.connect(egui::Context::default());
         handle.request();
         assert!(first.has_requested_repaint());
+    }
+
+    use crate::wiring::testing::test_services;
+    use voice_core::Shortcut;
+
+    fn changed() -> Settings {
+        Settings {
+            push_to_talk: Shortcut::Fn,
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn saving_persists_and_applies() {
+        let (services, probe) = test_services();
+        (services.save_settings)(&changed()).unwrap();
+        assert_eq!(services.settings_store.load(), changed());
+        assert_eq!(probe.engine_settings(), vec![changed()]);
+        assert_eq!(probe.applied_settings(), vec![changed()]);
+    }
+
+    #[test]
+    fn a_failed_save_applies_nothing() {
+        let (services, probe) = test_services();
+        probe.fail_saving("disk full");
+        let err = (services.save_settings)(&changed()).unwrap_err();
+        assert_eq!(err, "disk full");
+        assert!(probe.engine_settings().is_empty());
+        assert!(probe.applied_settings().is_empty());
+    }
+
+    #[test]
+    fn a_stopped_engine_is_reported() {
+        let store: Arc<dyn SettingsStore> = Arc::new(fakes::InMemorySettings::default());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        drop(rx);
+        let applied = Arc::new(std::sync::Mutex::new(0));
+        let count = applied.clone();
+        let save = settings_saver(store, tx, move |_| *count.lock().unwrap() += 1);
+        let err = save(&changed()).unwrap_err();
+        assert!(err.contains("not running"));
+        assert_eq!(*applied.lock().unwrap(), 0);
     }
 
     #[test]
