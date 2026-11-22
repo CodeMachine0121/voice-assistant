@@ -45,7 +45,6 @@ impl Engine {
             recorder: deps.recorder,
             pipeline: deps.pipeline,
             settings: deps.settings,
-            recording: false,
             shortcuts,
             status: status_tx,
             on_status,
@@ -67,8 +66,6 @@ struct Worker {
     recorder: Box<dyn Recorder>,
     pipeline: DictationPipeline,
     settings: Settings,
-    /// Whether the recorder is currently capturing.
-    recording: bool,
     shortcuts: Receiver<ShortcutEvent>,
     status: Sender<Status>,
     on_status: Box<dyn Fn() + Send>,
@@ -91,7 +88,7 @@ impl Worker {
                 recv(ticker) -> _ => self.handle(ControllerEvent::Tick),
             }
         }
-        if self.recording {
+        if self.controller.is_listening() {
             self.recorder.cancel();
         }
     }
@@ -99,7 +96,7 @@ impl Worker {
     fn handle(&mut self, event: ControllerEvent) {
         match self.controller.handle(event, Instant::now()) {
             Some(command) => self.execute(command),
-            None if self.recording && event == ControllerEvent::Tick => {
+            None if self.controller.is_listening() && event == ControllerEvent::Tick => {
                 self.publish(Status::Listening {
                     level: self.recorder.level(),
                 });
@@ -112,21 +109,20 @@ impl Worker {
         match command {
             Command::StartRecording => match self.recorder.start() {
                 Ok(()) => {
-                    self.recording = true;
                     self.publish(Status::Listening {
                         level: self.recorder.level(),
                     });
                 }
                 Err(problem) => {
                     // The dictation never began: forget it entirely.
-                    self.controller = SessionController::new();
+                    self.controller
+                        .handle(ControllerEvent::RecordingFailed, Instant::now());
                     self.publish(Status::Problem(problem));
                 }
             },
             Command::StopAndProcess => {
                 self.publish(Status::Working);
                 let recording = self.recorder.stop();
-                self.recording = false;
                 let outcome = self.pipeline.process(recording, &self.settings);
                 // Only one dictation at a time: shortcuts pressed meanwhile are dropped.
                 while self.shortcuts.try_recv().is_ok() {}
@@ -135,19 +131,14 @@ impl Worker {
                     .handle(ControllerEvent::ProcessingFinished, Instant::now());
             }
             Command::Discard => {
-                self.stop_capturing();
+                self.recorder.cancel();
                 self.publish(Status::Idle);
             }
             Command::Cancel => {
-                self.stop_capturing();
+                self.recorder.cancel();
                 self.publish(Status::Cancelled);
             }
         }
-    }
-
-    fn stop_capturing(&mut self) {
-        self.recorder.cancel();
-        self.recording = false;
     }
 
     fn publish(&self, status: Status) {
@@ -275,9 +266,11 @@ mod tests {
         }
 
         /// Next status that is not a live level update.
+        /// Gives up after `WAIT` in total, so endless level updates cannot hang a test.
         fn next_status(&self) -> Status {
+            let deadline = Instant::now() + WAIT;
             loop {
-                match self.handle.status.recv_timeout(WAIT).expect("status") {
+                match self.handle.status.recv_deadline(deadline).expect("status") {
                     Status::Listening { .. } => continue,
                     other => return other,
                 }
@@ -388,6 +381,25 @@ mod tests {
         );
 
         assert_eq!(rig.log(|l| (l.starts, l.stops)), (2, 0));
+    }
+
+    #[test]
+    fn a_failed_start_publishes_no_live_level_and_cancels_nothing_on_shutdown() {
+        let rig = Rig::new(Options {
+            start_result: Err(Problem::MicrophonePermission),
+            ..Options::default()
+        });
+
+        rig.press(PushToTalkDown);
+        assert_eq!(
+            rig.handle.status.recv_timeout(WAIT).expect("status"),
+            Status::Problem(Problem::MicrophonePermission)
+        );
+        hold(TICK_INTERVAL * 3);
+
+        let (rest, _, recorder) = rig.shut_down();
+        assert!(rest.is_empty(), "unexpected statuses: {rest:?}");
+        assert_eq!(recorder.lock().unwrap().cancels, 0);
     }
 
     #[test]

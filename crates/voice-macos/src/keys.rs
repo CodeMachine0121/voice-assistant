@@ -10,7 +10,7 @@
 //! the later release of the modifier is swallowed. A quick accent therefore ends
 //! as a press shorter than the minimum dictation, which the session controller
 //! discards silently.
-use voice_core::{Shortcut, ShortcutEvent};
+use voice_core::{Settings, Shortcut, ShortcutEvent};
 
 /// Virtual key codes (Carbon `kVK_*`) the interpreter cares about.
 pub mod keycode {
@@ -54,6 +54,15 @@ pub mod flag {
 pub struct ShortcutConfig {
     pub push_to_talk: Shortcut,
     pub hands_free: Shortcut,
+}
+
+impl From<&Settings> for ShortcutConfig {
+    fn from(settings: &Settings) -> Self {
+        Self {
+            push_to_talk: settings.push_to_talk.clone(),
+            hands_free: settings.hands_free.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +244,25 @@ impl KeyInterpreter {
 mod tests {
     use super::*;
     use voice_core::ShortcutEvent::*;
+
+    #[test]
+    fn config_takes_both_shortcuts_from_the_settings() {
+        let settings = Settings {
+            push_to_talk: Shortcut::Fn,
+            hands_free: Shortcut::ControlShiftSpace,
+            ..Settings::default()
+        };
+
+        let config = ShortcutConfig::from(&settings);
+
+        assert_eq!(
+            config,
+            ShortcutConfig {
+                push_to_talk: Shortcut::Fn,
+                hands_free: Shortcut::ControlShiftSpace,
+            }
+        );
+    }
 
     const KEY_E: u16 = 14;
     const LEFT_OPTION: u16 = 58;
