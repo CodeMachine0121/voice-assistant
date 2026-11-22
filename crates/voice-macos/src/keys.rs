@@ -166,6 +166,10 @@ pub struct KeyInterpreter {
     push_to_talk: Trigger,
     hands_free: Trigger,
     state: PushToTalk,
+    /// A modifier-only hands-free shortcut is down and nothing else was pressed
+    /// yet: it toggles on release, so using the key normally (e.g. Command+C)
+    /// never starts a dictation.
+    hands_free_armed: bool,
 }
 
 impl KeyInterpreter {
@@ -174,6 +178,7 @@ impl KeyInterpreter {
             push_to_talk: trigger(&config.push_to_talk),
             hands_free: trigger(&config.hands_free),
             state: PushToTalk::Idle,
+            hands_free_armed: false,
         }
     }
 
@@ -188,6 +193,9 @@ impl KeyInterpreter {
         if self.state != PushToTalk::Idle {
             return self.while_pushed(input);
         }
+        if self.hands_free_armed {
+            return self.while_hands_free_armed(input);
+        }
         if input.autorepeat {
             return None;
         }
@@ -198,10 +206,34 @@ impl KeyInterpreter {
             self.state = PushToTalk::Held;
             return Some(ShortcutEvent::PushToTalkDown);
         }
-        if self.hands_free.pressed_alone(&input) || self.hands_free.combo_pressed(&input) {
+        if self.hands_free.pressed_alone(&input) {
+            self.hands_free_armed = true;
+            return None;
+        }
+        if self.hands_free.combo_pressed(&input) {
             return Some(ShortcutEvent::HandsFreePressed);
         }
         None
+    }
+
+    /// The modifier-only hands-free key is down: its clean release toggles; any
+    /// other key pressed meanwhile means it was used as a normal modifier.
+    fn while_hands_free_armed(&mut self, input: KeyInput) -> Option<ShortcutEvent> {
+        if let Trigger::Modifier { keycode, bit } = self.hands_free {
+            if input.kind == KeyKind::FlagsChanged
+                && input.keycode == keycode
+                && input.flags & bit == 0
+            {
+                self.hands_free_armed = false;
+                return Some(ShortcutEvent::HandsFreePressed);
+            }
+        }
+        if input.kind == KeyKind::Up {
+            return None;
+        }
+        self.hands_free_armed = false;
+        (input.kind == KeyKind::Down && input.keycode == keycode::ESCAPE)
+            .then_some(ShortcutEvent::EscapePressed)
     }
 
     /// Push-to-talk is held or was interrupted: watch for its release and for
@@ -639,19 +671,77 @@ mod tests {
         assert_eq!(produced, Some(PushToTalkUp));
     }
 
+    const RIGHT_COMMAND_HELD: u64 = flag::COMMAND | flag::RIGHT_COMMAND;
+    const KEY_C: u16 = 8;
+
+    fn right_command_hands_free() -> KeyInterpreter {
+        KeyInterpreter::new(&config(Shortcut::RightOption, Shortcut::RightCommand))
+    }
+
     #[test]
-    fn modifier_only_hands_free_shortcut_toggles_on_press() {
-        let mut keys = KeyInterpreter::new(&config(Shortcut::RightOption, Shortcut::RightCommand));
+    fn modifier_only_hands_free_shortcut_toggles_on_a_clean_release() {
+        let mut keys = right_command_hands_free();
 
         let events = feed(
             &mut keys,
             &[
-                flags_changed(keycode::RIGHT_COMMAND, flag::COMMAND | flag::RIGHT_COMMAND),
+                flags_changed(keycode::RIGHT_COMMAND, RIGHT_COMMAND_HELD),
                 flags_changed(keycode::RIGHT_COMMAND, 0),
             ],
         );
 
-        assert_eq!(events, [Some(HandsFreePressed), None]);
+        assert_eq!(events, [None, Some(HandsFreePressed)]);
+    }
+
+    #[test]
+    fn using_the_hands_free_modifier_in_a_combination_does_not_toggle() {
+        let mut keys = right_command_hands_free();
+
+        let events = feed(
+            &mut keys,
+            &[
+                flags_changed(keycode::RIGHT_COMMAND, RIGHT_COMMAND_HELD),
+                down(KEY_C, RIGHT_COMMAND_HELD),
+                up(KEY_C, RIGHT_COMMAND_HELD),
+                flags_changed(keycode::RIGHT_COMMAND, 0),
+            ],
+        );
+
+        assert_eq!(events, [None, None, None, None]);
+    }
+
+    #[test]
+    fn escape_while_the_hands_free_modifier_is_down_still_cancels() {
+        let mut keys = right_command_hands_free();
+
+        let events = feed(
+            &mut keys,
+            &[
+                flags_changed(keycode::RIGHT_COMMAND, RIGHT_COMMAND_HELD),
+                down(keycode::ESCAPE, RIGHT_COMMAND_HELD),
+                flags_changed(keycode::RIGHT_COMMAND, 0),
+            ],
+        );
+
+        assert_eq!(events, [None, Some(EscapePressed), None]);
+    }
+
+    #[test]
+    fn hands_free_modifier_works_again_after_a_combination() {
+        let mut keys = right_command_hands_free();
+
+        let events = feed(
+            &mut keys,
+            &[
+                flags_changed(keycode::RIGHT_COMMAND, RIGHT_COMMAND_HELD),
+                down(KEY_C, RIGHT_COMMAND_HELD),
+                flags_changed(keycode::RIGHT_COMMAND, 0),
+                flags_changed(keycode::RIGHT_COMMAND, RIGHT_COMMAND_HELD),
+                flags_changed(keycode::RIGHT_COMMAND, 0),
+            ],
+        );
+
+        assert_eq!(events, [None, None, None, None, Some(HandsFreePressed)]);
     }
 
     #[test]
