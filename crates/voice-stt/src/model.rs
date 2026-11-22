@@ -2,6 +2,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MODEL_FILE: &str = "ggml-small.bin";
 const MODEL_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin";
@@ -20,8 +21,9 @@ pub(crate) fn model_path_in(data_dir: PathBuf) -> PathBuf {
         .join(MODEL_FILE)
 }
 
-/// Downloads the default model to `dest`. Bytes go to `dest` with extension `part` first and
-/// the file is renamed only when complete, so `dest` never holds a partial model.
+/// Downloads the default model to `dest`. Bytes go to a private temporary file next to
+/// `dest` first and it is renamed only when complete, so `dest` never holds a partial
+/// model, and two downloads running at once cannot corrupt each other.
 /// `progress(done, total)` is called as bytes arrive; `total` is unknown if the server omits it.
 pub fn download_default_model(
     dest: &Path,
@@ -35,14 +37,22 @@ pub fn download_default_model(
     save_atomically(reader, total, dest, progress)
 }
 
-/// Streams `reader` into `dest` via a `.part` file, reporting progress after every chunk.
+/// A temporary file next to `dest`, unique to this download.
+fn part_path(dest: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    dest.with_extension(format!("part-{}-{n}", std::process::id()))
+}
+
+/// Streams `reader` into `dest` via a private temporary file, reporting progress after
+/// every chunk.
 pub(crate) fn save_atomically(
     mut reader: impl Read,
     total: Option<u64>,
     dest: &Path,
     mut progress: impl FnMut(u64, Option<u64>),
 ) -> Result<(), String> {
-    let part = dest.with_extension("part");
+    let part = part_path(dest);
     let result = (|| {
         if let Some(dir) = dest.parent() {
             fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -101,6 +111,44 @@ mod tests {
         assert!(default_model_path().ends_with("VoiceAssistant/models/ggml-small.bin"));
     }
 
+    /// No temporary download file is left in `dir`.
+    fn no_part_files(dir: &Path) -> bool {
+        fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .all(|e| !e.file_name().to_string_lossy().contains(".part"))
+            })
+            .unwrap_or(true)
+    }
+
+    #[test]
+    fn two_downloads_at_once_each_leave_a_complete_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("m.bin");
+        let threads: Vec<_> = [3u8, 9u8]
+            .into_iter()
+            .map(|byte| {
+                let dest = dest.clone();
+                std::thread::spawn(move || {
+                    save_atomically(
+                        Cursor::new(vec![byte; 3_000_000]),
+                        Some(3_000_000),
+                        &dest,
+                        |_, _| std::thread::yield_now(),
+                    )
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap().unwrap();
+        }
+        let model = fs::read(&dest).unwrap();
+        assert_eq!(model.len(), 3_000_000);
+        assert!(model.iter().all(|b| *b == model[0]), "mixed contents");
+        assert!(no_part_files(dir.path()));
+    }
+
     #[test]
     fn download_writes_the_file_and_leaves_no_part_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -113,7 +161,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fs::read(&dest).unwrap(), vec![7u8; 200_000]);
-        assert!(!dest.with_extension("part").exists());
+        assert!(no_part_files(dest.parent().unwrap()));
     }
 
     #[test]
@@ -153,7 +201,7 @@ mod tests {
         let err =
             save_atomically(Cursor::new(vec![1u8; 10]), Some(20), &dest, |_, _| {}).unwrap_err();
         assert!(err.contains("incomplete"), "{err}");
-        assert!(!dest.exists() && !dest.with_extension("part").exists());
+        assert!(!dest.exists() && no_part_files(dir.path()));
     }
 
     struct Broken;
@@ -171,7 +219,7 @@ mod tests {
         let err = save_atomically(Broken, None, &dest, |_, _| {}).unwrap_err();
         assert!(err.contains("connection reset"), "{err}");
         assert_eq!(fs::read(&dest).unwrap(), b"old");
-        assert!(!dest.with_extension("part").exists());
+        assert!(no_part_files(dir.path()));
     }
 
     #[test]
@@ -186,9 +234,13 @@ mod tests {
     #[test]
     fn part_file_that_cannot_be_created_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("m.bin");
-        fs::create_dir(dest.with_extension("part")).unwrap(); // a directory is in the way
+        use std::os::unix::fs::PermissionsExt;
+        let models = dir.path().join("models");
+        fs::create_dir(&models).unwrap();
+        fs::set_permissions(&models, fs::Permissions::from_mode(0o555)).unwrap(); // read-only
+        let dest = models.join("m.bin");
         let err = save_atomically(Cursor::new(vec![1u8]), None, &dest, |_, _| {}).unwrap_err();
+        fs::set_permissions(&models, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(err.contains("cannot write"), "{err}");
     }
 
