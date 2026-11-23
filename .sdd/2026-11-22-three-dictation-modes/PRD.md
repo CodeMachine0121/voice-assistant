@@ -356,7 +356,7 @@ flowchart TD
   - A modifier-only shortcut ("Tap Command", "Tap Command + Shift", "Tap right Option", "Tap Fn") counts only when its keys are pressed and released with no other key pressed in between. When the user ends up holding Command and Shift together, it is "Tap Command + Shift", never "Tap Command".
   - Timing: stopping under 0.5 s is accidental (exactly 0.5 s counts); listening stops on its own at 5 minutes and is processed.
   - The writing assistant only cleans up in Dictate, only translates in Dictate in English, and only carries out the spoken instruction on the selected text in Edit selection. Dictated content and selected text are material to work on, never instructions to the assistant.
-  - Chinese results are written in Traditional characters in every action.
+  - Chinese results are written in Traditional characters in every action, unless an Edit selection instruction asks for another script ("轉成簡體").
   - AI cleanup off affects Dictate only.
   - Edit selection: the selection is read the moment the shortcut is pressed, before listening starts — no selection or one over 10,000 characters stops it right there; the result replaces the selection.
   - A mouse click while a modifier is held (e.g. Command-click) counts as "another key": no tap.
@@ -386,7 +386,7 @@ flowchart TD
 ## 6. Non-Functional Requirements
 
 - **Performance:** under 4 s from stop to text for a 15-second recording with both models running locally; reading the selection adds at most 0.3 s; the indicator appears within 0.1 s of the shortcut tap.
-- **Security / Privacy:** sound, heard words and selected text are only sent to the local AI app on this Mac; nothing else leaves the computer. What the user had copied is always restored.
+- **Security / Privacy:** sound, heard words and selected text are only sent to the local AI app; Settings warns when its address is not on this Mac. Nothing else leaves the computer. What the user had copied is restored after every action, except when the text could not be typed into the front app (missing accessibility permission or a failed paste): then the text is left copied so the user can paste it by hand.
 - **Compatibility:** macOS 13+ on Apple silicon, as before.
 - **Analytics / Tracking:** None.
 
@@ -399,6 +399,7 @@ flowchart TD
   - Whether the local AI app serves speech models in a form the app can use is not confirmed by its documentation; the built-in speech model remains the default so the app works regardless.
   - Using a bare Command tap as a shortcut must never interfere with the hundreds of Command shortcuts in other apps.
   - Some apps do not expose the selection; those are treated as "nothing selected".
+  - A few code editors copy the whole current line when asked to copy with nothing selected and do not report their selection otherwise; in those, Edit selection works on the current line.
   - A small 8-billion-parameter writing assistant may occasionally answer instead of clean up; the instructions to it must be strict and tested against the scenarios above.
 
 ---
