@@ -1,99 +1,45 @@
 use crate::{Action, PersonalDictionary};
 use serde::{Deserialize, Serialize};
 
-/// A global shortcut. Every shortcut starts its action when tapped and stops it when
-/// tapped again. A "tap" shortcut counts only when its keys are pressed and released
-/// with no other key or mouse button pressed in between.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// A global shortcut. There are exactly three, one per action, and they are fixed.
+/// Every modifier in them is the right-hand key only: the left Command, Shift and
+/// Option keys never trigger anything. Every shortcut starts its action when used
+/// and stops it when used again. A "tap" counts only when its keys are pressed and
+/// released with no other key or mouse button pressed in between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Shortcut {
-    /// Tapping a Command key alone.
-    TapCommand,
-    /// Tapping a Command key together with a Shift key.
-    TapCommandShift,
-    /// Option + Space.
-    OptionSpace,
-    /// Tapping the right Option key alone.
-    TapRightOption,
     /// Tapping the right Command key alone.
     TapRightCommand,
-    /// Tapping the Fn key alone.
-    TapFn,
-    /// Control + Shift + Space.
-    ControlShiftSpace,
+    /// Tapping the right Command key together with the right Shift key.
+    TapRightCommandRightShift,
+    /// The right Option key + Space.
+    RightOptionSpace,
 }
 
 impl Shortcut {
-    /// Every shortcut the user may choose from, in the order they are offered.
-    pub const ALL: [Shortcut; 7] = [
-        Shortcut::TapCommand,
-        Shortcut::TapCommandShift,
-        Shortcut::OptionSpace,
-        Shortcut::TapRightOption,
+    /// Every shortcut, in the order of the actions they trigger.
+    pub const ALL: [Shortcut; 3] = [
         Shortcut::TapRightCommand,
-        Shortcut::TapFn,
-        Shortcut::ControlShiftSpace,
+        Shortcut::TapRightCommandRightShift,
+        Shortcut::RightOptionSpace,
     ];
 
-    /// Whether one key press can trigger both shortcuts. Tapping the right Command key
-    /// is also a tap of "a Command key", so those two collide like equal shortcuts.
-    pub fn collides_with(self, other: Shortcut) -> bool {
-        use Shortcut::{TapCommand, TapRightCommand};
-        self == other
-            || matches!(
-                (self, other),
-                (TapCommand, TapRightCommand) | (TapRightCommand, TapCommand)
-            )
-    }
-}
-
-/// The shortcut of each action. No two actions may share one (see `conflict`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ActionShortcuts {
-    pub dictate: Shortcut,
-    pub english: Shortcut,
-    pub edit_selection: Shortcut,
-}
-
-impl Default for ActionShortcuts {
-    fn default() -> Self {
-        Self {
-            dictate: Shortcut::TapCommand,
-            english: Shortcut::TapCommandShift,
-            edit_selection: Shortcut::OptionSpace,
-        }
-    }
-}
-
-impl ActionShortcuts {
-    pub fn for_action(&self, a: Action) -> &Shortcut {
-        match a {
-            Action::Dictate => &self.dictate,
-            Action::DictateInEnglish => &self.english,
-            Action::EditSelection => &self.edit_selection,
+    /// The shortcut that triggers `action`.
+    pub fn for_action(action: Action) -> Shortcut {
+        match action {
+            Action::Dictate => Shortcut::TapRightCommand,
+            Action::DictateInEnglish => Shortcut::TapRightCommandRightShift,
+            Action::EditSelection => Shortcut::RightOptionSpace,
         }
     }
 
-    pub fn set(&mut self, a: Action, s: Shortcut) {
-        match a {
-            Action::Dictate => self.dictate = s,
-            Action::DictateInEnglish => self.english = s,
-            Action::EditSelection => self.edit_selection = s,
+    /// The action this shortcut triggers.
+    pub fn action(self) -> Action {
+        match self {
+            Shortcut::TapRightCommand => Action::Dictate,
+            Shortcut::TapRightCommandRightShift => Action::DictateInEnglish,
+            Shortcut::RightOptionSpace => Action::EditSelection,
         }
-    }
-
-    /// The first two actions whose shortcuts collide (see `Shortcut::collides_with`), as
-    /// `(earlier, later)` in `Action::ALL` order; `None` when every action has its own.
-    pub fn conflict(&self) -> Option<(Action, Action)> {
-        Action::ALL.iter().enumerate().find_map(|(i, &earlier)| {
-            Action::ALL[i + 1..]
-                .iter()
-                .find(|&&later| {
-                    self.for_action(earlier)
-                        .collides_with(*self.for_action(later))
-                })
-                .map(|&later| (earlier, later))
-        })
     }
 }
 
@@ -147,12 +93,11 @@ impl Default for SpeechSettings {
 }
 
 /// Settings saved by earlier versions load with every field they still share; fields that
-/// no longer exist (the press-and-hold shortcuts, the on-device and local speech model
-/// choices) are ignored and new ones take defaults.
+/// no longer exist (any saved shortcut choice, now that the shortcuts are fixed, and the
+/// on-device and local speech model choices) are ignored and new ones take defaults.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    pub shortcuts: ActionShortcuts,
     /// `None` = system default microphone.
     pub microphone: Option<String>,
     /// OpenAI-compatible base URL of the local AI app (LM Studio default).
@@ -168,7 +113,6 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            shortcuts: ActionShortcuts::default(),
             microphone: None,
             assistant_url: "http://localhost:1234/v1".to_string(),
             assistant_model: String::new(),
@@ -186,9 +130,6 @@ mod tests {
     #[test]
     fn first_launch_defaults() {
         let s = Settings::default();
-        assert_eq!(s.shortcuts.dictate, Shortcut::TapCommand);
-        assert_eq!(s.shortcuts.english, Shortcut::TapCommandShift);
-        assert_eq!(s.shortcuts.edit_selection, Shortcut::OptionSpace);
         assert_eq!(s.speech.provider, SpeechProvider::OpenAi);
         assert_eq!(s.speech.provider.label(), "OpenAI");
         assert_eq!(s.speech.model, "gpt-4o-transcribe");
@@ -214,108 +155,33 @@ mod tests {
     }
 
     #[test]
-    fn first_launch_shortcuts_do_not_conflict() {
-        assert_eq!(ActionShortcuts::default().conflict(), None);
-    }
-
-    #[test]
-    fn each_action_reads_and_changes_its_own_shortcut() {
-        let mut shortcuts = ActionShortcuts::default();
-
-        shortcuts.set(Action::Dictate, Shortcut::TapRightOption);
-        shortcuts.set(Action::DictateInEnglish, Shortcut::TapFn);
-        shortcuts.set(Action::EditSelection, Shortcut::ControlShiftSpace);
-
+    fn each_action_has_its_own_right_hand_shortcut() {
         assert_eq!(
-            shortcuts.for_action(Action::Dictate),
-            &Shortcut::TapRightOption
+            Shortcut::for_action(Action::Dictate),
+            Shortcut::TapRightCommand
         );
         assert_eq!(
-            shortcuts.for_action(Action::DictateInEnglish),
-            &Shortcut::TapFn
+            Shortcut::for_action(Action::DictateInEnglish),
+            Shortcut::TapRightCommandRightShift
         );
         assert_eq!(
-            shortcuts.for_action(Action::EditSelection),
-            &Shortcut::ControlShiftSpace
-        );
-        assert_eq!(shortcuts.conflict(), None);
-    }
-
-    #[test]
-    fn changing_dictate_to_tap_right_option_frees_tap_command() {
-        let mut shortcuts = ActionShortcuts::default();
-
-        shortcuts.set(Action::Dictate, Shortcut::TapRightOption);
-
-        assert!(Action::ALL
-            .iter()
-            .all(|&a| shortcuts.for_action(a) != &Shortcut::TapCommand));
-        assert_eq!(shortcuts.conflict(), None);
-    }
-
-    #[test]
-    fn two_actions_sharing_a_shortcut_conflict_naming_the_earlier_first() {
-        let mut shortcuts = ActionShortcuts::default();
-
-        shortcuts.set(Action::EditSelection, Shortcut::TapCommand);
-
-        assert_eq!(
-            shortcuts.conflict(),
-            Some((Action::Dictate, Action::EditSelection))
+            Shortcut::for_action(Action::EditSelection),
+            Shortcut::RightOptionSpace
         );
     }
 
     #[test]
-    fn tapping_any_command_collides_with_tapping_the_right_command() {
-        let mut shortcuts = ActionShortcuts::default();
-        shortcuts.set(Action::EditSelection, Shortcut::TapRightCommand);
-
-        assert_eq!(
-            shortcuts.conflict(),
-            Some((Action::Dictate, Action::EditSelection))
-        );
-    }
-
-    #[test]
-    fn distinct_shortcuts_do_not_collide() {
-        for a in Shortcut::ALL {
-            for b in Shortcut::ALL {
-                let overlapping_command = matches!(
-                    (a, b),
-                    (Shortcut::TapCommand, Shortcut::TapRightCommand)
-                        | (Shortcut::TapRightCommand, Shortcut::TapCommand)
-                );
-                assert_eq!(
-                    a.collides_with(b),
-                    a == b || overlapping_command,
-                    "{a:?} {b:?}"
-                );
-            }
+    fn there_are_exactly_three_shortcuts_each_leading_back_to_its_action() {
+        assert_eq!(Shortcut::ALL.len(), 3);
+        for (shortcut, action) in Shortcut::ALL.into_iter().zip(Action::ALL) {
+            assert_eq!(shortcut.action(), action);
+            assert_eq!(Shortcut::for_action(action), shortcut);
         }
     }
 
     #[test]
-    fn a_conflict_between_the_later_actions_is_found() {
-        let mut shortcuts = ActionShortcuts::default();
-
-        shortcuts.set(Action::EditSelection, Shortcut::TapCommandShift);
-
-        assert_eq!(
-            shortcuts.conflict(),
-            Some((Action::DictateInEnglish, Action::EditSelection))
-        );
-    }
-
-    #[test]
-    fn every_shortcut_is_offered_once() {
-        let mut seen = std::collections::HashSet::new();
-        assert!(Shortcut::ALL.iter().all(|s| seen.insert(*s)));
-        assert_eq!(seen.len(), 7);
-    }
-
-    #[test]
     fn settings_round_trip_through_json() {
-        let mut settings = Settings {
+        let settings = Settings {
             speech: SpeechSettings {
                 provider: SpeechProvider::OpenAi,
                 model: "gpt-4o-mini-transcribe".into(),
@@ -323,7 +189,6 @@ mod tests {
             assistant_model: "twil-8b".into(),
             ..Settings::default()
         };
-        settings.shortcuts.set(Action::Dictate, Shortcut::TapFn);
 
         let json = serde_json::to_string(&settings).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -346,7 +211,6 @@ mod tests {
 
         let s: Settings = serde_json::from_str(old).unwrap();
 
-        assert_eq!(s.shortcuts, ActionShortcuts::default());
         assert_eq!(s.speech, SpeechSettings::default());
         assert_eq!(s.dictionary.words(), ["Cafler"]);
         assert_eq!(s.microphone.as_deref(), Some("USB Mic"));
@@ -370,7 +234,6 @@ mod tests {
 
         assert_eq!(s.speech.provider, SpeechProvider::OpenAi);
         assert_eq!(s.speech.model, "gpt-4o-transcribe");
-        assert_eq!(s.shortcuts.dictate, Shortcut::TapFn);
         assert_eq!(s.microphone.as_deref(), Some("USB Mic"));
         assert_eq!(s.dictionary.words(), ["Cafler"]);
         assert_eq!(s.assistant_model, "twil-8b");
@@ -408,12 +271,24 @@ mod tests {
     }
 
     #[test]
-    fn partially_saved_shortcuts_fill_in_the_missing_ones() {
-        let s: Settings =
-            serde_json::from_str(r#"{ "shortcuts": { "dictate": "TapFn" } }"#).unwrap();
+    fn settings_with_saved_shortcut_choices_still_load() {
+        let old = r#"{
+            "shortcuts": {
+                "dictate": "TapFn",
+                "english": "ControlShiftSpace",
+                "edit_selection": "OptionSpace"
+            },
+            "microphone": "USB Mic",
+            "assistant_model": "twil-8b",
+            "cleanup_enabled": false
+        }"#;
 
-        assert_eq!(s.shortcuts.dictate, Shortcut::TapFn);
-        assert_eq!(s.shortcuts.english, Shortcut::TapCommandShift);
-        assert_eq!(s.shortcuts.edit_selection, Shortcut::OptionSpace);
+        let s: Settings = serde_json::from_str(old).unwrap();
+
+        assert_eq!(s.microphone.as_deref(), Some("USB Mic"));
+        assert_eq!(s.assistant_model, "twil-8b");
+        assert!(!s.cleanup_enabled);
+        let saved_again = serde_json::to_string(&s).unwrap();
+        assert!(!saved_again.contains("shortcuts"), "{saved_again}");
     }
 }

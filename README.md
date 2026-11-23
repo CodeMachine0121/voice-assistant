@@ -30,13 +30,18 @@ On first launch:
 
 ## Using it
 
-| Action | Default |
+Each action has one fixed shortcut. Use it once to start speaking and again to stop.
+
+| Action | Shortcut |
 | --- | --- |
-| Push-to-talk | hold **right Option** |
-| Hands-free start/stop | **Control + Shift + Space** |
+| Dictate (write what you say) | tap **right ⌘** alone |
+| Dictate in English (write what you say, in English) | tap **right ⌘ + right ⇧** together |
+| Edit selection (say what to do with the selected text) | **right ⌥ + Space** |
 | Cancel | **Escape** |
 
-Presses shorter than 0.5 s are ignored, and a dictation stops on its own after 5 minutes. If LM Studio is not reachable (or takes longer than 20 s), the raw transcript is inserted. The last 200 dictations are kept under **History…**.
+Only the right-hand ⌘, ⇧ and ⌥ keys count. The left-hand keys never start anything, so shortcuts such as ⌘C or ⌥ + Space keep working as usual with them. A tap counts only when the keys are released within a second with nothing else pressed in between. Right ⌥ + Space types no space.
+
+Recordings shorter than 0.5 s are ignored, and a dictation stops on its own after 5 minutes. If LM Studio is not reachable (or takes longer than 20 s), the raw transcript is inserted. The last 200 dictations are kept under **History…**.
 
 ## Development
 

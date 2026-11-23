@@ -150,8 +150,8 @@ pub struct AppModel {
     /// The History window should come to the front.
     pub history_focus: FocusRequest,
     pub quit_requested: bool,
-    /// Focus was handed back by hiding the app; its windows stay hidden until shown.
-    handed_back: bool,
+    /// The status as last noticed, to tell when time alone has changed it.
+    noticed_status: Status,
 }
 
 impl AppModel {
@@ -164,26 +164,32 @@ impl AppModel {
             settings_focus: FocusRequest::default(),
             history_focus: FocusRequest::default(),
             quit_requested: false,
-            handed_back: false,
+            noticed_status: Status::Idle,
         }
     }
 
     /// Takes in every status the engine has published; history is reloaded after each
     /// finished dictation (Done, or a problem that may still have recorded an entry,
-    /// such as cleanup being skipped).
-    pub fn drain_statuses(&mut self, services: &Services, now: Instant) {
+    /// such as cleanup being skipped). `true` when any status arrived.
+    pub fn drain_statuses(&mut self, services: &Services, now: Instant) -> bool {
+        let mut any = false;
         for status in services.engine.status.try_iter() {
-            if self.handed_back {
-                // The indicator must be seen, but without taking focus from the
-                // app being dictated into.
-                (services.app_focus.show_without_focus)();
-                self.handed_back = false;
-            }
+            any = true;
             if matches!(status, Status::Done | Status::Problem(_)) {
                 self.history = services.history_store.load();
             }
             self.indicator.set_status(status, now);
         }
+        any
+    }
+
+    /// `true` once when the shown status has changed by time passing alone (a
+    /// message expiring), not by a new status from the engine.
+    pub fn status_expired(&mut self, now: Instant) -> bool {
+        let status = self.indicator.effective_status(now);
+        let expired = status != self.noticed_status && status == Status::Idle;
+        self.noticed_status = status;
+        expired
     }
 
     /// Opening a window also brings it to the front with keyboard focus, whether it
@@ -194,13 +200,13 @@ impl AppModel {
                 if self.settings.is_none() {
                     self.settings = Some(SettingsSession::open(services));
                 }
-                self.bring_to_front(services);
+                (services.app_focus.bring_to_front)();
                 self.settings_focus.request(now);
             }
             TrayCommand::History => {
                 self.history = services.history_store.load();
                 self.history_open = true;
-                self.bring_to_front(services);
+                (services.app_focus.bring_to_front)();
                 self.history_focus.request(now);
             }
             TrayCommand::Quit => self.quit_requested = true,
@@ -219,17 +225,11 @@ impl AppModel {
         self.hand_back_after_last_window(services);
     }
 
-    fn bring_to_front(&mut self, services: &Services) {
-        (services.app_focus.bring_to_front)();
-        self.handed_back = false;
-    }
-
     /// Once no window is left, the app the user was in gets focus back, so the next
     /// dictation pastes there and not into this app.
-    fn hand_back_after_last_window(&mut self, services: &Services) {
+    fn hand_back_after_last_window(&self, services: &Services) {
         if self.settings.is_none() && !self.history_open {
             (services.app_focus.hand_back)();
-            self.handed_back = true;
         }
     }
 }
@@ -241,7 +241,7 @@ mod tests {
     use chrono::Local;
     use std::sync::Mutex;
     use std::time::Duration;
-    use voice_core::{Action, HistoryEntry, Problem, Shortcut};
+    use voice_core::{Action, HistoryEntry, Problem};
 
     fn entry(text: &str) -> HistoryEntry {
         HistoryEntry {
@@ -501,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn after_handing_back_the_next_status_shows_the_app_without_focus() {
+    fn statuses_never_move_focus() {
         let (services, probe) = test_services();
         let now = Instant::now();
         let mut model = AppModel::new(now);
@@ -512,44 +512,80 @@ mod tests {
             &probe,
             &[Status::Working(Action::Dictate), Status::Cancelled],
         );
-        model.drain_statuses(&services, now);
+        assert!(model.drain_statuses(&services, now));
 
         assert_eq!(
             probe.focus_moves(),
-            [
-                FocusMove::BringToFront,
-                FocusMove::HandBack,
-                FocusMove::ShowWithoutFocus
-            ],
-            "shown once, and only after handing back"
+            [FocusMove::BringToFront, FocusMove::HandBack],
+            "dictating after a window closed leaves focus with the app dictated into"
         );
     }
 
     #[test]
-    fn without_handing_back_statuses_leave_focus_alone() {
+    fn draining_reports_whether_any_status_arrived() {
         let (services, probe) = test_services();
         let now = Instant::now();
         let mut model = AppModel::new(now);
-
+        assert!(!model.drain_statuses(&services, now));
         publish(&probe, &[Status::Working(Action::Dictate)]);
-        model.drain_statuses(&services, now);
-
-        assert!(probe.focus_moves().is_empty());
+        assert!(model.drain_statuses(&services, now));
+        assert!(!model.drain_statuses(&services, now));
     }
 
     #[test]
-    fn opening_a_window_again_after_handing_back_needs_no_extra_show() {
+    fn opening_and_closing_windows_again_and_again_moves_focus_every_time() {
+        let (services, probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+        for _ in 0..3 {
+            model.handle_command(TrayCommand::Settings, &services, now);
+            model.close_settings(&services);
+            model.handle_command(TrayCommand::History, &services, now);
+            model.close_history(&services);
+        }
+
+        let round = [FocusMove::BringToFront, FocusMove::HandBack];
+        assert_eq!(probe.focus_moves(), round.repeat(6));
+    }
+
+    #[test]
+    fn reopening_after_handing_back_shows_the_window_again() {
         let (services, probe) = test_services();
         let now = Instant::now();
         let mut model = AppModel::new(now);
         model.handle_command(TrayCommand::History, &services, now);
         model.close_history(&services);
+
         model.handle_command(TrayCommand::History, &services, now);
 
+        assert!(model.history_open);
+        assert!(model.history_focus.poll(false, now));
+        assert_eq!(probe.times_brought_to_front(), 2);
+    }
+
+    #[test]
+    fn a_message_expiring_is_noticed_once() {
+        let (services, probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+        publish(&probe, &[Status::Done]);
+        model.drain_statuses(&services, now);
+        assert!(!model.status_expired(now), "a new status is not an expiry");
+
+        let later = now + model.indicator.time_to_expiry(now).unwrap();
+        assert!(model.status_expired(later));
+        assert!(!model.status_expired(later), "noticed only once");
+    }
+
+    #[test]
+    fn a_status_that_does_not_expire_is_never_reported_as_expired() {
+        let (services, probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+        assert!(!model.status_expired(now));
         publish(&probe, &[Status::Working(Action::Dictate)]);
         model.drain_statuses(&services, now);
-
-        assert!(!probe.focus_moves().contains(&FocusMove::ShowWithoutFocus));
+        assert!(!model.status_expired(now + std::time::Duration::from_secs(600)));
     }
 
     #[test]
@@ -567,15 +603,12 @@ mod tests {
         services
             .settings_store
             .save(&Settings {
-                shortcuts: voice_core::ActionShortcuts {
-                    dictate: Shortcut::TapFn,
-                    ..Default::default()
-                },
+                microphone: Some("USB Mic".into()),
                 ..Settings::default()
             })
             .unwrap();
         let session = SettingsSession::open(&services);
-        assert_eq!(session.form.shortcuts.dictate, Shortcut::TapFn);
+        assert_eq!(session.form.microphone.as_deref(), Some("USB Mic"));
         assert_eq!(session.devices, ["Mic A"]);
         assert!(!session.is_dirty());
         assert_eq!(session.notice, None);
@@ -610,13 +643,10 @@ mod tests {
     fn invalid_form_is_not_saved() {
         let (services, probe) = test_services();
         let mut session = SettingsSession::open(&services);
-        session
-            .form
-            .shortcuts
-            .set(Action::EditSelection, Shortcut::TapCommand);
+        session.form.assistant_url = " ".into();
         assert!(!session.can_save());
         session.save(&services);
-        assert!(matches!(&session.notice, Some(Notice::Problem(m)) if m.contains("different")));
+        assert!(matches!(&session.notice, Some(Notice::Problem(m)) if m.contains("address")));
         assert!(probe.engine_settings().is_empty());
         assert_eq!(services.settings_store.load(), Settings::default());
     }

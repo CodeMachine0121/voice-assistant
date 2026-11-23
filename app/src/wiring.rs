@@ -112,19 +112,19 @@ pub struct Services {
 pub struct AppFocus {
     /// Makes the app the active app so its windows can come to the front.
     pub bring_to_front: Arc<dyn Fn() + Send + Sync>,
-    /// Hides the app, so the app the user was in becomes active again.
+    /// Gives focus back to the app that was active before `bring_to_front`, if it
+    /// is still running. Never hides this app: its menu must keep working.
     pub hand_back: Arc<dyn Fn() + Send + Sync>,
-    /// Lets the app show windows again after `hand_back`, without taking focus.
-    pub show_without_focus: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl AppFocus {
-    /// The real thing, through AppKit.
+    /// The real thing, through AppKit. Starts following which other app the user
+    /// is in, so build it on the main thread at startup.
     pub fn macos() -> Self {
+        voice_macos::track_focus();
         Self {
             bring_to_front: Arc::new(voice_macos::activate_app),
-            hand_back: Arc::new(voice_macos::hide_app),
-            show_without_focus: Arc::new(voice_macos::unhide_app_without_activation),
+            hand_back: Arc::new(voice_macos::return_focus),
         }
     }
 }
@@ -202,14 +202,10 @@ mod tests {
     }
 
     use crate::wiring::testing::test_services;
-    use voice_core::Shortcut;
 
     fn changed() -> Settings {
         Settings {
-            shortcuts: voice_core::ActionShortcuts {
-                dictate: Shortcut::TapFn,
-                ..Default::default()
-            },
+            microphone: Some("USB Mic".into()),
             ..Settings::default()
         }
     }

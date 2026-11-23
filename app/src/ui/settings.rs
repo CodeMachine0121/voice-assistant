@@ -7,7 +7,7 @@ use crate::settings_form::{
     CLEANUP_LABEL, SPEECH_GROUP, SPEECH_PRIVACY_NOTE, SPEECH_PURPOSE, WRITING_GROUP,
     WRITING_PURPOSE,
 };
-use crate::shortcut_names::{caps_text, friendly_name, key_caps, ALL_SHORTCUTS};
+use crate::shortcut_names::key_caps;
 use crate::tasks::ModelsState;
 use crate::ui::{follow_focus, OK_COLOUR, PROBLEM_COLOUR};
 use crate::wiring::Services;
@@ -54,7 +54,7 @@ fn draw(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
     ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            section(ui, "Shortcuts", |ui| shortcuts(ui, session));
+            section(ui, "Shortcuts", shortcuts);
             section(ui, SPEECH_GROUP, |ui| speech_to_text(ui, session, services));
             section(ui, WRITING_GROUP, |ui| {
                 writing_assistant(ui, session, services)
@@ -74,7 +74,8 @@ fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
     ui.separator();
 }
 
-fn shortcuts(ui: &mut egui::Ui, session: &mut SettingsSession) {
+/// Each action with its fixed shortcut. Only the right-hand modifier keys count.
+fn shortcuts(ui: &mut egui::Ui) {
     for action in Action::ALL {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
@@ -82,16 +83,27 @@ fn shortcuts(ui: &mut egui::Ui, session: &mut SettingsSession) {
                 ui.label(RichText::new(action.description()).weak().small());
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut value = *session.form.shortcuts.for_action(action);
-                shortcut_picker(ui, action, &mut value);
-                session.form.shortcuts.set(action, value);
+                // Right to left: the last key first.
+                for (i, key) in shortcut_keys(action).iter().rev().enumerate() {
+                    if i > 0 {
+                        ui.label(RichText::new("+").weak());
+                    }
+                    key_cap(ui, key);
+                }
             });
         });
-        if let Some(conflict) = session.form.shortcut_conflict(action) {
-            ui.colored_label(PROBLEM_COLOUR, conflict);
-        }
         ui.add_space(4.0);
     }
+    ui.label(RichText::new(SHORTCUTS_NOTE).weak().small());
+}
+
+/// Under the shortcuts: why the left-hand keys do nothing.
+pub const SHORTCUTS_NOTE: &str =
+    "Only the right-hand ⌘, ⇧ and ⌥ keys count, so the left ones keep working as usual.";
+
+/// The key caps of the shortcut of `action`.
+fn shortcut_keys(action: Action) -> &'static [&'static str] {
+    key_caps(Shortcut::for_action(action))
 }
 
 /// A key cap: one key of a shortcut drawn as a small rounded box.
@@ -103,27 +115,6 @@ fn key_cap(ui: &mut egui::Ui, key: &str) {
         .inner_margin(Margin::symmetric(5, 0))
         .show(ui, |ui| {
             ui.label(RichText::new(key).monospace().small());
-        });
-}
-
-fn shortcut_picker(ui: &mut egui::Ui, action: Action, value: &mut Shortcut) {
-    ComboBox::from_id_salt(("shortcut", action.label()))
-        .width(200.0)
-        .selected_text(caps_text(value))
-        .show_ui(ui, |ui| {
-            for shortcut in ALL_SHORTCUTS {
-                ui.horizontal(|ui| {
-                    for key in key_caps(&shortcut) {
-                        key_cap(ui, key);
-                    }
-                    if ui
-                        .selectable_label(*value == shortcut, friendly_name(&shortcut))
-                        .clicked()
-                    {
-                        *value = shortcut;
-                    }
-                });
-            }
         });
 }
 
@@ -170,7 +161,7 @@ fn writing_uses(ui: &mut egui::Ui, session: &SettingsSession) {
     for action in Action::ALL {
         ui.horizontal(|ui| {
             ui.label(RichText::new(action.label()).strong());
-            for key in key_caps(session.form.shortcuts.for_action(action)) {
+            for key in shortcut_keys(action) {
                 key_cap(ui, key);
             }
             ui.label(
@@ -519,6 +510,41 @@ mod tests {
     }
 
     #[test]
+    fn the_shortcuts_group_shows_the_three_fixed_right_hand_shortcuts() {
+        let (services, _probe) = test_services();
+        let mut session = SettingsSession::open(&services);
+
+        let drawn = drawn_window(&mut session, &services);
+
+        let start = position(&drawn, "Shortcuts") + 1;
+        let end = position(&drawn, SPEECH_GROUP);
+        let d = |a: Action| a.description().to_string();
+        let expected: Vec<String> = [
+            "Dictate".to_string(),
+            d(Action::Dictate),
+            "Right ⌘".into(),
+            "English".into(),
+            d(Action::DictateInEnglish),
+            // Drawn right to left: the last key first.
+            "Right ⇧".into(),
+            "+".into(),
+            "Right ⌘".into(),
+            "Edit".into(),
+            d(Action::EditSelection),
+            "Space".into(),
+            "+".into(),
+            "Right ⌥".into(),
+            SHORTCUTS_NOTE.into(),
+        ]
+        .into();
+        assert_eq!(
+            drawn[start..end],
+            expected,
+            "nothing to pick, just the keys"
+        );
+    }
+
+    #[test]
     fn speech_and_writing_models_are_in_separate_groups() {
         let (services, _probe) = test_services();
         let mut session = SettingsSession::open(&services);
@@ -564,7 +590,7 @@ mod tests {
         let under_writing = &drawn[writing..];
         for action in Action::ALL {
             let name = position(under_writing, action.label());
-            let caps = key_caps(session.form.shortcuts.for_action(action));
+            let caps = shortcut_keys(action);
             let used_for = position(under_writing, writing_use(action, true));
             assert!(name < used_for, "{action:?}: {under_writing:?}");
             for (offset, key) in caps.iter().enumerate() {

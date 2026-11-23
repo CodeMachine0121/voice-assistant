@@ -3,8 +3,7 @@
 //! grants Input Monitoring / Accessibility, without restarting the app.
 //!
 //! The service never asks for permissions itself; prompting is the app's call.
-use crate::keys::ShortcutConfig;
-use crate::shortcuts::{EventTapShortcuts, ShortcutListener};
+use crate::shortcuts::EventTapShortcuts;
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,48 +14,36 @@ use voice_core::{Problem, ShortcutEvent};
 /// How long the supervisor waits between two attempts to start the listener.
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
-/// What the supervisor needs from a running listener.
-pub(crate) trait LiveShortcuts {
-    fn update(&self, config: ShortcutConfig);
-}
-
-impl LiveShortcuts for ShortcutListener {
-    fn update(&self, config: ShortcutConfig) {
-        ShortcutListener::update(self, config);
-    }
-}
-
-/// Starts and supervises the global shortcut listener.
+/// Starts and supervises the global shortcut listener. The shortcuts are fixed, so
+/// once listening there is nothing left to do but keep the listener alive.
 pub struct ShortcutService;
 
 impl ShortcutService {
     /// Spawns the supervisor using the real event tap, retrying every
     /// [`RETRY_INTERVAL`] while macOS refuses it.
-    pub fn spawn(config: ShortcutConfig, sink: Sender<ShortcutEvent>) -> ShortcutHandle {
-        Self::spawn_with(config, sink, EventTapShortcuts::start, RETRY_INTERVAL)
+    pub fn spawn(sink: Sender<ShortcutEvent>) -> ShortcutHandle {
+        Self::spawn_with(sink, EventTapShortcuts::start, RETRY_INTERVAL)
     }
 
     /// Spawns the supervisor with an injected `start` function and retry interval.
     ///
-    /// The listener is created, updated and dropped on the supervisor thread only.
+    /// The listener is created and dropped on the supervisor thread only.
     pub(crate) fn spawn_with<L, F>(
-        config: ShortcutConfig,
         sink: Sender<ShortcutEvent>,
         start: F,
         retry: Duration,
     ) -> ShortcutHandle
     where
-        L: LiveShortcuts + 'static,
-        F: FnMut(ShortcutConfig, Sender<ShortcutEvent>) -> Result<L, Problem> + Send + 'static,
+        L: 'static,
+        F: FnMut(Sender<ShortcutEvent>) -> Result<L, Problem> + Send + 'static,
     {
-        let (configs_tx, configs) = unbounded();
+        let (stop_tx, stop) = unbounded();
         let listening = Arc::new(AtomicBool::new(false));
         let supervisor = Supervisor {
-            pending: config,
             sink,
             start,
             retry,
-            configs,
+            stop,
             listening: Arc::clone(&listening),
         };
         let thread = std::thread::Builder::new()
@@ -65,7 +52,7 @@ impl ShortcutService {
             .map_err(|e| log::error!("cannot start the shortcut supervisor thread: {e}"))
             .ok();
         ShortcutHandle {
-            configs: Some(configs_tx),
+            stop: Some(stop_tx),
             listening,
             thread,
         }
@@ -73,52 +60,39 @@ impl ShortcutService {
 }
 
 struct Supervisor<F> {
-    /// The configuration the listener runs with, or will start with.
-    pending: ShortcutConfig,
     sink: Sender<ShortcutEvent>,
     start: F,
     retry: Duration,
-    configs: Receiver<ShortcutConfig>,
+    /// Closes when the handle is dropped; nothing is ever sent on it.
+    stop: Receiver<()>,
     listening: Arc<AtomicBool>,
 }
 
 impl<L, F> Supervisor<F>
 where
-    L: LiveShortcuts,
-    F: FnMut(ShortcutConfig, Sender<ShortcutEvent>) -> Result<L, Problem>,
+    F: FnMut(Sender<ShortcutEvent>) -> Result<L, Problem>,
 {
     fn run(mut self) {
-        let mut live: Option<L> = None;
         let mut failures: u32 = 0;
-        loop {
-            if live.is_none() {
-                live = self.attempt(&mut failures);
+        let live = loop {
+            if let Some(listener) = self.attempt(&mut failures) {
+                break Some(listener);
             }
-            let next = match live {
-                Some(_) => self
-                    .configs
-                    .recv()
-                    .map_err(|_| RecvTimeoutError::Disconnected),
-                None => self.configs.recv_timeout(self.retry),
-            };
-            match next {
-                Ok(config) => {
-                    if let Some(listener) = &live {
-                        listener.update(config.clone());
-                    }
-                    self.pending = config;
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
+            if let Err(RecvTimeoutError::Disconnected) = self.stop.recv_timeout(self.retry) {
+                break None;
             }
+        };
+        if live.is_some() {
+            // Keep the listener until the handle goes away.
+            let _ = self.stop.recv();
         }
         drop(live);
         self.listening.store(false, Ordering::Release);
     }
 
-    /// One try at starting the listener with the pending configuration.
+    /// One try at starting the listener.
     fn attempt(&mut self, failures: &mut u32) -> Option<L> {
-        match (self.start)(self.pending.clone(), self.sink.clone()) {
+        match (self.start)(self.sink.clone()) {
             Ok(listener) => {
                 if *failures > 0 {
                     log::info!("global shortcuts available after {failures} failed attempt(s)");
@@ -144,21 +118,12 @@ where
 /// the listener.
 pub struct ShortcutHandle {
     /// `None` only while dropping, so the supervisor sees the channel close.
-    configs: Option<Sender<ShortcutConfig>>,
+    stop: Option<Sender<()>>,
     listening: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl ShortcutHandle {
-    /// Switches the live listener to new shortcuts, or keeps them for the next
-    /// start attempt while it is not listening.
-    pub fn apply(&self, config: ShortcutConfig) {
-        if let Some(configs) = &self.configs {
-            // The supervisor is gone only if its thread could not be created.
-            let _ = configs.send(config);
-        }
-    }
-
     /// Whether the global shortcuts are being listened to right now.
     pub fn is_listening(&self) -> bool {
         self.listening.load(Ordering::Acquire)
@@ -167,7 +132,7 @@ impl ShortcutHandle {
 
 impl Drop for ShortcutHandle {
     fn drop(&mut self) {
-        self.configs = None;
+        self.stop = None;
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -179,42 +144,26 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::time::Instant;
-    use voice_core::{Action, ActionShortcuts, Shortcut};
+    use voice_core::Action;
 
     const WAIT: Duration = Duration::from_secs(5);
     const FAST: Duration = Duration::from_millis(10);
     const NEVER: Duration = Duration::from_secs(3600);
 
-    fn config(dictate: Shortcut) -> ShortcutConfig {
-        let mut shortcuts = ActionShortcuts::default();
-        shortcuts.set(Action::Dictate, dictate);
-        ShortcutConfig { shortcuts }
-    }
-
     /// Records what the supervisor does with the listeners it starts.
     #[derive(Default)]
     struct Log {
-        attempts: Mutex<Vec<ShortcutConfig>>,
-        updates: Mutex<Vec<ShortcutConfig>>,
+        attempts: Mutex<usize>,
         dropped: AtomicBool,
     }
 
     impl Log {
-        fn attempts(&self) -> Vec<ShortcutConfig> {
-            self.attempts.lock().unwrap().clone()
-        }
-        fn updates(&self) -> Vec<ShortcutConfig> {
-            self.updates.lock().unwrap().clone()
+        fn attempts(&self) -> usize {
+            *self.attempts.lock().unwrap()
         }
     }
 
     struct FakeListener(Arc<Log>);
-
-    impl LiveShortcuts for FakeListener {
-        fn update(&self, config: ShortcutConfig) {
-            self.0.updates.lock().unwrap().push(config);
-        }
-    }
 
     impl Drop for FakeListener {
         fn drop(&mut self) {
@@ -227,12 +176,11 @@ mod tests {
     fn start_after(
         refusals: usize,
         log: &Arc<Log>,
-    ) -> impl FnMut(ShortcutConfig, Sender<ShortcutEvent>) -> Result<FakeListener, Problem> + Send
-    {
+    ) -> impl FnMut(Sender<ShortcutEvent>) -> Result<FakeListener, Problem> + Send {
         let mut refusals_left = refusals;
         let log = Arc::clone(log);
-        move |config, sink| {
-            log.attempts.lock().unwrap().push(config);
+        move |sink| {
+            *log.attempts.lock().unwrap() += 1;
             if refusals_left == 0 {
                 let _ = sink.send(ShortcutEvent::ActionTapped(Action::Dictate));
                 Ok(FakeListener(Arc::clone(&log)))
@@ -246,12 +194,7 @@ mod tests {
     fn spawn(refusals: usize, retry: Duration) -> (ShortcutHandle, Arc<Log>) {
         let log = Arc::new(Log::default());
         let (sink, _) = unbounded();
-        let handle = ShortcutService::spawn_with(
-            config(Shortcut::TapRightOption),
-            sink,
-            start_after(refusals, &log),
-            retry,
-        );
+        let handle = ShortcutService::spawn_with(sink, start_after(refusals, &log), retry);
         (handle, log)
     }
 
@@ -268,7 +211,7 @@ mod tests {
         let (handle, log) = spawn(0, NEVER);
 
         wait_until("listening", || handle.is_listening());
-        assert_eq!(log.attempts(), [config(Shortcut::TapRightOption)]);
+        assert_eq!(log.attempts(), 1);
     }
 
     #[test]
@@ -276,30 +219,30 @@ mod tests {
         let (handle, log) = spawn(3, FAST);
 
         wait_until("listening", || handle.is_listening());
-        assert_eq!(log.attempts().len(), 4);
+        assert_eq!(log.attempts(), 4);
     }
 
     #[test]
     fn waits_the_retry_interval_between_attempts() {
         let (handle, log) = spawn(usize::MAX, NEVER);
 
-        wait_until("first attempt", || log.attempts().len() == 1);
+        wait_until("first attempt", || log.attempts() == 1);
         std::thread::sleep(Duration::from_millis(100));
 
-        assert_eq!(log.attempts().len(), 1);
+        assert_eq!(log.attempts(), 1);
         assert!(!handle.is_listening());
     }
 
     #[test]
     fn retries_again_after_the_interval_elapses() {
         let (handle, log) = spawn(1, Duration::from_millis(200));
-        wait_until("first attempt", || log.attempts().len() == 1);
+        wait_until("first attempt", || log.attempts() == 1);
         let refused_at = Instant::now();
 
         wait_until("listening", || handle.is_listening());
 
         assert!(refused_at.elapsed() >= Duration::from_millis(150));
-        assert_eq!(log.attempts().len(), 2);
+        assert_eq!(log.attempts(), 2);
     }
 
     #[test]
@@ -307,12 +250,7 @@ mod tests {
         let log = Arc::new(Log::default());
         let (sink, events) = unbounded();
 
-        let _handle = ShortcutService::spawn_with(
-            config(Shortcut::TapRightOption),
-            sink,
-            start_after(0, &log),
-            NEVER,
-        );
+        let _handle = ShortcutService::spawn_with(sink, start_after(0, &log), NEVER);
 
         assert_eq!(
             events.recv_timeout(WAIT),
@@ -321,44 +259,14 @@ mod tests {
     }
 
     #[test]
-    fn new_config_goes_to_the_live_listener_without_restarting_it() {
-        let (handle, log) = spawn(0, NEVER);
+    fn a_live_listener_is_never_restarted() {
+        let (handle, log) = spawn(0, FAST);
         wait_until("listening", || handle.is_listening());
 
-        handle.apply(config(Shortcut::TapFn));
+        std::thread::sleep(Duration::from_millis(50));
 
-        wait_until("update", || !log.updates().is_empty());
-        assert_eq!(log.updates(), [config(Shortcut::TapFn)]);
-        assert_eq!(log.attempts().len(), 1);
-    }
-
-    #[test]
-    fn new_config_while_not_listening_is_used_for_the_next_attempt() {
-        let (handle, log) = spawn(1, NEVER);
-        wait_until("first attempt", || log.attempts().len() == 1);
-
-        handle.apply(config(Shortcut::TapRightCommand));
-
-        wait_until("listening", || handle.is_listening());
-        assert_eq!(
-            log.attempts(),
-            [
-                config(Shortcut::TapRightOption),
-                config(Shortcut::TapRightCommand)
-            ]
-        );
-        assert!(log.updates().is_empty());
-    }
-
-    #[test]
-    fn newest_config_survives_further_refusals() {
-        let (handle, log) = spawn(2, FAST);
-        wait_until("first attempt", || !log.attempts().is_empty());
-        handle.apply(config(Shortcut::TapFn));
-
-        wait_until("listening", || handle.is_listening());
-
-        assert_eq!(log.attempts().last(), Some(&config(Shortcut::TapFn)));
+        assert_eq!(log.attempts(), 1);
+        assert!(!log.dropped.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -374,13 +282,13 @@ mod tests {
     #[test]
     fn dropping_the_handle_stops_retrying() {
         let (handle, log) = spawn(usize::MAX, FAST);
-        wait_until("a few attempts", || log.attempts().len() >= 3);
+        wait_until("a few attempts", || log.attempts() >= 3);
 
         drop(handle);
-        let attempts = log.attempts().len();
+        let attempts = log.attempts();
         std::thread::sleep(Duration::from_millis(50));
 
-        assert_eq!(log.attempts().len(), attempts);
+        assert_eq!(log.attempts(), attempts);
     }
 
     #[test]
@@ -400,8 +308,7 @@ mod tests {
     fn real_service_starts_and_stops_cleanly() {
         let (sink, events) = unbounded();
 
-        let handle = ShortcutService::spawn(config(Shortcut::TapRightOption), sink);
-        handle.apply(config(Shortcut::TapFn));
+        let handle = ShortcutService::spawn(sink);
         drop(handle);
 
         assert!(events.try_recv().is_err());

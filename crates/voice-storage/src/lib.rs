@@ -93,9 +93,7 @@ impl HistoryStore for JsonHistoryStore {
 mod tests {
     use super::*;
     use chrono::{Local, TimeZone};
-    use voice_core::{
-        Action, ActionShortcuts, HistoryEntry, PersonalDictionary, Shortcut, SpeechSettings,
-    };
+    use voice_core::{Action, HistoryEntry, PersonalDictionary, SpeechSettings};
 
     fn entry(n: u32) -> HistoryEntry {
         HistoryEntry {
@@ -122,10 +120,6 @@ mod tests {
         let store = JsonSettingsStore::new(dir.path().into());
         let s = Settings {
             assistant_model: "qwen2.5-7b-instruct".into(),
-            shortcuts: ActionShortcuts {
-                dictate: Shortcut::TapFn,
-                ..ActionShortcuts::default()
-            },
             speech: SpeechSettings {
                 model: "gpt-4o-mini-transcribe".into(),
                 ..SpeechSettings::default()
@@ -319,19 +313,40 @@ mod tests {
 }"#;
 
     #[test]
-    fn settings_from_the_press_and_hold_version_get_the_new_shortcuts_and_keep_the_rest() {
+    fn settings_from_the_press_and_hold_version_keep_the_rest() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("settings.json"), OLD_SETTINGS).unwrap();
         let loaded = JsonSettingsStore::new(dir.path().into()).load();
-        assert_eq!(loaded.shortcuts, ActionShortcuts::default());
-        assert_eq!(loaded.shortcuts.dictate, Shortcut::TapCommand);
-        assert_eq!(loaded.shortcuts.english, Shortcut::TapCommandShift);
-        assert_eq!(loaded.shortcuts.edit_selection, Shortcut::OptionSpace);
         assert_eq!(loaded.dictionary.words(), ["Cafler".to_string()]);
         assert_eq!(loaded.microphone.as_deref(), Some("USB Mic"));
         assert_eq!(loaded.assistant_model, "qwen2.5-7b-instruct");
         assert!(!loaded.cleanup_enabled);
         assert_eq!(loaded.speech, SpeechSettings::default());
+    }
+
+    #[test]
+    fn settings_with_chosen_shortcuts_load_and_drop_the_choice_when_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "shortcuts": { "dictate": "TapFn", "english": "TapCommandShift", "edit_selection": "OptionSpace" },
+  "microphone": "USB Mic",
+  "assistant_model": "twil-8b"
+}"#,
+        )
+        .unwrap();
+        let store = JsonSettingsStore::new(dir.path().into());
+
+        let loaded = store.load();
+        assert_eq!(loaded.microphone.as_deref(), Some("USB Mic"));
+        assert_eq!(loaded.assistant_model, "twil-8b");
+
+        store.save(&loaded).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("shortcuts"), "{saved}");
+        assert_eq!(store.load(), loaded);
     }
 
     #[test]

@@ -1,8 +1,6 @@
 //! Editable copy of `Settings` for the Settings window, and the conversion back.
 use std::fmt;
-use voice_core::{
-    Action, ActionShortcuts, PersonalDictionary, Settings, SpeechProvider, SpeechSettings,
-};
+use voice_core::{Action, PersonalDictionary, Settings, SpeechProvider, SpeechSettings};
 use voice_stt::KeyStatus;
 
 /// The writing assistant row's first choice.
@@ -30,7 +28,6 @@ pub const ADDRESS_NOT_LOCAL: &str =
 
 #[derive(Clone, PartialEq)]
 pub struct SettingsForm {
-    pub shortcuts: ActionShortcuts,
     /// `None` = system default microphone.
     pub microphone: Option<String>,
     pub assistant_url: String,
@@ -53,7 +50,6 @@ impl fmt::Debug for SettingsForm {
             "<redacted>"
         };
         f.debug_struct("SettingsForm")
-            .field("shortcuts", &self.shortcuts)
             .field("microphone", &self.microphone)
             .field("assistant_url", &self.assistant_url)
             .field("assistant_model", &self.assistant_model)
@@ -69,7 +65,6 @@ impl fmt::Debug for SettingsForm {
 impl SettingsForm {
     pub fn from_settings(settings: &Settings) -> Self {
         Self {
-            shortcuts: settings.shortcuts.clone(),
             microphone: settings.microphone.clone(),
             assistant_url: settings.assistant_url.clone(),
             assistant_model: settings.assistant_model.clone(),
@@ -83,7 +78,6 @@ impl SettingsForm {
 
     pub fn to_settings(&self) -> Settings {
         Settings {
-            shortcuts: self.shortcuts.clone(),
             microphone: self.microphone.clone(),
             assistant_url: self.assistant_url.trim().to_string(),
             assistant_model: self.assistant_model.trim().to_string(),
@@ -111,31 +105,12 @@ impl SettingsForm {
         self.dictionary.words()
     }
 
-    /// "Already used by <action>" for the row of `action`, when an action above it in
-    /// the list has a colliding shortcut (see `Shortcut::collides_with`).
-    pub fn shortcut_conflict(&self, action: Action) -> Option<String> {
-        let mine = self.shortcuts.for_action(action);
-        Action::ALL
-            .iter()
-            .take_while(|&&a| a != action)
-            .find(|&&a| self.shortcuts.for_action(a).collides_with(*mine))
-            .map(|a| format!("Already used by {}", a.label()))
-    }
-
     /// Why the form cannot be saved yet, if it cannot.
     pub fn problem(&self) -> Option<String> {
-        if let Some((earlier, later)) = self.shortcuts.conflict() {
-            Some(format!(
-                "{} and {} need different shortcuts.",
-                earlier.label(),
-                later.label()
-            ))
-        } else {
-            self.address_problem().map(str::to_string)
-        }
+        self.address_problem().map(str::to_string)
     }
 
-    /// The part of `problem` that is not shown under a shortcut row.
+    /// Why the local AI app address cannot be saved, if it cannot.
     pub fn address_problem(&self) -> Option<&'static str> {
         self.assistant_url
             .trim()
@@ -236,7 +211,6 @@ pub fn assistant_choices(listed: &[String], current: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voice_core::Shortcut;
 
     #[test]
     fn writing_use_says_what_the_writing_model_does_per_action() {
@@ -286,11 +260,6 @@ mod tests {
     #[test]
     fn untouched_form_round_trips_a_full_settings_value() {
         let settings = Settings {
-            shortcuts: ActionShortcuts {
-                dictate: Shortcut::TapFn,
-                english: Shortcut::ControlShiftSpace,
-                edit_selection: Shortcut::TapRightOption,
-            },
             microphone: Some("USB Mic".into()),
             assistant_url: "http://host:1/v1".into(),
             assistant_model: "qwen".into(),
@@ -310,15 +279,12 @@ mod tests {
     #[test]
     fn edits_show_up_in_settings() {
         let mut f = form();
-        f.shortcuts.set(Action::Dictate, Shortcut::TapRightOption);
         f.microphone = Some("Headset".into());
         f.assistant_url = "http://other/v1".into();
         f.assistant_model = "llama".into();
         f.cleanup_enabled = false;
         f.speech.model = "gpt-4o-mini-transcribe".into();
         let s = f.to_settings();
-        assert_eq!(s.shortcuts.dictate, Shortcut::TapRightOption);
-        assert_eq!(s.shortcuts.english, Shortcut::TapCommandShift);
         assert_eq!(s.microphone.as_deref(), Some("Headset"));
         assert_eq!(s.assistant_url, "http://other/v1");
         assert_eq!(s.assistant_model, "llama");
@@ -382,40 +348,6 @@ mod tests {
     }
 
     #[test]
-    fn first_launch_rows_have_no_conflict() {
-        let f = form();
-        for action in Action::ALL {
-            assert_eq!(f.shortcut_conflict(action), None);
-        }
-        assert_eq!(f.problem(), None);
-    }
-
-    #[test]
-    fn a_shared_shortcut_is_reported_under_the_later_row_and_blocks_saving() {
-        let mut f = form();
-        f.shortcuts.set(Action::EditSelection, Shortcut::TapCommand);
-        assert_eq!(f.shortcut_conflict(Action::Dictate), None);
-        assert_eq!(f.shortcut_conflict(Action::DictateInEnglish), None);
-        assert_eq!(
-            f.shortcut_conflict(Action::EditSelection).as_deref(),
-            Some("Already used by Dictate")
-        );
-        assert!(f.problem().is_some());
-    }
-
-    #[test]
-    fn a_right_command_tap_is_reported_as_used_by_the_command_tap() {
-        let mut f = form();
-        f.shortcuts
-            .set(Action::EditSelection, Shortcut::TapRightCommand);
-        assert_eq!(
-            f.shortcut_conflict(Action::EditSelection).as_deref(),
-            Some("Already used by Dictate")
-        );
-        assert!(f.problem().is_some(), "saving stays blocked");
-    }
-
-    #[test]
     fn addresses_on_this_mac_get_no_warning() {
         let mut f = form();
         for address in [
@@ -446,42 +378,6 @@ mod tests {
             f.assistant_url = address.to_string();
             assert_eq!(f.address_warning(), Some(ADDRESS_NOT_LOCAL), "{address}");
         }
-    }
-
-    #[test]
-    fn the_conflict_names_whichever_action_comes_first() {
-        let mut f = form();
-        f.shortcuts
-            .set(Action::EditSelection, Shortcut::TapCommandShift);
-        assert_eq!(
-            f.shortcut_conflict(Action::EditSelection).as_deref(),
-            Some("Already used by English")
-        );
-    }
-
-    #[test]
-    fn three_actions_on_one_shortcut_flag_both_later_rows() {
-        let mut f = form();
-        f.shortcuts
-            .set(Action::DictateInEnglish, Shortcut::TapCommand);
-        f.shortcuts.set(Action::EditSelection, Shortcut::TapCommand);
-        assert_eq!(f.shortcut_conflict(Action::Dictate), None);
-        assert_eq!(
-            f.shortcut_conflict(Action::DictateInEnglish).as_deref(),
-            Some("Already used by Dictate")
-        );
-        assert_eq!(
-            f.shortcut_conflict(Action::EditSelection).as_deref(),
-            Some("Already used by Dictate")
-        );
-    }
-
-    #[test]
-    fn changing_dictate_to_another_shortcut_is_fine() {
-        let mut f = form();
-        f.shortcuts.set(Action::Dictate, Shortcut::TapRightOption);
-        assert_eq!(f.problem(), None);
-        assert_eq!(f.to_settings().shortcuts.dictate, Shortcut::TapRightOption);
     }
 
     #[test]

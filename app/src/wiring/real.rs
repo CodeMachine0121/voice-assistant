@@ -2,7 +2,7 @@
 //! macOS shortcuts/paste/permissions and JSON storage.
 //!
 //! Several adapters depend on settings the user can change while the app runs
-//! (microphone, speech model, assistant address and model, shortcuts).
+//! (microphone, speech model, assistant address and model).
 //! Each is wrapped in a small "configurable" adapter that `apply` reconfigures.
 use super::swappable::Swappable;
 use super::{settings_saver, Permissions, PrivacyPane, RepaintHandle, Services};
@@ -14,8 +14,8 @@ use voice_core::{
     TranscribeError, Transcriber, WritingTask,
 };
 use voice_macos::{
-    ClipboardSelectionReader, KeychainSecret, MacPermissions, PasteInserter, ShortcutConfig,
-    ShortcutHandle, ShortcutService,
+    ClipboardSelectionReader, KeychainSecret, MacPermissions, PasteInserter, ShortcutHandle,
+    ShortcutService,
 };
 use voice_polish::LmStudioPolisher;
 use voice_storage::{JsonHistoryStore, JsonSettingsStore};
@@ -291,15 +291,11 @@ pub fn build() -> Services {
     );
     // The service keeps retrying until macOS allows the listener, so granting the
     // permission later takes effect without a restart.
-    let shortcuts = Arc::new(ShortcutService::spawn(
-        ShortcutConfig::from(&settings),
-        engine.shortcuts.clone(),
-    ));
+    let shortcuts = Arc::new(ShortcutService::spawn(engine.shortcuts.clone()));
     if !MacPermissions::accessibility_granted() {
         // Pasting into other apps needs it; macOS's prompt also lists the app.
         MacPermissions::prompt_accessibility();
     }
-    let listener = shortcuts.clone();
 
     let save_settings = settings_saver(
         settings_store.clone(),
@@ -309,7 +305,6 @@ pub fn build() -> Services {
             transcriber.apply(&s.speech);
             polisher.replace(polisher_for(s));
             recorder.choose_device(s.microphone.clone());
-            listener.apply(ShortcutConfig::from(s));
         },
     );
     Services {
