@@ -4,8 +4,9 @@
 //! Several adapters depend on settings the user can change while the app runs
 //! (microphone, speech model, assistant address and model, shortcuts).
 //! Each is wrapped in a small "configurable" adapter that `apply` reconfigures.
+use super::swappable::Swappable;
 use super::{settings_saver, Permissions, PrivacyPane, RepaintHandle, Services};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use voice_audio::CpalRecorder;
 use voice_core::{
     DictationPipeline, Engine, EngineDeps, HistoryStore, PersonalDictionary, PolishError, Polisher,
@@ -27,29 +28,18 @@ type TranscriberFactory = dyn Fn(&SpeechSettings) -> Arc<dyn Transcriber> + Send
 /// `Settings::speech`. `apply` switches it when settings are saved.
 pub struct SpeechProviderSwitch {
     factory: Box<TranscriberFactory>,
-    chosen: RwLock<Arc<dyn Transcriber>>,
+    chosen: Swappable<dyn Transcriber>,
 }
 
 impl SpeechProviderSwitch {
     pub fn new(settings: &SpeechSettings, factory: Box<TranscriberFactory>) -> Self {
-        let chosen = RwLock::new(factory(settings));
+        let chosen = Swappable::new(factory(settings));
         Self { factory, chosen }
     }
 
     /// Uses the provider and speech model of `settings` from the next dictation on.
     pub fn apply(&self, settings: &SpeechSettings) {
-        let next = (self.factory)(settings);
-        match self.chosen.write() {
-            Ok(mut guard) => *guard = next,
-            Err(poisoned) => *poisoned.into_inner() = next,
-        }
-    }
-
-    fn current(&self) -> Arc<dyn Transcriber> {
-        match self.chosen.read() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
+        self.chosen.replace((self.factory)(settings));
     }
 }
 
@@ -59,7 +49,7 @@ impl Transcriber for SpeechProviderSwitch {
         recording: &Recording,
         dictionary: &PersonalDictionary,
     ) -> Result<String, TranscribeError> {
-        self.current().transcribe(recording, dictionary)
+        self.chosen.current().transcribe(recording, dictionary)
     }
 }
 
@@ -92,27 +82,7 @@ impl SecretStore for Keychain {
 }
 
 /// The writing assistant at whatever address and model the settings name.
-pub struct ConfigurablePolisher(RwLock<Arc<dyn Polisher>>);
-
-impl ConfigurablePolisher {
-    pub fn new(polisher: Arc<dyn Polisher>) -> Self {
-        Self(RwLock::new(polisher))
-    }
-
-    pub fn replace(&self, polisher: Arc<dyn Polisher>) {
-        match self.0.write() {
-            Ok(mut guard) => *guard = polisher,
-            Err(poisoned) => *poisoned.into_inner() = polisher,
-        }
-    }
-
-    fn current(&self) -> Arc<dyn Polisher> {
-        match self.0.read() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
-    }
-}
+pub type ConfigurablePolisher = Swappable<dyn Polisher>;
 
 impl Polisher for ConfigurablePolisher {
     fn polish(

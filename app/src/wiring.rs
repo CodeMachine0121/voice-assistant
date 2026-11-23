@@ -5,6 +5,7 @@
 //! runs without microphone, speech provider, writing assistant or permissions.
 mod fakes;
 mod real;
+mod swappable;
 #[cfg(test)]
 pub mod testing;
 
