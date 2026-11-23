@@ -12,7 +12,7 @@ mod service;
 mod shortcuts;
 mod surroundings;
 
-pub use activation::{activate_app, return_focus};
+pub use activation::{activate_app, return_focus, track_focus};
 pub use keychain::{KeychainSecret, KEYCHAIN_SERVICE, OPENAI_KEY_ACCOUNT};
 pub use keys::{
     KeyDecision, KeyInput, KeyInterpreter, KeyKind, ShortcutConfig, Surroundings, MAX_TAP_HOLD,

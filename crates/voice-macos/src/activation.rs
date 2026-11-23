@@ -6,57 +6,106 @@
 //! keyboard focus. When its windows close, focus has to be handed back by hand too,
 //! or the next dictation would paste into this app.
 //!
-//! Focus is handed back by activating the app that was in front before, never by
-//! hiding this app: a hidden app gets no more frames from the UI toolkit, so the
-//! menu-bar commands would stop working.
+//! Which app focus goes back to is followed all the time: every time another app
+//! becomes active, macOS says so and that app is remembered. Focus is handed back by
+//! activating it, never by hiding this app: a hidden app gets no more frames from the
+//! UI toolkit, so the menu-bar commands would stop working.
 //!
 //! AppKit may only be used from the main thread (where the UI runs). Called from
 //! any other thread these functions do nothing and log a warning.
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSRunningApplication, NSWorkspace,
+    NSWorkspaceApplicationKey, NSWorkspaceDidActivateApplicationNotification,
 };
-use std::cell::RefCell;
+use objc2_foundation::{NSNotification, NSOperationQueue};
+use std::cell::{Cell, RefCell};
+use std::ptr::NonNull;
 
 thread_local! {
     /// The app to give focus back to. Only ever touched on the main thread.
-    static PREVIOUS_APP: RefCell<PreviousApp<Retained<NSRunningApplication>>> =
-        const { RefCell::new(PreviousApp::none()) };
+    static LAST_OTHER_APP: RefCell<LastOtherApp<Retained<NSRunningApplication>>> =
+        const { RefCell::new(LastOtherApp::none()) };
+    /// Whether macOS already tells us about every app that becomes active.
+    static TRACKING: Cell<bool> = const { Cell::new(false) };
 }
 
-fn shared_app(purpose: &str) -> Option<Retained<NSApplication>> {
-    match MainThreadMarker::new() {
-        Some(mtm) => Some(NSApplication::sharedApplication(mtm)),
-        None => {
-            log::warn!("cannot {purpose} from a background thread");
-            None
-        }
+fn main_thread(purpose: &str) -> Option<MainThreadMarker> {
+    let mtm = MainThreadMarker::new();
+    if mtm.is_none() {
+        log::warn!("cannot {purpose} from a background thread");
     }
+    mtm
+}
+
+/// Starts following which other app the user was last in, so focus can be handed
+/// back to it. Call once at startup on the main thread; later calls do nothing.
+pub fn track_focus() {
+    if main_thread("follow the app in front").is_none() || TRACKING.get() {
+        return;
+    }
+    TRACKING.set(true);
+    let workspace = NSWorkspace::sharedWorkspace();
+    LAST_OTHER_APP.with_borrow_mut(|last| last.saw_in_front(workspace.frontmostApplication()));
+
+    let block = RcBlock::new(|note: NonNull<NSNotification>| {
+        // SAFETY: macOS hands the block a valid notification for its duration.
+        let note = unsafe { note.as_ref() };
+        let app = note
+            .userInfo()
+            // SAFETY: an AppKit constant, valid for the life of the process.
+            .and_then(|info| info.objectForKey(unsafe { NSWorkspaceApplicationKey }))
+            .and_then(|app| app.downcast::<NSRunningApplication>().ok());
+        LAST_OTHER_APP.with_borrow_mut(|last| last.saw_in_front(app));
+    });
+    // SAFETY: the name is an AppKit constant; the block runs on the main queue,
+    // so it only ever touches the main thread's state.
+    let observer = unsafe {
+        workspace
+            .notificationCenter()
+            .addObserverForName_object_queue_usingBlock(
+                Some(NSWorkspaceDidActivateApplicationNotification),
+                None,
+                Some(&NSOperationQueue::mainQueue()),
+                &block,
+            )
+    };
+    // Observed for as long as the app runs.
+    std::mem::forget(observer);
 }
 
 /// Makes this app the active app, even while another app is active, so its windows
-/// can come to the front. The app that was active until now is remembered, so
-/// `return_focus` can give focus back to it.
+/// can come to the front.
 pub fn activate_app() {
-    if let Some(app) = shared_app("bring the app to the front") {
-        let front = NSWorkspace::sharedWorkspace().frontmostApplication();
-        PREVIOUS_APP.with_borrow_mut(|previous| previous.remember(front));
-        // The cooperative `activate` of macOS 14+ may be ignored here: the menu
-        // command is handled on a later frame, outside the click that asked for it.
-        // `activateIgnoringOtherApps` still works on every supported version.
-        #[allow(deprecated)]
-        app.activateIgnoringOtherApps(true);
-    }
+    let Some(mtm) = main_thread("bring the app to the front") else {
+        return;
+    };
+    // Covers the case where following the app in front has not started.
+    let front = NSWorkspace::sharedWorkspace().frontmostApplication();
+    LAST_OTHER_APP.with_borrow_mut(|last| last.saw_in_front(front));
+    // The cooperative `activate` of macOS 14+ may be ignored here: the menu command
+    // is handled on a later frame, outside the click that asked for it.
+    // `activateIgnoringOtherApps` still works on every supported version.
+    #[allow(deprecated)]
+    NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
 }
 
-/// Gives keyboard focus back to the app that was active before `activate_app`,
-/// then forgets it. Does nothing when no app was remembered, when it has quit, or
-/// when this app no longer has focus (the user has already moved on).
+/// Gives keyboard focus back to the other app the user was last in. When there is
+/// none left, this app still gives up focus (without hiding), so the next dictation
+/// never pastes into it. Does nothing when this app no longer has focus: the user
+/// has already moved on.
 pub fn return_focus() {
-    if let Some(app) = shared_app("give focus back") {
-        let still_active = app.isActive();
-        PREVIOUS_APP.with_borrow_mut(|previous| previous.hand_back(still_active));
+    let Some(mtm) = main_thread("give focus back") else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    let decision = LAST_OTHER_APP.with_borrow_mut(|last| last.hand_back(app.isActive()));
+    match decision {
+        HandBack::Nothing => {}
+        HandBack::Activate(other) if other.activate() => {}
+        HandBack::Activate(_) | HandBack::GiveUp => app.deactivate(),
     }
 }
 
@@ -64,7 +113,8 @@ pub fn return_focus() {
 trait RunningApp {
     fn is_this_app(&self) -> bool;
     fn has_quit(&self) -> bool;
-    fn activate(&self);
+    /// `false` when macOS refused to activate it.
+    fn activate(&self) -> bool;
 }
 
 impl RunningApp for Retained<NSRunningApplication> {
@@ -76,36 +126,53 @@ impl RunningApp for Retained<NSRunningApplication> {
         self.isTerminated()
     }
 
-    fn activate(&self) {
-        if !self.activateWithOptions(NSApplicationActivationOptions(0)) {
+    fn activate(&self) -> bool {
+        let done = self.activateWithOptions(NSApplicationActivationOptions(0));
+        if !done {
             log::warn!("could not give focus back to the previous app");
         }
+        done
     }
 }
 
-/// The app the user was in before this app took focus.
-struct PreviousApp<A>(Option<A>);
+/// What to do with focus once the last window has closed.
+#[derive(Debug, PartialEq)]
+enum HandBack<A> {
+    /// This app no longer has focus; leave it where it is.
+    Nothing,
+    /// Activate the other app the user was last in.
+    Activate(A),
+    /// No other app to go back to: this app just stops being the active one.
+    GiveUp,
+}
 
-impl<A: RunningApp> PreviousApp<A> {
+/// The other app the user was last in, that is the last app other than this one
+/// that came to the front.
+struct LastOtherApp<A>(Option<A>);
+
+impl<A: RunningApp + Clone> LastOtherApp<A> {
     const fn none() -> Self {
         Self(None)
     }
 
-    /// Remembers `front`, the app in front right now, unless it is this app: then
-    /// the one remembered before still is the one to go back to.
-    fn remember(&mut self, front: Option<A>) {
+    /// `front` is the app in front right now. This app is never one to go back to,
+    /// so then the one remembered before stays.
+    fn saw_in_front(&mut self, front: Option<A>) {
         if let Some(app) = front.filter(|app| !app.is_this_app()) {
             self.0 = Some(app);
         }
     }
 
-    /// Activates the remembered app, if it is still running and this app still has
-    /// focus, and forgets it either way.
-    fn hand_back(&mut self, this_app_active: bool) {
-        if let Some(app) = self.0.take() {
-            if this_app_active && !app.has_quit() {
-                app.activate();
-            }
+    /// Decides where focus goes when this app is done. An app that has quit is
+    /// forgotten.
+    fn hand_back(&mut self, this_app_active: bool) -> HandBack<A> {
+        if self.0.as_ref().is_some_and(A::has_quit) {
+            self.0 = None;
+        }
+        match &self.0 {
+            _ if !this_app_active => HandBack::Nothing,
+            Some(app) => HandBack::Activate(app.clone()),
+            None => HandBack::GiveUp,
         }
     }
 }
@@ -113,15 +180,29 @@ impl<A: RunningApp> PreviousApp<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
-    use std::rc::Rc;
 
-    #[derive(Clone, Default)]
+    #[derive(Debug, Clone, Copy, PartialEq, Default)]
     struct FakeApp {
+        id: u8,
         this_app: bool,
         quit: bool,
-        activated: Rc<Cell<usize>>,
     }
+
+    const EDITOR: FakeApp = FakeApp {
+        id: 1,
+        this_app: false,
+        quit: false,
+    };
+    const BROWSER: FakeApp = FakeApp {
+        id: 2,
+        this_app: false,
+        quit: false,
+    };
+    const THIS: FakeApp = FakeApp {
+        id: 3,
+        this_app: true,
+        quit: false,
+    };
 
     impl RunningApp for FakeApp {
         fn is_this_app(&self) -> bool {
@@ -130,95 +211,81 @@ mod tests {
         fn has_quit(&self) -> bool {
             self.quit
         }
-        fn activate(&self) {
-            self.activated.set(self.activated.get() + 1);
+        fn activate(&self) -> bool {
+            true
         }
     }
 
-    #[test]
-    fn hands_focus_back_to_the_app_that_was_in_front() {
-        let editor = FakeApp::default();
-        let mut previous = PreviousApp::none();
-        previous.remember(Some(editor.clone()));
-        previous.hand_back(true);
-        assert_eq!(editor.activated.get(), 1);
+    fn after(seen: &[FakeApp]) -> LastOtherApp<FakeApp> {
+        let mut last = LastOtherApp::none();
+        for app in seen {
+            last.saw_in_front(Some(*app));
+        }
+        last
     }
 
     #[test]
-    fn hands_focus_back_only_once() {
-        let editor = FakeApp::default();
-        let mut previous = PreviousApp::none();
-        previous.remember(Some(editor.clone()));
-        previous.hand_back(true);
-        previous.hand_back(true);
-        assert_eq!(editor.activated.get(), 1);
+    fn focus_goes_back_to_the_app_the_user_was_in() {
+        assert_eq!(
+            after(&[EDITOR, THIS]).hand_back(true),
+            HandBack::Activate(EDITOR)
+        );
     }
 
     #[test]
-    fn this_app_in_front_keeps_the_app_remembered_before() {
-        let editor = FakeApp::default();
-        let this = FakeApp {
-            this_app: true,
-            ..FakeApp::default()
-        };
-        let mut previous = PreviousApp::none();
-        previous.remember(Some(editor.clone()));
-        previous.remember(Some(this.clone()));
-        previous.hand_back(true);
-        assert_eq!(editor.activated.get(), 1);
-        assert_eq!(this.activated.get(), 0);
+    fn switching_apps_while_a_window_is_open_changes_where_focus_goes() {
+        // Settings opened from the editor, then the user went to the browser and
+        // came back to Settings.
+        assert_eq!(
+            after(&[EDITOR, THIS, BROWSER, THIS]).hand_back(true),
+            HandBack::Activate(BROWSER)
+        );
     }
 
     #[test]
-    fn the_latest_other_app_in_front_wins() {
-        let editor = FakeApp::default();
-        let browser = FakeApp::default();
-        let mut previous = PreviousApp::none();
-        previous.remember(Some(editor.clone()));
-        previous.remember(Some(browser.clone()));
-        previous.hand_back(true);
-        assert_eq!(editor.activated.get(), 0);
-        assert_eq!(browser.activated.get(), 1);
+    fn focus_goes_back_every_time_a_window_closes() {
+        let mut last = after(&[EDITOR, THIS]);
+        assert_eq!(last.hand_back(true), HandBack::Activate(EDITOR));
+        last.saw_in_front(Some(EDITOR));
+        last.saw_in_front(Some(THIS));
+        assert_eq!(last.hand_back(true), HandBack::Activate(EDITOR));
     }
 
     #[test]
-    fn nothing_remembered_means_nothing_to_hand_back() {
-        let mut previous = PreviousApp::<FakeApp>::none();
-        previous.remember(None);
-        previous.hand_back(true);
-        assert!(previous.0.is_none());
+    fn without_another_app_this_app_gives_up_focus() {
+        assert_eq!(after(&[THIS]).hand_back(true), HandBack::GiveUp);
+        let mut nothing_seen = LastOtherApp::<FakeApp>::none();
+        nothing_seen.saw_in_front(None);
+        assert_eq!(nothing_seen.hand_back(true), HandBack::GiveUp);
     }
 
     #[test]
-    fn an_app_that_has_quit_is_not_activated_and_is_forgotten() {
-        let editor = FakeApp {
+    fn an_app_that_has_quit_is_forgotten_and_this_app_gives_up_focus() {
+        let quit_editor = FakeApp {
             quit: true,
-            ..FakeApp::default()
+            ..EDITOR
         };
-        let mut previous = PreviousApp::none();
-        previous.remember(Some(editor.clone()));
-        previous.hand_back(true);
-        assert_eq!(editor.activated.get(), 0);
-        assert!(previous.0.is_none());
+        let mut last = after(&[quit_editor, THIS]);
+        assert_eq!(last.hand_back(true), HandBack::GiveUp);
+        assert!(last.0.is_none());
     }
 
     #[test]
     fn once_the_user_has_moved_on_focus_is_left_where_it_is() {
-        let editor = FakeApp::default();
-        let mut previous = PreviousApp::none();
-        previous.remember(Some(editor.clone()));
-        previous.hand_back(false);
-        assert_eq!(editor.activated.get(), 0);
-        assert!(previous.0.is_none());
+        assert_eq!(after(&[EDITOR, THIS]).hand_back(false), HandBack::Nothing);
+        assert_eq!(after(&[]).hand_back(false), HandBack::Nothing);
     }
 
     #[test]
-    fn off_the_main_thread_nothing_is_done() {
-        // Test threads are never the main thread, so AppKit must not be touched.
+    fn off_the_main_thread_appkit_is_not_touched() {
+        // Test threads are never the main thread.
         std::thread::spawn(|| {
+            // The guard every AppKit entry point goes through refuses this thread...
+            assert!(main_thread("test").is_none());
+            // ...so these return before touching AppKit (which would abort here).
+            track_focus();
             activate_app();
             return_focus();
-            PREVIOUS_APP.with_borrow(|previous| assert!(previous.0.is_none()));
         })
         .join()
         .unwrap();
