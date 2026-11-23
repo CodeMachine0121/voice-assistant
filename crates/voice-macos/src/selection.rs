@@ -13,11 +13,13 @@ use std::time::{Duration, Instant};
 use voice_core::{Problem, SelectionReader};
 
 /// How long the front app gets to put the copied selection on the clipboard.
-const COPY_WAIT: Duration = Duration::from_millis(250);
+const COPY_WAIT: Duration = Duration::from_millis(200);
 /// How often the clipboard is checked while waiting for the copy.
 const COPY_POLL: Duration = Duration::from_millis(10);
 /// Upper bound on how long a busy front app may keep an Accessibility query waiting.
-const AX_TIMEOUT_SECONDS: f32 = 0.5;
+/// Kept short so reading the selection stays within about 0.3 s even when the copy
+/// fallback is needed; an app too slow for it just takes the fallback.
+const AX_TIMEOUT_SECONDS: f32 = 0.1;
 
 /// The selected text of the focused element, as Accessibility reports it.
 pub(crate) trait FocusedSelection {
