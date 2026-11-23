@@ -31,6 +31,7 @@ impl SettingsStore for FlakySettings {
 struct FlakySecret {
     secret: Mutex<Option<String>>,
     failure: Mutex<Option<String>>,
+    reads: Mutex<usize>,
 }
 
 impl FlakySecret {
@@ -44,6 +45,7 @@ impl FlakySecret {
 
 impl SecretStore for FlakySecret {
     fn read(&self) -> Result<Option<String>, String> {
+        *self.reads.lock().unwrap() += 1;
         Ok(self.secret.lock().unwrap().clone())
     }
 
@@ -73,6 +75,11 @@ impl Probe {
     /// What the secret store (the Keychain in the real app) holds.
     pub fn saved_key(&self) -> Option<String> {
         self.secret.secret.lock().unwrap().clone()
+    }
+
+    /// How often the secret store has been read so far.
+    pub fn key_reads(&self) -> usize {
+        *self.secret.reads.lock().unwrap()
     }
 
     pub fn fail_key_storage(&self, message: &str) {

@@ -28,6 +28,13 @@ pub enum KeyStatus {
 
 type EnvLookup = dyn Fn() -> Option<String> + Send + Sync;
 
+/// A resolved key and where it came from. Private, so the key never leaks through it.
+enum Resolved {
+    Saved(String),
+    FromEnvironment(String),
+    Missing,
+}
+
 /// Resolves, saves and removes the OpenAI key.
 pub struct OpenAiKey {
     store: Arc<dyn SecretStore>,
@@ -51,19 +58,34 @@ impl OpenAiKey {
         }
     }
 
-    /// The key to use now: the saved one, else the environment's. Blank values count as
-    /// absent, and a store that cannot be read counts as holding nothing.
+    /// The key to use now: the saved one, else the environment's.
     pub fn current(&self) -> Option<String> {
-        self.saved().or_else(|| non_blank((self.environment)()))
+        match self.resolve() {
+            Resolved::Saved(key) | Resolved::FromEnvironment(key) => Some(key),
+            Resolved::Missing => None,
+        }
     }
 
+    /// Where the key [`current`](Self::current) would return comes from. Reads the
+    /// store, so callers that show it repeatedly should keep the answer.
     pub fn status(&self) -> KeyStatus {
-        if self.saved().is_some() {
-            KeyStatus::Saved
-        } else if non_blank((self.environment)()).is_some() {
-            KeyStatus::FromEnvironment
+        match self.resolve() {
+            Resolved::Saved(_) => KeyStatus::Saved,
+            Resolved::FromEnvironment(_) => KeyStatus::FromEnvironment,
+            Resolved::Missing => KeyStatus::Missing,
+        }
+    }
+
+    /// The one place the precedence lives: the saved key wins over the environment's.
+    /// Blank values count as absent, and a store that cannot be read counts as holding
+    /// nothing. The store is read exactly once.
+    fn resolve(&self) -> Resolved {
+        if let Some(key) = self.saved() {
+            Resolved::Saved(key)
+        } else if let Some(key) = non_blank((self.environment)()) {
+            Resolved::FromEnvironment(key)
         } else {
-            KeyStatus::Missing
+            Resolved::Missing
         }
     }
 
@@ -253,6 +275,39 @@ mod tests {
 
         assert_eq!(key.save("sk-test"), Err("keychain locked".to_string()));
         assert_eq!(key.remove(), Err("keychain locked".to_string()));
+    }
+
+    /// Counts reads, to show each answer comes from a single look at the store.
+    #[derive(Default)]
+    struct Counting {
+        inner: MemorySecretStore,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+    impl SecretStore for Counting {
+        fn read(&self) -> Result<Option<String>, String> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.read()
+        }
+        fn save(&self, secret: &str) -> Result<(), String> {
+            self.inner.save(secret)
+        }
+        fn remove(&self) -> Result<(), String> {
+            self.inner.remove()
+        }
+    }
+
+    #[test]
+    fn each_answer_reads_the_store_once() {
+        let store = Arc::new(Counting::default());
+        let key = key_with(store.clone(), Some("sk-env"));
+        key.save("sk-saved").unwrap();
+
+        assert_eq!(key.status(), KeyStatus::Saved);
+        assert_eq!(key.current().as_deref(), Some("sk-saved"));
+        key.remove().unwrap();
+        assert_eq!(key.status(), KeyStatus::FromEnvironment);
+
+        assert_eq!(store.reads.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[test]

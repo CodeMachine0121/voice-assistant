@@ -245,7 +245,7 @@ fn speech_rows(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Serv
         },
     );
     ui.add_space(4.0);
-    let status = session.key_status(services);
+    let status = session.key_status;
     let mut remove = false;
     choice_row(ui, "OpenAI key", key_status_text(status), |ui| {
         if status == KeyStatus::Saved {
@@ -446,6 +446,20 @@ mod tests {
         assert!(drawn.iter().any(|t| t == "OpenAI key saved"), "{drawn:?}");
         assert!(drawn.iter().any(|t| t == "Remove key"), "{drawn:?}");
         assert!(!drawn.iter().any(|t| t.contains("sk-secret")), "{drawn:?}");
+    }
+
+    #[test]
+    fn drawing_frames_does_not_read_the_key_store_again() {
+        let (services, probe) = test_services();
+        let mut session = SettingsSession::open(&services);
+        let reads_on_open = probe.key_reads();
+
+        for _ in 0..5 {
+            drawn_speech_rows(&mut session, &services);
+        }
+
+        assert_eq!(reads_on_open, 1);
+        assert_eq!(probe.key_reads(), 1);
     }
 
     #[test]

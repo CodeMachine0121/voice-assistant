@@ -24,6 +24,9 @@ pub struct SettingsSession {
     pub devices: Vec<String>,
     pub tasks: TaskState,
     pub notice: Option<Notice>,
+    /// Where the OpenAI key comes from. Read when the window opens and after the key
+    /// changes, never per frame: every read may reach the Keychain.
+    pub key_status: KeyStatus,
     /// What macOS allows, re-read while the window is open.
     pub permissions: PermissionSnapshot,
     events_tx: Sender<TaskEvent>,
@@ -40,6 +43,7 @@ impl SettingsSession {
             devices: (services.list_input_devices)(),
             tasks: TaskState::default(),
             notice: None,
+            key_status: services.speech_key.status(),
             permissions: PermissionSnapshot::take(&services.permissions, Instant::now()),
             events_tx,
             events_rx,
@@ -107,6 +111,7 @@ impl SettingsSession {
         let settings = self.form.to_settings();
         match (services.save_settings)(&settings) {
             Ok(()) => {
+                self.key_status = services.speech_key.status();
                 self.form = SettingsForm::from_settings(&settings);
                 self.stored = settings;
                 self.notice = Some(Notice::Saved);
@@ -117,15 +122,13 @@ impl SettingsSession {
 }
 
 impl SettingsSession {
-    /// Where the OpenAI key for the next dictation comes from.
-    pub fn key_status(&self, services: &Services) -> KeyStatus {
-        services.speech_key.status()
-    }
-
     /// Forgets the saved OpenAI key right away (not waiting for Save).
     pub fn remove_key(&mut self, services: &Services) {
         self.notice = match services.speech_key.remove() {
-            Ok(()) => None,
+            Ok(()) => {
+                self.key_status = services.speech_key.status();
+                None
+            }
             Err(e) => Some(Notice::Problem(format!(
                 "Could not remove the OpenAI key: {e}"
             ))),
@@ -504,7 +507,7 @@ mod tests {
         session.save(&services);
 
         assert_eq!(probe.saved_key().as_deref(), Some("sk-test"));
-        assert_eq!(session.key_status(&services), KeyStatus::Saved);
+        assert_eq!(session.key_status, KeyStatus::Saved);
         assert_eq!(session.notice, Some(Notice::Saved));
         assert_eq!(session.form.new_key, "");
         assert!(!session.is_dirty());
@@ -520,7 +523,7 @@ mod tests {
         let session = SettingsSession::open(&services);
 
         assert_eq!(session.form.new_key, "");
-        assert_eq!(session.key_status(&services), KeyStatus::Saved);
+        assert_eq!(session.key_status, KeyStatus::Saved);
     }
 
     #[test]
@@ -566,7 +569,7 @@ mod tests {
         session.remove_key(&services);
 
         assert_eq!(probe.saved_key(), None);
-        assert_eq!(session.key_status(&services), KeyStatus::Missing);
+        assert_eq!(session.key_status, KeyStatus::Missing);
         assert_eq!(session.notice, None);
     }
 
