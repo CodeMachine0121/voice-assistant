@@ -62,17 +62,33 @@ pub enum ModelsState {
     Failed(String),
 }
 
+/// Shown in a model list while the local AI app is being asked.
+pub const CHECKING: &str = "Checking…";
+/// Shown in a model list when the local AI app reports nothing to pick.
+pub const NO_MODELS: &str = "No models — open your local AI app and load one";
+
 impl ModelsState {
-    /// One line under the model field.
-    pub fn message(&self) -> Option<String> {
+    /// Result of "Check connection": what the local AI app at `address` answered.
+    pub fn connection_line(&self, address: &str) -> Option<String> {
         match self {
             ModelsState::NotLoaded => None,
-            ModelsState::Loading => Some("Loading models…".to_string()),
-            ModelsState::Loaded(models) if models.is_empty() => {
-                Some("The assistant lists no models.".to_string())
-            }
-            ModelsState::Loaded(models) => Some(format!("{} models available", models.len())),
-            ModelsState::Failed(e) => Some(format!("Could not list models: {e}")),
+            ModelsState::Loading => Some(CHECKING.to_string()),
+            ModelsState::Loaded(models) => Some(match models.len() {
+                0 => "Connected — no models available".to_string(),
+                1 => "Connected — 1 model available".to_string(),
+                n => format!("Connected — {n} models available"),
+            }),
+            ModelsState::Failed(_) => Some(format!("Local AI app not reachable at {address}")),
+        }
+    }
+
+    /// Note under a model list while it has nothing to pick.
+    pub fn list_note(&self) -> Option<&'static str> {
+        match self {
+            ModelsState::Loading => Some(CHECKING),
+            ModelsState::Loaded(models) if models.is_empty() => Some(NO_MODELS),
+            ModelsState::Failed(_) => Some(NO_MODELS),
+            _ => None,
         }
     }
 
@@ -276,26 +292,41 @@ mod tests {
     }
 
     #[test]
-    fn models_messages() {
-        assert_eq!(ModelsState::NotLoaded.message(), None);
+    fn connection_line_reports_what_the_local_ai_app_answered() {
+        let line = |s: &ModelsState| s.connection_line("http://localhost:1234/v1");
+        assert_eq!(line(&ModelsState::NotLoaded), None);
+        assert_eq!(line(&ModelsState::Loading).as_deref(), Some("Checking…"));
         assert_eq!(
-            ModelsState::Loading.message().as_deref(),
-            Some("Loading models…")
+            line(&ModelsState::Loaded(vec!["a".into(), "b".into()])).as_deref(),
+            Some("Connected — 2 models available")
         );
         assert_eq!(
-            ModelsState::Loaded(vec![]).message().as_deref(),
-            Some("The assistant lists no models.")
+            line(&ModelsState::Loaded(vec!["a".into()])).as_deref(),
+            Some("Connected — 1 model available")
         );
         assert_eq!(
-            ModelsState::Loaded(vec!["a".into(), "b".into()])
-                .message()
-                .as_deref(),
-            Some("2 models available")
+            line(&ModelsState::Loaded(vec![])).as_deref(),
+            Some("Connected — no models available")
         );
         assert_eq!(
-            ModelsState::Failed("down".into()).message().as_deref(),
-            Some("Could not list models: down")
+            line(&ModelsState::Failed("refused".into())).as_deref(),
+            Some("Local AI app not reachable at http://localhost:1234/v1")
         );
+    }
+
+    #[test]
+    fn list_note_explains_an_empty_list() {
+        assert_eq!(ModelsState::NotLoaded.list_note(), None);
+        assert_eq!(ModelsState::Loading.list_note(), Some("Checking…"));
+        assert_eq!(
+            ModelsState::Loaded(vec![]).list_note(),
+            Some("No models — open your local AI app and load one")
+        );
+        assert_eq!(
+            ModelsState::Failed("down".into()).list_note(),
+            Some("No models — open your local AI app and load one")
+        );
+        assert_eq!(ModelsState::Loaded(vec!["a".into()]).list_note(), None);
     }
 
     #[test]

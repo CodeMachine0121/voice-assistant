@@ -93,11 +93,15 @@ impl HistoryStore for JsonHistoryStore {
 mod tests {
     use super::*;
     use chrono::{Local, TimeZone};
-    use voice_core::{HistoryEntry, PersonalDictionary, Shortcut};
+    use voice_core::{
+        Action, ActionShortcuts, HistoryEntry, PersonalDictionary, Shortcut, SpeechSource,
+    };
 
     fn entry(n: u32) -> HistoryEntry {
         HistoryEntry {
             at: Local.with_ymd_and_hms(2026, 11, 22, 9, 0, n).unwrap(),
+            action: Action::Dictate,
+            original: None,
             raw: format!("um raw {n}"),
             polished: format!("Polished {n}."),
         }
@@ -118,7 +122,13 @@ mod tests {
         let store = JsonSettingsStore::new(dir.path().into());
         let s = Settings {
             assistant_model: "qwen2.5-7b-instruct".into(),
-            push_to_talk: Shortcut::Fn,
+            shortcuts: ActionShortcuts {
+                dictate: Shortcut::TapFn,
+                ..ActionShortcuts::default()
+            },
+            speech_source: SpeechSource::LocalAiApp {
+                model: "breeze-asr-25".into(),
+            },
             microphone: Some("USB Mic".into()),
             cleanup_enabled: false,
             dictionary: PersonalDictionary::from_words(["Cafler"]),
@@ -295,5 +305,89 @@ mod tests {
             .save(&Settings::default())
             .unwrap_err();
         assert!(err.contains("cannot write"), "{err}");
+    }
+
+    const OLD_SETTINGS: &str = r#"{
+  "push_to_talk": "RightOption",
+  "hands_free": "ControlOptionSpace",
+  "microphone": "USB Mic",
+  "assistant_url": "http://localhost:1234/v1",
+  "assistant_model": "qwen2.5-7b-instruct",
+  "cleanup_enabled": false,
+  "dictionary": ["Cafler"],
+  "speech_model_path": null
+}"#;
+
+    #[test]
+    fn settings_from_the_press_and_hold_version_get_the_new_shortcuts_and_keep_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("settings.json"), OLD_SETTINGS).unwrap();
+        let loaded = JsonSettingsStore::new(dir.path().into()).load();
+        assert_eq!(loaded.shortcuts, ActionShortcuts::default());
+        assert_eq!(loaded.shortcuts.dictate, Shortcut::TapCommand);
+        assert_eq!(loaded.shortcuts.english, Shortcut::TapCommandShift);
+        assert_eq!(loaded.shortcuts.edit_selection, Shortcut::OptionSpace);
+        assert_eq!(loaded.dictionary.words(), ["Cafler".to_string()]);
+        assert_eq!(loaded.microphone.as_deref(), Some("USB Mic"));
+        assert_eq!(loaded.assistant_model, "qwen2.5-7b-instruct");
+        assert!(!loaded.cleanup_enabled);
+        assert_eq!(loaded.speech_source, SpeechSource::BuiltIn);
+    }
+
+    #[test]
+    fn old_settings_are_saved_in_the_new_format_on_the_next_save() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("settings.json"), OLD_SETTINGS).unwrap();
+        let store = JsonSettingsStore::new(dir.path().into());
+        store.save(&store.load()).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("settings.json")).unwrap();
+        assert!(!text.contains("push_to_talk"));
+        assert!(!text.contains("hands_free"));
+        assert_eq!(store.load().dictionary.words(), ["Cafler".to_string()]);
+    }
+
+    #[test]
+    fn history_from_the_earlier_version_loads_as_dictate() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = r#"[
+  {"at": "2026-11-22T09:00:01+08:00", "raw": "um hello", "polished": "Hello."},
+  {"at": "2026-11-21T18:30:00+08:00", "raw": "bye", "polished": "Bye."}
+]"#;
+        std::fs::write(dir.path().join("history.json"), old).unwrap();
+        let loaded = JsonHistoryStore::new(dir.path().into()).load();
+        assert_eq!(loaded.entries().len(), 2);
+        for entry in loaded.entries() {
+            assert_eq!(entry.action, Action::Dictate);
+            assert_eq!(entry.original, None);
+        }
+        assert_eq!(loaded.entries()[0].polished, "Hello.");
+        assert_eq!(loaded.entries()[1].raw, "bye");
+    }
+
+    #[test]
+    fn edit_entries_keep_their_original_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = History::default();
+        history.record(HistoryEntry {
+            action: Action::EditSelection,
+            raw: "translate to English".into(),
+            original: Some("我們明天開會".into()),
+            polished: "We have a meeting tomorrow.".into(),
+            ..entry(1)
+        });
+        history.record(HistoryEntry {
+            action: Action::DictateInEnglish,
+            ..entry(2)
+        });
+        JsonHistoryStore::new(dir.path().into())
+            .save(&history)
+            .unwrap();
+        let loaded = JsonHistoryStore::new(dir.path().into()).load();
+        assert_eq!(loaded, history);
+        assert_eq!(loaded.entries()[0].action, Action::DictateInEnglish);
+        assert_eq!(
+            loaded.entries()[1].original.as_deref(),
+            Some("我們明天開會")
+        );
     }
 }
