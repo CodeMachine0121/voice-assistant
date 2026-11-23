@@ -1,20 +1,39 @@
 //! Post-processing of the assistant's answer.
 
-/// Removes reasoning blocks, code fences and surrounding quotes, then trims.
-pub(crate) fn clean_answer(answer: &str) -> String {
-    let text = strip_think(answer);
+/// Which of the prompt's tags the model may echo back around its answer.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct EchoedTags {
+    /// Tags that wrapped the content being worked on: only the tag text is removed.
+    pub(crate) unwrap: &'static [&'static str],
+    /// Tags that held input only: the whole block is removed.
+    pub(crate) drop: &'static [&'static str],
+}
+
+/// Removes reasoning blocks, echoed prompt tags, code fences and surrounding quotes,
+/// then trims.
+pub(crate) fn clean_answer(answer: &str, echoed: EchoedTags) -> String {
+    let mut text = strip_block(answer, "think");
+    for name in echoed.drop {
+        text = strip_block(&text, name);
+    }
+    for name in echoed.unwrap {
+        text = text
+            .replace(&format!("<{name}>"), "")
+            .replace(&format!("</{name}>"), "");
+    }
     let text = strip_fence(text.trim());
     strip_quotes(text.trim()).trim().to_string()
 }
 
-fn strip_think(text: &str) -> String {
+/// Removes every `<name>…</name>` block; an unterminated block swallows the rest.
+fn strip_block(text: &str, name: &str) -> String {
+    let (open, close) = (format!("<{name}>"), format!("</{name}>"));
     let mut out = String::new();
     let mut rest = text;
-    while let Some(start) = rest.find("<think>") {
+    while let Some(start) = rest.find(&open) {
         out.push_str(&rest[..start]);
-        match rest[start..].find("</think>") {
-            Some(end) => rest = &rest[start + end + "</think>".len()..],
-            // Unterminated block: everything after it is reasoning.
+        match rest[start..].find(&close) {
+            Some(end) => rest = &rest[start + end + close.len()..],
             None => return out,
         }
     }
@@ -45,7 +64,11 @@ fn strip_quotes(text: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::clean_answer;
+    use super::EchoedTags;
+
+    fn clean_answer(answer: &str) -> String {
+        super::clean_answer(answer, EchoedTags::default())
+    }
 
     #[test]
     fn trims_plain_text() {
@@ -93,5 +116,44 @@ mod tests {
     #[test]
     fn only_reasoning_leaves_nothing() {
         assert_eq!(clean_answer("<think>x</think>"), "");
+    }
+
+    #[test]
+    fn echoed_wrapping_tags_are_removed_but_their_text_kept() {
+        let echoed = EchoedTags {
+            unwrap: &["selection"],
+            drop: &[],
+        };
+        assert_eq!(
+            super::clean_answer("<selection>We meet tomorrow.</selection>", echoed),
+            "We meet tomorrow."
+        );
+    }
+
+    #[test]
+    fn echoed_input_blocks_are_removed_whole() {
+        let echoed = EchoedTags {
+            unwrap: &["selection"],
+            drop: &["instruction"],
+        };
+        assert_eq!(
+            super::clean_answer(
+                "<instruction>translate</instruction>\n<selection>We meet.</selection>",
+                echoed
+            ),
+            "We meet."
+        );
+    }
+
+    #[test]
+    fn tags_of_other_tasks_are_left_alone() {
+        let echoed = EchoedTags {
+            unwrap: &["transcript"],
+            drop: &[],
+        };
+        assert_eq!(
+            super::clean_answer("Use <selection> here.", echoed),
+            "Use <selection> here."
+        );
     }
 }

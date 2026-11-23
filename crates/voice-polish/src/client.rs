@@ -1,10 +1,10 @@
 //! HTTP client for LM Studio (OpenAI-compatible API).
 use crate::clean::clean_answer;
-use crate::prompt::{build_messages, ChatMessage};
+use crate::prompt::{echoed_tags, messages, ChatMessage};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
-use voice_core::{rules, PersonalDictionary, PolishError, Polisher};
+use voice_core::{rules, PersonalDictionary, PolishError, Polisher, WritingTask};
 
 const TEMPERATURE: f64 = 0.2;
 
@@ -46,8 +46,12 @@ impl LmStudioPolisher {
 }
 
 impl Polisher for LmStudioPolisher {
-    fn polish(&self, raw: &str, dictionary: &PersonalDictionary) -> Result<String, PolishError> {
-        let body = self.request_body(&build_messages(raw, dictionary));
+    fn polish(
+        &self,
+        task: &WritingTask<'_>,
+        dictionary: &PersonalDictionary,
+    ) -> Result<String, PolishError> {
+        let body = self.request_body(&messages(task, dictionary));
         let url = format!("{}/chat/completions", self.base_url);
         let reply: Reply = agent(self.timeout)
             .post(&url)
@@ -61,7 +65,7 @@ impl Polisher for LmStudioPolisher {
             .into_iter()
             .next()
             .and_then(|c| c.message.content)
-            .map(|c| clean_answer(&c))
+            .map(|c| clean_answer(&c, echoed_tags(task)))
             .unwrap_or_default();
         if content.is_empty() {
             return Err(PolishError::InvalidResponse("empty answer".into()));
@@ -188,10 +192,108 @@ mod tests {
         PersonalDictionary::default()
     }
 
+    fn clean_up(heard: &str) -> WritingTask<'_> {
+        WritingTask::CleanUp { heard }
+    }
+
+    fn sent_messages(fake: &Fake) -> Vec<Value> {
+        let sent: Value =
+            serde_json::from_str(&fake.bodies.lock().expect("lock")[0]).expect("json");
+        sent["messages"].as_array().expect("messages").clone()
+    }
+
+    #[test]
+    fn translation_request_carries_the_translation_prompt_and_heard_words() {
+        let fake = serve(200, chat("I'll fix this bug next week."), Duration::ZERO);
+        let out = polisher(&fake).polish(
+            &WritingTask::TranslateToEnglish {
+                heard: "這個 bug 我下週修",
+            },
+            &no_dict(),
+        );
+        assert_eq!(out, Ok("I'll fix this bug next week.".to_string()));
+        let msgs = sent_messages(&fake);
+        assert!(msgs[0]["content"]
+            .as_str()
+            .expect("system")
+            .contains("natural, fluent English"));
+        assert_eq!(
+            msgs.last().expect("last")["content"],
+            "<transcript>這個 bug 我下週修</transcript>"
+        );
+    }
+
+    #[test]
+    fn edit_request_carries_instruction_and_selection() {
+        let fake = serve(200, chat("We have a meeting tomorrow."), Duration::ZERO);
+        let out = polisher(&fake).polish(
+            &WritingTask::EditSelection {
+                instruction: "translate to English",
+                selection: "我們明天開會",
+            },
+            &no_dict(),
+        );
+        assert_eq!(out, Ok("We have a meeting tomorrow.".to_string()));
+        assert_eq!(
+            sent_messages(&fake).last().expect("last")["content"],
+            "<instruction>translate to English</instruction>\n<selection>我們明天開會</selection>"
+        );
+    }
+
+    #[test]
+    fn edit_answer_loses_echoed_tags() {
+        let fake = serve(
+            200,
+            chat("<instruction>translate to English</instruction>\n<selection>We have a meeting tomorrow.</selection>"),
+            Duration::ZERO,
+        );
+        let out = polisher(&fake).polish(
+            &WritingTask::EditSelection {
+                instruction: "translate to English",
+                selection: "我們明天開會",
+            },
+            &no_dict(),
+        );
+        assert_eq!(out, Ok("We have a meeting tomorrow.".to_string()));
+    }
+
+    #[test]
+    fn cleanup_answer_loses_an_echoed_transcript_tag() {
+        let fake = serve(
+            200,
+            chat("<transcript>我們開會。</transcript>"),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            polisher(&fake).polish(&clean_up("我们开会"), &no_dict()),
+            Ok("我們開會。".to_string())
+        );
+    }
+
+    #[test]
+    fn edit_answer_that_is_only_an_echoed_instruction_is_invalid() {
+        let fake = serve(
+            200,
+            chat("<instruction>shorten</instruction>"),
+            Duration::ZERO,
+        );
+        let out = polisher(&fake).polish(
+            &WritingTask::EditSelection {
+                instruction: "shorten",
+                selection: "long text",
+            },
+            &no_dict(),
+        );
+        assert!(
+            matches!(out, Err(PolishError::InvalidResponse(_))),
+            "{out:?}"
+        );
+    }
+
     #[test]
     fn returns_cleaned_text_on_success() {
         let fake = serve(200, chat("The meeting is at 4 tomorrow."), Duration::ZERO);
-        let out = polisher(&fake).polish("um meeting at 4", &no_dict());
+        let out = polisher(&fake).polish(&clean_up("um meeting at 4"), &no_dict());
         assert_eq!(out, Ok("The meeting is at 4 tomorrow.".to_string()));
         assert_eq!(fake.paths.lock().expect("lock")[0], "/v1/chat/completions");
     }
@@ -200,7 +302,7 @@ mod tests {
     fn request_carries_model_temperature_no_stream_and_transcript() {
         let fake = serve(200, chat("ok"), Duration::ZERO);
         polisher(&fake)
-            .polish("hello there", &no_dict())
+            .polish(&clean_up("hello there"), &no_dict())
             .expect("ok");
         let sent: Value =
             serde_json::from_str(&fake.bodies.lock().expect("lock")[0]).expect("json");
@@ -219,7 +321,9 @@ mod tests {
         let fake = serve(200, chat("ok"), Duration::ZERO);
         let mut d = PersonalDictionary::default();
         d.add("Cafler");
-        polisher(&fake).polish("caffler", &d).expect("ok");
+        polisher(&fake)
+            .polish(&clean_up("caffler"), &d)
+            .expect("ok");
         assert!(fake.bodies.lock().expect("lock")[0].contains("Always spell these exactly: Cafler"));
     }
 
@@ -227,7 +331,7 @@ mod tests {
     fn empty_model_is_omitted() {
         let fake = serve(200, chat("ok"), Duration::ZERO);
         LmStudioPolisher::new(fake.base.clone(), String::new())
-            .polish("x", &no_dict())
+            .polish(&clean_up("x"), &no_dict())
             .expect("ok");
         let sent: Value =
             serde_json::from_str(&fake.bodies.lock().expect("lock")[0]).expect("json");
@@ -238,7 +342,7 @@ mod tests {
     fn trailing_slash_in_base_url_is_tolerated() {
         let fake = serve(200, chat("ok"), Duration::ZERO);
         let p = LmStudioPolisher::new(format!("{}/", fake.base), "m".into());
-        assert!(p.polish("x", &no_dict()).is_ok());
+        assert!(p.polish(&clean_up("x"), &no_dict()).is_ok());
         assert_eq!(fake.paths.lock().expect("lock")[0], "/v1/chat/completions");
     }
 
@@ -246,7 +350,7 @@ mod tests {
     fn strips_reasoning_quotes_and_fences() {
         let fake = serve(200, chat("<think>plan</think>\n\"Hello.\""), Duration::ZERO);
         assert_eq!(
-            polisher(&fake).polish("hello", &no_dict()),
+            polisher(&fake).polish(&clean_up("hello"), &no_dict()),
             Ok("Hello.".into())
         );
     }
@@ -262,7 +366,7 @@ mod tests {
             r#"{}"#,
         ] {
             let fake = serve(200, body, Duration::ZERO);
-            let out = polisher(&fake).polish("x", &no_dict());
+            let out = polisher(&fake).polish(&clean_up("x"), &no_dict());
             assert!(
                 matches!(out, Err(PolishError::InvalidResponse(_))),
                 "{body}: {out:?}"
@@ -273,7 +377,7 @@ mod tests {
     #[test]
     fn unparsable_body_is_invalid_response() {
         let fake = serve(200, "not json", Duration::ZERO);
-        let out = polisher(&fake).polish("x", &no_dict());
+        let out = polisher(&fake).polish(&clean_up("x"), &no_dict());
         assert!(matches!(out, Err(PolishError::InvalidResponse(_))));
     }
 
@@ -281,7 +385,7 @@ mod tests {
     fn non_success_status_is_unreachable() {
         for status in [404, 500, 503] {
             let fake = serve(status, "boom", Duration::ZERO);
-            let out = polisher(&fake).polish("x", &no_dict());
+            let out = polisher(&fake).polish(&clean_up("x"), &no_dict());
             assert!(
                 matches!(out, Err(PolishError::Unreachable(_))),
                 "{status}: {out:?}"
@@ -298,7 +402,7 @@ mod tests {
             .port();
         let p = LmStudioPolisher::new(format!("http://127.0.0.1:{port}/v1"), "m".into());
         assert!(matches!(
-            p.polish("x", &no_dict()),
+            p.polish(&clean_up("x"), &no_dict()),
             Err(PolishError::Unreachable(_))
         ));
     }
@@ -308,7 +412,7 @@ mod tests {
         let fake = serve(200, chat("late"), Duration::from_millis(1500));
         let p = polisher(&fake).with_timeout(Duration::from_millis(200));
         let started = std::time::Instant::now();
-        let out = p.polish("x", &no_dict());
+        let out = p.polish(&clean_up("x"), &no_dict());
         assert!(matches!(out, Err(PolishError::Unreachable(_))), "{out:?}");
         assert!(started.elapsed() < Duration::from_millis(1400));
     }
@@ -332,7 +436,7 @@ mod tests {
         });
         let p = LmStudioPolisher::new(format!("http://127.0.0.1:{port}/v1"), "m".into())
             .with_timeout(Duration::from_millis(300));
-        let out = p.polish("x", &no_dict());
+        let out = p.polish(&clean_up("x"), &no_dict());
         assert!(matches!(out, Err(PolishError::Unreachable(_))), "{out:?}");
     }
 
