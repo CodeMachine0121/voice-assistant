@@ -11,10 +11,10 @@ pub fn initial_prompt(dictionary: &PersonalDictionary) -> Option<String> {
     }
 }
 
-/// Joins the model's segments into the transcript, dropping segments that are exactly one
-/// non-speech marker — `[BLANK_AUDIO]`, `(music)`, `*applause*`, `♪ ... ♪` — or hold
-/// nothing. Silence therefore comes out as an empty string, while speech that merely starts
-/// and ends with brackets, such as `(笑) 好啊 (笑)`, is kept.
+/// Joins the model's segments into the transcript, dropping segments made only of
+/// non-speech markers — `[BLANK_AUDIO]`, `(music) (applause)`, `*applause*`, `♪ ♪ ♪` — or
+/// of nothing. Silence therefore comes out as an empty string, while speech that merely
+/// starts and ends with markers, such as `(笑) 好啊 (笑)`, is kept whole.
 pub fn clean_transcript<S: AsRef<str>>(segments: &[S]) -> String {
     let joined: String = segments
         .iter()
@@ -24,24 +24,44 @@ pub fn clean_transcript<S: AsRef<str>>(segments: &[S]) -> String {
     joined.trim().to_string()
 }
 
+/// Bracket pairs that wrap a description of non-speech.
+const MARKERS: [(char, char); 6] = [
+    ('[', ']'),
+    ('(', ')'),
+    ('（', '）'),
+    ('【', '】'),
+    ('♪', '♪'),
+    ('*', '*'),
+];
+
+/// Whether the segment holds nothing but markers: they are stripped from the front one by
+/// one, and any other text left over makes it speech.
 fn is_non_speech(segment: &str) -> bool {
-    let s = segment.trim();
-    if s.is_empty() {
-        return true;
+    let mut rest = segment.trim();
+    while !rest.is_empty() {
+        match strip_marker(rest) {
+            Some(after) => rest = after.trim_start(),
+            None => return false,
+        }
     }
-    // One marker: a single bracket pair around the whole segment, with no other bracket of
-    // that kind inside (so no text can sit outside the pair).
-    let wrapped = |open: char, close: char| {
-        s.strip_prefix(open)
-            .and_then(|rest| rest.strip_suffix(close))
-            .is_some_and(|inside| !inside.contains(open) && !inside.contains(close))
-    };
-    wrapped('[', ']')
-        || wrapped('(', ')')
-        || wrapped('（', '）')
-        || wrapped('【', '】')
-        || wrapped('♪', '♪')
-        || (s.len() > 1 && wrapped('*', '*'))
+    true
+}
+
+/// `s` without the marker it starts with; `None` when it does not start with one.
+fn strip_marker(s: &str) -> Option<&str> {
+    MARKERS.iter().find_map(|&(open, close)| {
+        let inside_and_rest = s.strip_prefix(open)?;
+        match inside_and_rest.find(close) {
+            // A nested opening bracket means this is not one simple marker.
+            Some(end) if !inside_and_rest[..end].contains(open) => {
+                Some(&inside_and_rest[end + close.len_utf8()..])
+            }
+            Some(_) => None,
+            // A music note on its own stands for music; a lone `*` is just a character.
+            None if open == '♪' => Some(inside_and_rest),
+            None => None,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -134,6 +154,29 @@ mod tests {
             "*sigh* fine then *sigh*"
         );
         assert_eq!(clean_transcript(&["♪ la ♪ hi ♪ la ♪"]), "♪ la ♪ hi ♪ la ♪");
+    }
+
+    #[test]
+    fn a_transcript_made_only_of_markers_is_silence() {
+        for markers in [
+            "[Music] [Music]",
+            "(music) (applause)",
+            "♪ ♪ ♪",
+            "♪",
+            " [BLANK_AUDIO]  (music) *applause* ",
+        ] {
+            assert_eq!(clean_transcript(&[markers]), "", "{markers}");
+        }
+    }
+
+    #[test]
+    fn markers_around_and_between_speech_keep_the_whole_transcript() {
+        assert_eq!(clean_transcript(&["(笑) 好啊 (笑)"]), "(笑) 好啊 (笑)");
+        assert_eq!(
+            clean_transcript(&["[Music] hello [Music]"]),
+            "[Music] hello [Music]"
+        );
+        assert_eq!(clean_transcript(&["(a (b) c)"]), "(a (b) c)");
     }
 
     #[test]
