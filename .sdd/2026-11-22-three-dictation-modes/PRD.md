@@ -214,7 +214,7 @@ Scenario: Nothing selected
   When the user presses Option and Space
   Then Edit selection does not start listening
   And nothing changes in the front app
-  And the status shows "Select text first, then press Option + Space"
+  And the status shows "Select text first, then start Edit selection again"
   And no history entry is added
 
 Scenario: Writing assistant unreachable during Edit selection

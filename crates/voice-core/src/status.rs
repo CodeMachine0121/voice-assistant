@@ -38,7 +38,9 @@ impl fmt::Display for Problem {
                 f,
                 "Speech model not reachable — is your local AI app running?"
             ),
-            Problem::NoSelection => write!(f, "Select text first, then press Option + Space"),
+            Problem::NoSelection => {
+                write!(f, "Select text first, then start Edit selection again")
+            }
             Problem::SelectionTooLong => {
                 write!(f, "Selection too long — select at most 10,000 characters")
             }
@@ -98,7 +100,7 @@ mod tests {
             ),
             (
                 Problem::NoSelection,
-                "Select text first, then press Option + Space",
+                "Select text first, then start Edit selection again",
             ),
             (
                 Problem::SelectionTooLong,
