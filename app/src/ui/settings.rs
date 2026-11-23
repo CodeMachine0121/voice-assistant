@@ -3,7 +3,9 @@ use crate::focus::FocusRequest;
 use crate::model::{Notice, SettingsSession};
 use crate::permissions_view::{self, Access};
 use crate::settings_form::{
-    assistant_choices, assistant_label, key_status_text, speech_model_choices, SPEECH_PRIVACY_NOTE,
+    assistant_choices, assistant_label, key_status_text, speech_model_choices, writing_use,
+    CLEANUP_LABEL, SPEECH_GROUP, SPEECH_PRIVACY_NOTE, SPEECH_PURPOSE, WRITING_GROUP,
+    WRITING_PURPOSE,
 };
 use crate::shortcut_names::{caps_text, friendly_name, key_caps, ALL_SHORTCUTS};
 use crate::tasks::ModelsState;
@@ -53,7 +55,10 @@ fn draw(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             section(ui, "Shortcuts", |ui| shortcuts(ui, session));
-            section(ui, "AI models", |ui| ai_models(ui, session, services));
+            section(ui, SPEECH_GROUP, |ui| speech_to_text(ui, session, services));
+            section(ui, WRITING_GROUP, |ui| {
+                writing_assistant(ui, session, services)
+            });
             section(ui, "Microphone", |ui| microphone(ui, session));
             section(ui, "Dictionary", |ui| dictionary(ui, session));
             section(ui, "Permissions", |ui| permissions(ui, session, services));
@@ -140,10 +145,45 @@ fn microphone(ui: &mut egui::Ui, session: &mut SettingsSession) {
         });
 }
 
-fn ai_models(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
-    speech_rows(ui, session, services);
-    ui.add_space(12.0);
+/// A group's one-line purpose, under its title.
+fn purpose(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).weak());
+    ui.add_space(6.0);
+}
 
+/// The OpenAI model that turns the recording into words.
+fn speech_to_text(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
+    purpose(ui, SPEECH_PURPOSE);
+    speech_rows(ui, session, services);
+}
+
+/// The model in the local AI app that works on the words, and what each action uses it for.
+fn writing_assistant(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
+    purpose(ui, WRITING_PURPOSE);
+    writing_uses(ui, session);
+    ui.add_space(8.0);
+    writing_rows(ui, session, services);
+}
+
+/// One line per action: its name, its shortcut and what the writing model does for it.
+fn writing_uses(ui: &mut egui::Ui, session: &SettingsSession) {
+    for action in Action::ALL {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(action.label()).strong());
+            for key in key_caps(session.form.shortcuts.for_action(action)) {
+                key_cap(ui, key);
+            }
+            ui.label(
+                RichText::new(writing_use(action, session.form.cleanup_enabled))
+                    .weak()
+                    .small(),
+            );
+        });
+    }
+}
+
+/// Local AI app address, writing model and the AI cleanup switch.
+fn writing_rows(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
     ui.horizontal(|ui| {
         ui.label("Local AI app address");
         ui.add(
@@ -176,8 +216,7 @@ fn ai_models(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Servic
     assistant_row(ui, session, services);
     ui.add_space(8.0);
 
-    ui.checkbox(&mut session.form.cleanup_enabled, "AI cleanup");
-    ui.label(RichText::new("Applies to Dictate only").weak().small());
+    ui.checkbox(&mut session.form.cleanup_enabled, CLEANUP_LABEL);
 }
 
 /// Label, description and a right-aligned choice with a refresh button.
@@ -220,7 +259,7 @@ fn choice_row(
 /// Speech provider, its speech model and key, and where recordings go.
 fn speech_rows(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
     let speech = &mut session.form.speech;
-    choice_row(ui, "Provider", "turns your voice into words", |ui| {
+    choice_row(ui, "Provider", "the service that listens", |ui| {
         ComboBox::from_id_salt("speech_provider")
             .width(220.0)
             .selected_text(speech.provider.label())
@@ -235,7 +274,7 @@ fn speech_rows(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Serv
     choice_row(
         ui,
         "Speech model",
-        "the provider's model that listens",
+        "the provider's speech-to-text model",
         |ui| {
             ComboBox::from_id_salt("speech_model")
                 .width(220.0)
@@ -277,8 +316,8 @@ fn assistant_row(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Se
     let choices = assistant_choices(&listed, &session.form.assistant_model);
     let refresh = model_row(
         ui,
-        "Writing assistant model",
-        "cleans up, translates and edits, in the local AI app",
+        "Writing model",
+        "the model loaded in the local AI app",
         |ui| {
             ComboBox::from_id_salt("assistant_model")
                 .width(220.0)
@@ -453,10 +492,8 @@ mod tests {
         assert!(!drawn.iter().any(|t| t.contains("sk-secret")), "{drawn:?}");
     }
 
-    #[test]
-    fn the_settings_window_no_longer_offers_a_built_in_speech_model() {
-        let (services, _probe) = test_services();
-        let mut session = SettingsSession::open(&services);
+    /// Everything the whole window draws as text in one frame, top to bottom.
+    fn drawn_window(session: &mut SettingsSession, services: &Services) -> Vec<String> {
         let ctx = egui::Context::default();
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -465,16 +502,100 @@ mod tests {
             )),
             ..Default::default()
         };
-
-        let mut output = ctx.run_ui(input, |ui| draw(ui, &mut session, &services));
+        let mut output = ctx.run_ui(input, |ui| draw(ui, session, services));
         output.textures_delta.clear();
         let mut drawn = Vec::new();
         for clipped in &output.shapes {
             texts(&clipped.shape, &mut drawn);
         }
+        drawn
+    }
+
+    fn position(drawn: &[String], text: &str) -> usize {
+        drawn
+            .iter()
+            .position(|t| t == text)
+            .unwrap_or_else(|| panic!("{text} not drawn: {drawn:?}"))
+    }
+
+    #[test]
+    fn speech_and_writing_models_are_in_separate_groups() {
+        let (services, _probe) = test_services();
+        let mut session = SettingsSession::open(&services);
+
+        let drawn = drawn_window(&mut session, &services);
+
+        let speech = position(&drawn, SPEECH_GROUP);
+        let writing = position(&drawn, WRITING_GROUP);
+        let next = position(&drawn, "Microphone");
+        assert!(speech < writing && writing < next, "{drawn:?}");
+        for row in [
+            SPEECH_PURPOSE,
+            "Provider",
+            "Speech model",
+            "OpenAI key",
+            SPEECH_PRIVACY_NOTE,
+        ] {
+            let at = position(&drawn, row);
+            assert!(speech < at && at < writing, "{row} is not under speech");
+        }
+        for row in [
+            WRITING_PURPOSE,
+            "Local AI app address",
+            "Check connection",
+            "Writing model",
+            CLEANUP_LABEL,
+        ] {
+            let at = position(&drawn, row);
+            assert!(writing < at && at < next, "{row} is not under writing");
+        }
+        assert!(!drawn.iter().any(|t| t.contains("AI models")), "{drawn:?}");
+    }
+
+    #[test]
+    fn the_writing_group_lists_what_each_action_uses_it_for() {
+        let (services, _probe) = test_services();
+        let mut session = SettingsSession::open(&services);
+        session.form.cleanup_enabled = true;
+
+        let drawn = drawn_window(&mut session, &services);
+
+        let writing = position(&drawn, WRITING_GROUP);
+        let under_writing = &drawn[writing..];
+        for action in Action::ALL {
+            let name = position(under_writing, action.label());
+            let caps = key_caps(session.form.shortcuts.for_action(action));
+            let used_for = position(under_writing, writing_use(action, true));
+            assert!(name < used_for, "{action:?}: {under_writing:?}");
+            for (offset, key) in caps.iter().enumerate() {
+                assert_eq!(&under_writing[name + 1 + offset], key, "{action:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn turning_ai_cleanup_off_shows_dictate_does_not_use_the_writing_model() {
+        let (services, _probe) = test_services();
+        let mut session = SettingsSession::open(&services);
+        session.form.cleanup_enabled = false;
+
+        let drawn = drawn_window(&mut session, &services);
+
+        position(&drawn, writing_use(Action::Dictate, false));
+        assert!(!drawn
+            .iter()
+            .any(|t| t == writing_use(Action::Dictate, true)));
+    }
+
+    #[test]
+    fn the_settings_window_no_longer_offers_a_built_in_speech_model() {
+        let (services, _probe) = test_services();
+        let mut session = SettingsSession::open(&services);
+
+        let drawn = drawn_window(&mut session, &services);
 
         // The whole window was drawn, from the speech rows down to the permissions.
-        for expected in ["OpenAI", "Writing assistant model", "Permissions", "Save"] {
+        for expected in ["OpenAI", "Writing model", "Permissions", "Save"] {
             assert!(drawn.iter().any(|t| t == expected), "{expected}: {drawn:?}");
         }
         for gone in ["Built-in", "Download", "model file", "default location"] {
