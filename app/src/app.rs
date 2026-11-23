@@ -31,24 +31,17 @@ impl VoiceApp {
                 None
             }
         };
-        let mut model = AppModel::new(Instant::now());
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
         if tray.is_none() {
             // Without the menu there is no other way in; open Settings right away.
-            model.handle_command(TrayCommand::Settings, &services);
+            model.handle_command(TrayCommand::Settings, &services, now);
         }
         Self {
             services,
             model,
             tray,
             commands,
-        }
-    }
-
-    fn focus(ctx: &egui::Context, command: TrayCommand) {
-        match command {
-            TrayCommand::Settings => ui::settings::focus(ctx),
-            TrayCommand::History => ui::history::focus(ctx),
-            TrayCommand::Quit => {}
         }
     }
 }
@@ -61,8 +54,7 @@ impl eframe::App for VoiceApp {
         self.model.drain_statuses(&self.services, now);
         let commands: Vec<_> = self.commands.try_iter().collect();
         for command in commands {
-            self.model.handle_command(command, &self.services);
-            Self::focus(&ctx, command);
+            self.model.handle_command(command, &self.services, now);
         }
         if self.model.quit_requested {
             ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -80,12 +72,20 @@ impl eframe::App for VoiceApp {
         }
 
         if let Some(session) = &mut self.model.settings {
-            if ui::settings::show(&ctx, session, &self.services) {
-                self.model.close_settings();
+            let focus = &mut self.model.settings_focus;
+            if ui::settings::show(&ctx, session, &self.services, focus, now) {
+                self.model.close_settings(&self.services);
             }
         }
-        if self.model.history_open && ui::history::show(&ctx, &self.model.history) {
-            self.model.close_history();
+        if self.model.history_open
+            && ui::history::show(
+                &ctx,
+                &self.model.history,
+                &mut self.model.history_focus,
+                now,
+            )
+        {
+            self.model.close_history(&self.services);
         }
     }
 

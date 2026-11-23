@@ -1,5 +1,5 @@
 //! Services for unit tests: in-memory stores and recorders of what was asked of them.
-use super::{fakes, settings_saver, Permissions, RepaintHandle, Services};
+use super::{fakes, settings_saver, AppFocus, Permissions, RepaintHandle, Services};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use voice_core::{EngineHandle, HistoryStore, Settings, SettingsStore, Status};
@@ -73,9 +73,31 @@ pub struct Probe {
     status_tx: Sender<Status>,
     applied: Arc<Mutex<Vec<Settings>>>,
     secret: Arc<FlakySecret>,
+    focus_moves: Arc<Mutex<Vec<FocusMove>>>,
+}
+
+/// What the app asked of macOS about keyboard focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusMove {
+    BringToFront,
+    HandBack,
+    ShowWithoutFocus,
 }
 
 impl Probe {
+    /// How often the app asked to be made the active app.
+    pub fn times_brought_to_front(&self) -> usize {
+        self.focus_moves()
+            .iter()
+            .filter(|m| **m == FocusMove::BringToFront)
+            .count()
+    }
+
+    /// Every focus request so far, in order.
+    pub fn focus_moves(&self) -> Vec<FocusMove> {
+        self.focus_moves.lock().unwrap().clone()
+    }
+
     /// What the secret store (the Keychain in the real app) holds.
     pub fn saved_key(&self) -> Option<String> {
         self.secret.secret.lock().unwrap().clone()
@@ -124,6 +146,11 @@ pub fn test_services() -> (Services, Probe) {
     let recorded = updates.clone();
     let secret = Arc::new(FlakySecret::default());
     let speech_key = Arc::new(OpenAiKey::with_environment(secret.clone(), || None));
+    let focus_moves = Arc::new(Mutex::new(Vec::new()));
+    let record = |focus_move: FocusMove| -> Arc<dyn Fn() + Send + Sync> {
+        let moves = focus_moves.clone();
+        Arc::new(move || moves.lock().unwrap().push(focus_move))
+    };
     let services = Services {
         settings_store: settings.clone(),
         history_store: history,
@@ -150,6 +177,11 @@ pub fn test_services() -> (Services, Probe) {
             settings_tx,
             move |s: &Settings| recorded.lock().unwrap().push(s.clone()),
         ),
+        app_focus: AppFocus {
+            bring_to_front: record(FocusMove::BringToFront),
+            hand_back: record(FocusMove::HandBack),
+            show_without_focus: record(FocusMove::ShowWithoutFocus),
+        },
     };
     (
         services,
@@ -159,6 +191,7 @@ pub fn test_services() -> (Services, Probe) {
             status_tx,
             applied: updates,
             secret,
+            focus_moves,
         },
     )
 }

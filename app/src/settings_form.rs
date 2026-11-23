@@ -7,6 +7,18 @@ use voice_stt::KeyStatus;
 
 /// The writing assistant row's first choice.
 pub const ANY_ASSISTANT_MODEL: &str = "Whatever is loaded";
+/// Title of the Settings group for the model that turns speech into words.
+pub const SPEECH_GROUP: &str = "Speech to text";
+/// What the speech model is for.
+pub const SPEECH_PURPOSE: &str = "Turns your voice into words for every shortcut. Runs on OpenAI.";
+/// Title of the Settings group for the model that works on the words.
+pub const WRITING_GROUP: &str = "Writing assistant";
+/// What the writing model is for; the per-action uses follow.
+pub const WRITING_PURPOSE: &str =
+    "Works on the words once they are written down. Runs in the local AI app on this Mac.";
+/// Label of the AI cleanup switch.
+pub const CLEANUP_LABEL: &str = "AI cleanup for Dictate";
+
 /// Shown under the speech rows: where recordings go.
 pub const SPEECH_PRIVACY_NOTE: &str = "Recordings are sent to OpenAI to be turned into words.";
 
@@ -180,6 +192,17 @@ pub fn key_status_text(status: KeyStatus) -> &'static str {
     }
 }
 
+/// What the writing model does for `action`. Dictate only uses it while AI cleanup
+/// is on; the other actions always need it.
+pub fn writing_use(action: Action, cleanup_enabled: bool) -> &'static str {
+    match action {
+        Action::Dictate if cleanup_enabled => "cleans up the words (AI cleanup is on)",
+        Action::Dictate => "not used while AI cleanup is off",
+        Action::DictateInEnglish => "translates the words into English",
+        Action::EditSelection => "applies your spoken instruction to the selected text",
+    }
+}
+
 /// Row label of a writing assistant model (`""` = whatever is loaded).
 pub fn assistant_label(model: &str) -> String {
     if model.is_empty() {
@@ -214,6 +237,38 @@ pub fn assistant_choices(listed: &[String], current: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use voice_core::Shortcut;
+
+    #[test]
+    fn writing_use_says_what_the_writing_model_does_per_action() {
+        let uses: Vec<_> = Action::ALL
+            .iter()
+            .map(|&action| writing_use(action, true))
+            .collect();
+        assert_eq!(
+            uses,
+            [
+                "cleans up the words (AI cleanup is on)",
+                "translates the words into English",
+                "applies your spoken instruction to the selected text",
+            ]
+        );
+    }
+
+    #[test]
+    fn without_ai_cleanup_dictate_does_not_use_the_writing_model() {
+        assert_eq!(
+            writing_use(Action::Dictate, false),
+            "not used while AI cleanup is off"
+        );
+        assert_eq!(
+            writing_use(Action::DictateInEnglish, false),
+            writing_use(Action::DictateInEnglish, true)
+        );
+        assert_eq!(
+            writing_use(Action::EditSelection, false),
+            writing_use(Action::EditSelection, true)
+        );
+    }
 
     fn form() -> SettingsForm {
         SettingsForm::from_settings(&Settings::default())
