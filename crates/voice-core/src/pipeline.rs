@@ -1,8 +1,11 @@
-//! Finishing a dictation: speech check → transcribe → polish (or skip) → insert → history.
+//! Finishing a recording: speech check → heard words → writing assistant (per action)
+//! → insert at the cursor → history.
+use crate::script::to_traditional;
 use crate::speech::contains_speech;
 use crate::{
-    History, HistoryEntry, HistoryStore, PersonalDictionary, PolishError, Polisher, Problem,
-    Recording, Settings, Status, TextInserter, Transcriber,
+    Action, History, HistoryEntry, HistoryStore, PersonalDictionary, PolishError, Polisher,
+    PreparedAction, Problem, Recording, Settings, Status, TextInserter, TranscribeError,
+    Transcriber, WritingTask,
 };
 use chrono::Local;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -23,6 +26,14 @@ impl Outcome {
             entry: None,
         }
     }
+}
+
+/// What the writing assistant gave back.
+enum Reply {
+    Text(String),
+    /// Answered, but with nothing usable.
+    Unusable,
+    Unreachable,
 }
 
 pub struct DictationPipeline {
@@ -50,25 +61,76 @@ impl DictationPipeline {
         }
     }
 
-    pub fn process(&self, recording: Recording, settings: &Settings) -> Outcome {
+    pub fn process(
+        &self,
+        recording: Recording,
+        action: &PreparedAction,
+        settings: &Settings,
+    ) -> Outcome {
         if !contains_speech(&recording) {
             return Outcome::problem_without_entry(Problem::NoSpeech);
         }
-        let raw = match self
+        let heard = match self
             .transcriber
             .transcribe(&recording, &settings.dictionary)
         {
-            Ok(raw) => raw.trim().to_string(),
-            Err(e) => return Outcome::problem_without_entry(Problem::Other(e)),
+            Ok(transcript) => to_traditional(transcript.trim()),
+            Err(TranscribeError::Unreachable(reason)) => {
+                log::warn!("speech model unreachable: {reason}");
+                return Outcome::problem_without_entry(Problem::SpeechModelUnreachable);
+            }
+            Err(TranscribeError::Failed(reason)) => {
+                return Outcome::problem_without_entry(Problem::Other(reason))
+            }
         };
-        if raw.is_empty() {
+        if heard.is_empty() {
             return Outcome::problem_without_entry(Problem::NoSpeech);
         }
 
-        let (text, assistant_problem) = if settings.cleanup_enabled {
-            self.polish(&raw, &settings.dictionary)
-        } else {
-            (raw.clone(), None)
+        let dictionary = &settings.dictionary;
+        let (text, original, assistant_problem) = match action {
+            PreparedAction::Dictate if settings.cleanup_enabled => {
+                match self.ask(&WritingTask::CleanUp { heard: &heard }, dictionary) {
+                    Reply::Text(result) => (to_traditional(&result), None, None),
+                    Reply::Unusable => (heard.clone(), None, None),
+                    Reply::Unreachable => (
+                        heard.clone(),
+                        None,
+                        Some(Problem::AssistantUnreachable(Action::Dictate)),
+                    ),
+                }
+            }
+            PreparedAction::Dictate => (heard.clone(), None, None),
+            PreparedAction::DictateInEnglish => {
+                match self.ask(
+                    &WritingTask::TranslateToEnglish { heard: &heard },
+                    dictionary,
+                ) {
+                    Reply::Text(result) => (result, None, None),
+                    Reply::Unusable => (heard.clone(), None, None),
+                    Reply::Unreachable => (
+                        heard.clone(),
+                        None,
+                        Some(Problem::AssistantUnreachable(Action::DictateInEnglish)),
+                    ),
+                }
+            }
+            PreparedAction::EditSelection { selection } => {
+                let task = WritingTask::EditSelection {
+                    instruction: &heard,
+                    selection,
+                };
+                match self.ask(&task, dictionary) {
+                    // No Traditional conversion: the instruction may ask for Simplified.
+                    Reply::Text(result) => (result, Some(selection.clone()), None),
+                    // The selection stays as it was: nothing to write, nothing to record.
+                    Reply::Unusable | Reply::Unreachable => {
+                        return Outcome::problem_without_entry(Problem::AssistantUnreachable(
+                            Action::EditSelection,
+                        ))
+                    }
+                }
+            }
         };
 
         // An accessibility problem matters more than skipped cleanup: the text did not land.
@@ -76,7 +138,9 @@ impl DictationPipeline {
 
         let entry = HistoryEntry {
             at: Local::now(),
-            raw,
+            action: action.action(),
+            raw: heard,
+            original,
             polished: text,
         };
         self.record(entry.clone());
@@ -87,18 +151,20 @@ impl DictationPipeline {
         }
     }
 
-    /// Polished text, or the raw transcript when cleanup could not be done.
-    fn polish(&self, raw: &str, dictionary: &PersonalDictionary) -> (String, Option<Problem>) {
-        match self.polisher.polish(raw, dictionary) {
-            Ok(polished) if !polished.trim().is_empty() => (polished.trim().to_string(), None),
-            Ok(_) => (raw.to_string(), None),
+    fn ask(&self, task: &WritingTask<'_>, dictionary: &PersonalDictionary) -> Reply {
+        match self.polisher.polish(task, dictionary) {
+            Ok(text) if !text.trim().is_empty() => Reply::Text(text.trim().to_string()),
+            Ok(_) => {
+                log::warn!("writing assistant gave an empty answer");
+                Reply::Unusable
+            }
             Err(PolishError::Unreachable(reason)) => {
                 log::warn!("writing assistant unreachable: {reason}");
-                (raw.to_string(), Some(Problem::AssistantUnreachable))
+                Reply::Unreachable
             }
             Err(PolishError::InvalidResponse(reason)) => {
                 log::warn!("writing assistant gave an unusable answer: {reason}");
-                (raw.to_string(), None)
+                Reply::Unusable
             }
         }
     }
@@ -115,7 +181,9 @@ impl DictationPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fakes::{silence, speech, FakeInserter, FakePolisher, FakeStore, FakeTranscriber};
+    use crate::fakes::{
+        silence, speech, FakeInserter, FakePolisher, FakeStore, FakeTranscriber, Task,
+    };
     use crate::rules::HISTORY_LIMIT;
     use chrono::TimeZone;
 
@@ -127,10 +195,10 @@ mod tests {
     }
 
     impl Rig {
-        fn new(raw: &str, polished: Result<&str, PolishError>) -> Self {
+        fn new(heard: &str, answer: Result<&str, PolishError>) -> Self {
             Self {
-                transcriber: FakeTranscriber::new(Ok(raw)),
-                polisher: FakePolisher::new(polished),
+                transcriber: FakeTranscriber::new(Ok(heard)),
+                polisher: FakePolisher::new(answer),
                 inserter: FakeInserter::new(Ok(())),
                 store: FakeStore::new(History::default()),
             }
@@ -143,9 +211,20 @@ mod tests {
                 self.store.clone(),
             )
         }
+        fn run(&self, action: &PreparedAction, settings: &Settings) -> Outcome {
+            self.pipeline().process(speech(), action, settings)
+        }
         fn last_saved(&self) -> History {
             self.store.saved().pop().expect("history saved")
         }
+        fn assert_nothing_written_or_recorded(&self) {
+            assert!(self.inserter.inserted().is_empty(), "nothing written");
+            assert!(self.store.saved().is_empty(), "nothing recorded");
+        }
+    }
+
+    fn unreachable() -> Result<&'static str, PolishError> {
+        Err(PolishError::Unreachable("connection refused".into()))
     }
 
     fn cleanup_on() -> Settings {
@@ -159,132 +238,127 @@ mod tests {
         }
     }
 
+    fn edit(selection: &str) -> PreparedAction {
+        PreparedAction::EditSelection {
+            selection: selection.into(),
+        }
+    }
+
+    const DICTATE: PreparedAction = PreparedAction::Dictate;
+    const ENGLISH: PreparedAction = PreparedAction::DictateInEnglish;
+
     fn old_entry(n: usize) -> HistoryEntry {
         HistoryEntry {
             at: Local.timestamp_opt(1_600_000_000 + n as i64, 0).unwrap(),
+            action: Action::Dictate,
             raw: format!("old {n}"),
+            original: None,
             polished: format!("Old {n}."),
         }
     }
 
-    // ---- happy path --------------------------------------------------------
+    // ---- Dictate -----------------------------------------------------------
 
     #[test]
-    fn polished_text_is_inserted_recorded_and_done() {
-        let rig = Rig::new("hello team", Ok("Hello team."));
+    fn dictate_cleans_up_inserts_records_and_is_done() {
+        let rig = Rig::new("我們明天下午三點開會", Ok("我們明天下午三點開會。"));
 
-        let outcome = rig.pipeline().process(speech(), &cleanup_on());
+        let outcome = rig.run(&DICTATE, &cleanup_on());
 
         assert_eq!(outcome.status, Status::Done);
-        assert_eq!(rig.inserter.inserted(), ["Hello team."]);
+        assert_eq!(
+            rig.polisher.tasks(),
+            [Task::CleanUp("我們明天下午三點開會".into())]
+        );
+        assert_eq!(rig.inserter.inserted(), ["我們明天下午三點開會。"]);
         let entry = outcome.entry.expect("entry");
-        assert_eq!(entry.raw, "hello team");
-        assert_eq!(entry.polished, "Hello team.");
+        assert_eq!(entry.action, Action::Dictate);
+        assert_eq!(entry.raw, "我們明天下午三點開會");
+        assert_eq!(entry.original, None);
+        assert_eq!(entry.polished, "我們明天下午三點開會。");
         assert_eq!(rig.last_saved().entries(), [entry]);
     }
 
     #[test]
-    fn transcript_and_polished_text_are_trimmed() {
-        let rig = Rig::new("  hello team \n", Ok("\n Hello team. "));
+    fn dictate_writes_simplified_heard_words_in_traditional_characters() {
+        let rig = Rig::new("我们开会", Ok("我们开会。"));
 
-        let outcome = rig.pipeline().process(speech(), &cleanup_on());
+        let outcome = rig.run(&DICTATE, &cleanup_on());
 
-        assert_eq!(rig.polisher.calls()[0].0, "hello team");
-        assert_eq!(rig.inserter.inserted(), ["Hello team."]);
-        assert_eq!(outcome.entry.map(|e| e.raw), Some("hello team".into()));
+        assert_eq!(rig.polisher.tasks(), [Task::CleanUp("我們開會".into())]);
+        assert_eq!(rig.inserter.inserted(), ["我們開會。"]);
+        assert_eq!(outcome.entry.map(|e| e.raw), Some("我們開會".into()));
     }
 
     #[test]
-    fn dictionary_reaches_transcriber_and_polisher() {
-        let rig = Rig::new("I work at caffler", Ok("I work at Cafler."));
-        let settings = Settings {
-            dictionary: PersonalDictionary::from_words(["Cafler"]),
-            ..Settings::default()
-        };
+    fn dictate_keeps_mixed_chinese_and_english() {
+        let rig = Rig::new("嗯 我們那個 review 一下 PR", Ok("我們 review 一下 PR。"));
 
-        rig.pipeline().process(speech(), &settings);
+        rig.run(&DICTATE, &cleanup_on());
 
-        assert_eq!(rig.transcriber.dictionaries()[0].words(), ["Cafler"]);
-        assert_eq!(rig.polisher.calls()[0].1.words(), ["Cafler"]);
+        assert_eq!(rig.inserter.inserted(), ["我們 review 一下 PR。"]);
     }
 
-    // ---- cleanup off -------------------------------------------------------
-
     #[test]
-    fn cleanup_off_writes_the_raw_transcript_unchanged() {
-        let rig = Rig::new("um hello there", Ok("Hello there."));
+    fn cleanup_off_writes_the_heard_words_unchanged() {
+        let rig = Rig::new("嗯 我們開會", Ok("我們開會。"));
 
-        let outcome = rig.pipeline().process(speech(), &cleanup_off());
+        let outcome = rig.run(&DICTATE, &cleanup_off());
 
-        assert_eq!(rig.inserter.inserted(), ["um hello there"]);
+        assert_eq!(rig.inserter.inserted(), ["嗯 我們開會"]);
         assert!(rig.polisher.calls().is_empty());
         assert_eq!(outcome.status, Status::Done);
         assert_eq!(
             outcome.entry.map(|e| e.polished),
-            Some("um hello there".into())
+            Some("嗯 我們開會".into())
         );
     }
 
-    // ---- fallbacks ---------------------------------------------------------
+    #[test]
+    fn cleanup_off_still_writes_chinese_in_traditional_characters() {
+        let rig = Rig::new("我们开会", Ok("x"));
+
+        rig.run(&DICTATE, &cleanup_off());
+
+        assert_eq!(rig.inserter.inserted(), ["我們開會"]);
+    }
 
     #[test]
-    fn unreachable_assistant_writes_raw_and_reports_it() {
-        let rig = Rig::new(
-            "hello there",
-            Err(PolishError::Unreachable("connection refused".into())),
-        );
+    fn unreachable_assistant_during_dictate_writes_the_heard_words_and_says_so() {
+        let rig = Rig::new("我們開會", unreachable());
 
-        let outcome = rig.pipeline().process(speech(), &cleanup_on());
+        let outcome = rig.run(&DICTATE, &cleanup_on());
 
-        assert_eq!(rig.inserter.inserted(), ["hello there"]);
+        assert_eq!(rig.inserter.inserted(), ["我們開會"]);
         assert_eq!(
             outcome.status,
-            Status::Problem(Problem::AssistantUnreachable)
+            Status::Problem(Problem::AssistantUnreachable(Action::Dictate))
         );
         assert_eq!(
-            Problem::AssistantUnreachable.to_string(),
-            "Cleanup skipped – assistant unreachable"
+            outcome.status_message(),
+            "AI cleanup skipped — writing assistant not reachable"
         );
-        assert_eq!(
-            outcome.entry.map(|e| e.polished),
-            Some("hello there".into())
-        );
+        assert_eq!(outcome.entry.map(|e| e.polished), Some("我們開會".into()));
     }
 
     #[test]
-    fn slow_assistant_reported_as_unreachable_writes_raw() {
-        let rig = Rig::new(
-            "hello there",
-            Err(PolishError::Unreachable("timed out after 20 s".into())),
-        );
-
-        let outcome = rig.pipeline().process(speech(), &cleanup_on());
-
-        assert_eq!(rig.inserter.inserted(), ["hello there"]);
-        assert_eq!(
-            outcome.status,
-            Status::Problem(Problem::AssistantUnreachable)
-        );
-    }
-
-    #[test]
-    fn empty_assistant_answer_falls_back_to_raw_silently() {
+    fn empty_answer_during_dictate_falls_back_to_heard_words_silently() {
         let rig = Rig::new("hello there", Ok("   "));
 
-        let outcome = rig.pipeline().process(speech(), &cleanup_on());
+        let outcome = rig.run(&DICTATE, &cleanup_on());
 
         assert_eq!(rig.inserter.inserted(), ["hello there"]);
         assert_eq!(outcome.status, Status::Done);
     }
 
     #[test]
-    fn invalid_assistant_answer_falls_back_to_raw_silently() {
+    fn invalid_answer_during_dictate_falls_back_to_heard_words_silently() {
         let rig = Rig::new(
             "hello there",
             Err(PolishError::InvalidResponse("no choices".into())),
         );
 
-        let outcome = rig.pipeline().process(speech(), &cleanup_on());
+        let outcome = rig.run(&DICTATE, &cleanup_on());
 
         assert_eq!(rig.inserter.inserted(), ["hello there"]);
         assert_eq!(outcome.status, Status::Done);
@@ -294,51 +368,297 @@ mod tests {
         );
     }
 
-    // ---- silence -----------------------------------------------------------
+    // ---- Dictate in English ------------------------------------------------
 
     #[test]
-    fn silence_writes_nothing_and_records_nothing() {
+    fn english_translates_inserts_and_records_an_english_entry() {
+        let rig = Rig::new("我們開會", Ok("We have a meeting."));
+
+        let outcome = rig.run(&ENGLISH, &cleanup_on());
+
+        assert_eq!(outcome.status, Status::Done);
+        assert_eq!(
+            rig.polisher.tasks(),
+            [Task::TranslateToEnglish("我們開會".into())]
+        );
+        assert_eq!(rig.inserter.inserted(), ["We have a meeting."]);
+        let entry = rig.last_saved().entries()[0].clone();
+        assert_eq!(entry.action, Action::DictateInEnglish);
+        assert_eq!(entry.action.label(), "English");
+        assert_eq!(entry.raw, "我們開會");
+        assert_eq!(entry.polished, "We have a meeting.");
+        assert_eq!(entry.original, None);
+    }
+
+    #[test]
+    fn english_still_translates_when_cleanup_is_off() {
+        let rig = Rig::new("我們開會", Ok("We have a meeting."));
+
+        rig.run(&ENGLISH, &cleanup_off());
+
+        assert_eq!(
+            rig.polisher.tasks(),
+            [Task::TranslateToEnglish("我們開會".into())]
+        );
+        assert_eq!(rig.inserter.inserted(), ["We have a meeting."]);
+    }
+
+    #[test]
+    fn english_sends_simplified_heard_words_as_traditional() {
+        let rig = Rig::new("这个 bug 我下星期修", Ok("I'll fix this bug next week."));
+
+        rig.run(&ENGLISH, &cleanup_on());
+
+        assert_eq!(
+            rig.polisher.tasks(),
+            [Task::TranslateToEnglish("這個 bug 我下星期修".into())]
+        );
+        assert_eq!(rig.inserter.inserted(), ["I'll fix this bug next week."]);
+    }
+
+    #[test]
+    fn unreachable_assistant_during_english_writes_the_heard_words_and_says_so() {
+        let rig = Rig::new("我們開會", unreachable());
+
+        let outcome = rig.run(&ENGLISH, &cleanup_on());
+
+        assert_eq!(rig.inserter.inserted(), ["我們開會"]);
+        assert_eq!(
+            outcome.status,
+            Status::Problem(Problem::AssistantUnreachable(Action::DictateInEnglish))
+        );
+        assert_eq!(
+            outcome.status_message(),
+            "Translation skipped — writing assistant not reachable"
+        );
+        assert_eq!(
+            outcome.entry.map(|e| e.action),
+            Some(Action::DictateInEnglish)
+        );
+    }
+
+    #[test]
+    fn unusable_answer_during_english_falls_back_to_heard_words_silently() {
+        let rig = Rig::new("我們開會", Err(PolishError::InvalidResponse("bad".into())));
+
+        let outcome = rig.run(&ENGLISH, &cleanup_on());
+
+        assert_eq!(rig.inserter.inserted(), ["我們開會"]);
+        assert_eq!(outcome.status, Status::Done);
+    }
+
+    // ---- Edit selection ----------------------------------------------------
+
+    #[test]
+    fn edit_applies_the_instruction_to_the_selection_and_replaces_it() {
+        let rig = Rig::new("translate to English", Ok("We have a meeting tomorrow."));
+
+        let outcome = rig.run(&edit("我們明天開會"), &cleanup_on());
+
+        assert_eq!(outcome.status, Status::Done);
+        assert_eq!(
+            rig.polisher.tasks(),
+            [Task::EditSelection {
+                instruction: "translate to English".into(),
+                selection: "我們明天開會".into(),
+            }]
+        );
+        // inserting while the text is still selected replaces it
+        assert_eq!(rig.inserter.inserted(), ["We have a meeting tomorrow."]);
+    }
+
+    #[test]
+    fn edit_records_instruction_original_and_result() {
+        let rig = Rig::new("translate to English", Ok("We have a meeting tomorrow."));
+
+        rig.run(&edit("我們明天開會"), &cleanup_on());
+
+        let entry = rig.last_saved().entries()[0].clone();
+        assert_eq!(entry.action, Action::EditSelection);
+        assert_eq!(entry.action.label(), "Edit");
+        assert_eq!(entry.raw, "translate to English");
+        assert_eq!(entry.original.as_deref(), Some("我們明天開會"));
+        assert_eq!(entry.polished, "We have a meeting tomorrow.");
+    }
+
+    #[test]
+    fn edit_runs_even_when_cleanup_is_off() {
+        let rig = Rig::new("幫我翻譯成中文", Ok("你好，你好嗎？"));
+
+        rig.run(&edit("Hello, how are you?"), &cleanup_off());
+
+        assert_eq!(rig.inserter.inserted(), ["你好，你好嗎？"]);
+    }
+
+    #[test]
+    fn edit_writes_the_result_as_given_so_an_instruction_may_ask_for_simplified() {
+        let rig = Rig::new("翻譯成簡體中文", Ok("我们明天开会"));
+
+        rig.run(&edit("我們明天開會"), &cleanup_on());
+
+        assert_eq!(rig.inserter.inserted(), ["我们明天开会"]);
+    }
+
+    #[test]
+    fn edit_receives_a_simplified_instruction_as_traditional() {
+        let rig = Rig::new("缩短成一句话", Ok("One sentence."));
+
+        rig.run(&edit("First. Second. Third."), &cleanup_on());
+
+        assert_eq!(
+            rig.polisher.tasks(),
+            [Task::EditSelection {
+                instruction: "縮短成一句話".into(),
+                selection: "First. Second. Third.".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn unreachable_assistant_during_edit_changes_nothing_and_records_nothing() {
+        let rig = Rig::new("translate to English", unreachable());
+
+        let outcome = rig.run(&edit("我們明天開會"), &cleanup_on());
+
+        assert_eq!(
+            outcome.status,
+            Status::Problem(Problem::AssistantUnreachable(Action::EditSelection))
+        );
+        assert_eq!(
+            outcome.status_message(),
+            "Couldn't run the instruction — writing assistant not reachable"
+        );
+        assert_eq!(outcome.entry, None);
+        rig.assert_nothing_written_or_recorded();
+    }
+
+    #[test]
+    fn unusable_answer_during_edit_changes_nothing_and_says_so() {
+        for answer in [Ok("  \n"), Err(PolishError::InvalidResponse("bad".into()))] {
+            let rig = Rig::new("translate to English", answer);
+
+            let outcome = rig.run(&edit("我們明天開會"), &cleanup_on());
+
+            assert_eq!(
+                outcome.status,
+                Status::Problem(Problem::AssistantUnreachable(Action::EditSelection))
+            );
+            assert_eq!(outcome.entry, None);
+            rig.assert_nothing_written_or_recorded();
+        }
+    }
+
+    #[test]
+    fn silence_during_edit_changes_nothing() {
         let rig = Rig::new("Thank you.", Ok("Thank you."));
 
-        let outcome = rig.pipeline().process(silence(), &cleanup_on());
+        let outcome = rig
+            .pipeline()
+            .process(silence(), &edit("我們明天開會"), &cleanup_on());
 
         assert_eq!(outcome.status, Status::Problem(Problem::NoSpeech));
-        assert_eq!(outcome.entry, None);
-        assert_eq!(rig.transcriber.calls(), 0);
+        assert_eq!(outcome.status_message(), "No speech heard");
         assert!(rig.polisher.calls().is_empty());
-        assert!(rig.inserter.inserted().is_empty());
-        assert!(rig.store.saved().is_empty());
+        rig.assert_nothing_written_or_recorded();
+    }
+
+    // ---- shared rules ------------------------------------------------------
+
+    #[test]
+    fn heard_words_and_answer_are_trimmed() {
+        let rig = Rig::new("  hello team \n", Ok("\n Hello team. "));
+
+        let outcome = rig.run(&DICTATE, &cleanup_on());
+
+        assert_eq!(rig.polisher.tasks(), [Task::CleanUp("hello team".into())]);
+        assert_eq!(rig.inserter.inserted(), ["Hello team."]);
+        assert_eq!(outcome.entry.map(|e| e.raw), Some("hello team".into()));
     }
 
     #[test]
-    fn blank_transcript_counts_as_no_speech() {
+    fn dictionary_reaches_speech_model_and_writing_assistant_in_every_action() {
+        let settings = Settings {
+            dictionary: PersonalDictionary::from_words(["Cafler"]),
+            ..Settings::default()
+        };
+        for action in [DICTATE, ENGLISH, edit("x")] {
+            let rig = Rig::new("I work at caffler", Ok("I work at Cafler."));
+
+            rig.run(&action, &settings);
+
+            assert_eq!(rig.transcriber.dictionaries()[0].words(), ["Cafler"]);
+            assert_eq!(rig.polisher.calls()[0].1.words(), ["Cafler"]);
+        }
+    }
+
+    #[test]
+    fn silence_writes_nothing_and_records_nothing_in_any_action() {
+        for action in [DICTATE, ENGLISH, edit("x")] {
+            let rig = Rig::new("Thank you.", Ok("Thank you."));
+
+            let outcome = rig.pipeline().process(silence(), &action, &cleanup_on());
+
+            assert_eq!(outcome.status, Status::Problem(Problem::NoSpeech));
+            assert_eq!(outcome.entry, None);
+            assert_eq!(rig.transcriber.calls(), 0);
+            assert!(rig.polisher.calls().is_empty());
+            rig.assert_nothing_written_or_recorded();
+        }
+    }
+
+    #[test]
+    fn blank_heard_words_count_as_no_speech() {
         let rig = Rig::new("  \n ", Ok("Hello."));
 
-        let outcome = rig.pipeline().process(speech(), &cleanup_on());
+        let outcome = rig.run(&DICTATE, &cleanup_on());
 
         assert_eq!(outcome.status, Status::Problem(Problem::NoSpeech));
         assert_eq!(outcome.entry, None);
         assert!(rig.polisher.calls().is_empty());
-        assert!(rig.inserter.inserted().is_empty());
-        assert!(rig.store.saved().is_empty());
+        rig.assert_nothing_written_or_recorded();
     }
 
     #[test]
-    fn transcription_failure_is_reported_and_nothing_written() {
+    fn unreachable_speech_model_writes_nothing_in_any_action() {
+        for action in [DICTATE, ENGLISH, edit("我們明天開會")] {
+            let rig = Rig {
+                transcriber: FakeTranscriber::new(Err(TranscribeError::Unreachable(
+                    "connection refused".into(),
+                ))),
+                ..Rig::new("", Ok("x"))
+            };
+
+            let outcome = rig.run(&action, &cleanup_on());
+
+            assert_eq!(
+                outcome.status,
+                Status::Problem(Problem::SpeechModelUnreachable)
+            );
+            assert_eq!(
+                outcome.status_message(),
+                "Speech model not reachable — is your local AI app running?"
+            );
+            assert_eq!(outcome.entry, None);
+            assert!(rig.polisher.calls().is_empty());
+            rig.assert_nothing_written_or_recorded();
+        }
+    }
+
+    #[test]
+    fn speech_model_failure_is_reported_and_nothing_written() {
         let rig = Rig {
-            transcriber: FakeTranscriber::new(Err("model missing")),
+            transcriber: FakeTranscriber::new(Err(TranscribeError::Failed("model missing".into()))),
             ..Rig::new("", Ok("x"))
         };
 
-        let outcome = rig.pipeline().process(speech(), &cleanup_on());
+        let outcome = rig.run(&DICTATE, &cleanup_on());
 
         assert_eq!(
             outcome.status,
             Status::Problem(Problem::Other("model missing".into()))
         );
         assert_eq!(outcome.entry, None);
-        assert!(rig.inserter.inserted().is_empty());
-        assert!(rig.store.saved().is_empty());
+        rig.assert_nothing_written_or_recorded();
     }
 
     // ---- accessibility -----------------------------------------------------
@@ -350,7 +670,7 @@ mod tests {
             ..Rig::new("hello", Ok("Hello."))
         };
 
-        let outcome = rig.pipeline().process(speech(), &cleanup_on());
+        let outcome = rig.run(&DICTATE, &cleanup_on());
 
         assert_eq!(
             outcome.status,
@@ -363,17 +683,19 @@ mod tests {
 
     #[test]
     fn accessibility_problem_wins_over_unreachable_assistant() {
-        let rig = Rig {
-            inserter: FakeInserter::new(Err(Problem::AccessibilityPermission)),
-            ..Rig::new("hello", Err(PolishError::Unreachable("down".into())))
-        };
+        for action in [DICTATE, ENGLISH] {
+            let rig = Rig {
+                inserter: FakeInserter::new(Err(Problem::AccessibilityPermission)),
+                ..Rig::new("hello", unreachable())
+            };
 
-        let outcome = rig.pipeline().process(speech(), &cleanup_on());
+            let outcome = rig.run(&action, &cleanup_on());
 
-        assert_eq!(
-            outcome.status,
-            Status::Problem(Problem::AccessibilityPermission)
-        );
+            assert_eq!(
+                outcome.status,
+                Status::Problem(Problem::AccessibilityPermission)
+            );
+        }
     }
 
     // ---- history -----------------------------------------------------------
@@ -386,28 +708,35 @@ mod tests {
         };
         let pipeline = rig.pipeline();
 
-        pipeline.process(speech(), &cleanup_on());
-        pipeline.process(speech(), &cleanup_on());
+        pipeline.process(speech(), &DICTATE, &cleanup_on());
+        pipeline.process(speech(), &ENGLISH, &cleanup_on());
 
         let saved = rig.last_saved();
-        let polished: Vec<_> = saved
+        let shown: Vec<_> = saved
             .entries()
             .iter()
-            .map(|e| e.polished.as_str())
+            .map(|e| (e.action, e.polished.as_str()))
             .collect();
-        assert_eq!(polished, ["Hello.", "Hello.", "Old 1."]);
+        assert_eq!(
+            shown,
+            [
+                (Action::DictateInEnglish, "Hello."),
+                (Action::Dictate, "Hello."),
+                (Action::Dictate, "Old 1."),
+            ]
+        );
         assert!(saved.entries()[0].at >= saved.entries()[1].at);
     }
 
     #[test]
-    fn full_history_drops_the_oldest_when_a_dictation_finishes() {
+    fn full_history_drops_the_oldest_when_an_action_finishes() {
         let full: Vec<_> = (1..=HISTORY_LIMIT).rev().map(old_entry).collect();
         let rig = Rig {
             store: FakeStore::new(History::from(full)),
             ..Rig::new("hello", Ok("Hello."))
         };
 
-        rig.pipeline().process(speech(), &cleanup_on());
+        rig.run(&DICTATE, &cleanup_on());
 
         let saved = rig.last_saved();
         assert_eq!(saved.entries().len(), HISTORY_LIMIT);
@@ -423,12 +752,21 @@ mod tests {
         };
         let pipeline = rig.pipeline();
 
-        let first = pipeline.process(speech(), &cleanup_on());
-        pipeline.process(speech(), &cleanup_on());
+        let first = pipeline.process(speech(), &DICTATE, &cleanup_on());
+        pipeline.process(speech(), &DICTATE, &cleanup_on());
 
         assert_eq!(first.status, Status::Done);
         assert!(first.entry.is_some());
         // the in-memory history keeps growing even though saving fails
         assert_eq!(rig.last_saved().entries().len(), 2);
+    }
+
+    impl Outcome {
+        fn status_message(&self) -> String {
+            match &self.status {
+                Status::Problem(problem) => problem.to_string(),
+                other => format!("{other:?}"),
+            }
+        }
     }
 }

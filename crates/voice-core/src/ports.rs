@@ -1,5 +1,6 @@
 //! Ports: everything the dictation rules need from the outside world.
-use crate::{History, PersonalDictionary, Problem, Recording, Settings};
+use crate::{History, PersonalDictionary, Problem, Recording, Settings, WritingTask};
+use std::fmt;
 
 /// Captures sound from the chosen microphone.
 pub trait Recorder: Send {
@@ -13,13 +14,33 @@ pub trait Recorder: Send {
     fn level(&self) -> f32;
 }
 
-/// Turns a recording into the raw transcript, on device.
+/// Why a recording could not be turned into words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscribeError {
+    /// The speech model runs elsewhere (the local AI app) and could not be reached.
+    Unreachable(String),
+    /// The speech model was there but failed (e.g. model file missing or corrupt).
+    Failed(String),
+}
+
+impl fmt::Display for TranscribeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TranscribeError::Unreachable(reason) => {
+                write!(f, "speech model unreachable: {reason}")
+            }
+            TranscribeError::Failed(reason) => write!(f, "{reason}"),
+        }
+    }
+}
+
+/// Turns a recording into the heard words.
 pub trait Transcriber: Send + Sync {
     fn transcribe(
         &self,
         recording: &Recording,
         dictionary: &PersonalDictionary,
-    ) -> Result<String, String>;
+    ) -> Result<String, TranscribeError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,9 +51,19 @@ pub enum PolishError {
     InvalidResponse(String),
 }
 
-/// The writing assistant: rewrites a raw transcript into polished text.
+/// The writing assistant: carries out one `WritingTask` and returns the resulting text.
 pub trait Polisher: Send + Sync {
-    fn polish(&self, raw: &str, dictionary: &PersonalDictionary) -> Result<String, PolishError>;
+    fn polish(
+        &self,
+        task: &WritingTask<'_>,
+        dictionary: &PersonalDictionary,
+    ) -> Result<String, PolishError>;
+}
+
+/// Reads the text selected in the front app without disturbing the clipboard.
+pub trait SelectionReader: Send + Sync {
+    /// `Ok(None)` = nothing selected or the app does not expose it.
+    fn selected_text(&self) -> Result<Option<String>, Problem>;
 }
 
 /// Places text at the cursor of the front app, preserving the clipboard.

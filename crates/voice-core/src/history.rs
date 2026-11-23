@@ -1,11 +1,21 @@
 use crate::rules::HISTORY_LIMIT;
+use crate::Action;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 
+/// One finished action.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub at: DateTime<Local>,
+    /// Entries saved before actions existed load as `Action::Dictate`.
+    #[serde(default)]
+    pub action: Action,
+    /// The heard words; for Edit selection, the spoken instruction.
     pub raw: String,
+    /// Edit selection only: the text that was selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original: Option<String>,
+    /// The resulting text.
     pub polished: String,
 }
 
@@ -51,7 +61,9 @@ mod tests {
     fn entry(n: usize) -> HistoryEntry {
         HistoryEntry {
             at: Local.timestamp_opt(1_700_000_000 + n as i64, 0).unwrap(),
+            action: Action::Dictate,
             raw: format!("raw {n}"),
+            original: None,
             polished: format!("Polished {n}."),
         }
     }
@@ -116,5 +128,45 @@ mod tests {
         assert_eq!(history.entries().len(), 200);
         assert_eq!(back.as_array().map(Vec::len), Some(200));
         assert_eq!(Vec::<HistoryEntry>::from(history)[0], entry(201));
+    }
+
+    #[test]
+    fn entries_from_before_actions_existed_load_as_dictate() {
+        let old =
+            r#"[{"at":"2026-11-20T10:00:00+08:00","raw":"我們開會","polished":"我們開會。"}]"#;
+
+        let history: History = serde_json::from_str(old).unwrap();
+
+        let entry = &history.entries()[0];
+        assert_eq!(entry.action, Action::Dictate);
+        assert_eq!(entry.original, None);
+        assert_eq!(entry.raw, "我們開會");
+        assert_eq!(entry.polished, "我們開會。");
+    }
+
+    #[test]
+    fn an_edit_entry_keeps_action_instruction_original_and_result() {
+        let edit = HistoryEntry {
+            action: Action::EditSelection,
+            raw: "translate to English".into(),
+            original: Some("我們明天開會".into()),
+            polished: "We have a meeting tomorrow.".into(),
+            ..entry(1)
+        };
+
+        let json = serde_json::to_value(&edit).unwrap();
+        let back: HistoryEntry = serde_json::from_value(json.clone()).unwrap();
+
+        assert_eq!(json["action"], "EditSelection");
+        assert_eq!(json["original"], "我們明天開會");
+        assert_eq!(back, edit);
+    }
+
+    #[test]
+    fn entries_without_an_original_do_not_save_one() {
+        let json = serde_json::to_value(entry(1)).unwrap();
+
+        assert!(json.get("original").is_none());
+        assert_eq!(json["action"], "Dictate");
     }
 }

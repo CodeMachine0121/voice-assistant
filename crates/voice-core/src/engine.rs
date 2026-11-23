@@ -1,10 +1,11 @@
 //! Background engine: owns the controller and recorder, runs the pipeline,
 //! and publishes `Status` updates. The UI only sends shortcut events and settings.
 use crate::{
-    Command, ControllerEvent, DictationPipeline, Recorder, SessionController, Settings,
-    ShortcutEvent, Status,
+    Action, Command, ControllerEvent, DictationPipeline, PreparedAction, Problem, Recorder,
+    SelectionReader, SessionController, Settings, ShortcutEvent, Status,
 };
 use crossbeam_channel::{never, select, tick, unbounded, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,8 @@ pub const TICK_INTERVAL: Duration = Duration::from_millis(100);
 pub struct EngineDeps {
     pub recorder: Box<dyn Recorder>,
     pub pipeline: DictationPipeline,
+    /// Reads the front app's selection when Edit selection starts.
+    pub selection: Arc<dyn SelectionReader>,
     pub settings: Settings,
 }
 
@@ -44,6 +47,8 @@ impl Engine {
             controller: SessionController::new(),
             recorder: deps.recorder,
             pipeline: deps.pipeline,
+            selection: deps.selection,
+            running: None,
             settings: deps.settings,
             shortcuts,
             status: status_tx,
@@ -65,6 +70,9 @@ struct Worker {
     controller: SessionController,
     recorder: Box<dyn Recorder>,
     pipeline: DictationPipeline,
+    selection: Arc<dyn SelectionReader>,
+    /// The action being listened to, from its start until it is processed or dropped.
+    running: Option<PreparedAction>,
     settings: Settings,
     shortcuts: Receiver<ShortcutEvent>,
     status: Sender<Status>,
@@ -97,46 +105,78 @@ impl Worker {
         match self.controller.handle(event, Instant::now()) {
             Some(command) => self.execute(command),
             None if self.controller.is_listening() && event == ControllerEvent::Tick => {
-                self.publish(Status::Listening {
-                    level: self.recorder.level(),
-                });
+                if let Some(action) = self.running_action() {
+                    self.publish(Status::Listening {
+                        action,
+                        level: self.recorder.level(),
+                    });
+                }
             }
             None => {}
         }
     }
 
+    fn running_action(&self) -> Option<Action> {
+        self.running.as_ref().map(PreparedAction::action)
+    }
+
     fn execute(&mut self, command: Command) {
         match command {
-            Command::StartRecording => {
-                // Show the indicator before the microphone opens: opening it can take
-                // a noticeable moment (first use, Bluetooth headsets).
-                self.publish(Status::Listening { level: 0.0 });
-                if let Err(problem) = self.recorder.start() {
-                    // The dictation never began: forget it entirely.
-                    self.controller
-                        .handle(ControllerEvent::RecordingFailed, Instant::now());
-                    self.publish(Status::Problem(problem));
-                }
-            }
+            Command::StartRecording(action) => self.start(action),
             Command::StopAndProcess => {
-                self.publish(Status::Working);
                 let recording = self.recorder.stop();
-                let outcome = self.pipeline.process(recording, &self.settings);
-                // Only one dictation at a time: shortcuts pressed meanwhile are dropped.
-                while self.shortcuts.try_recv().is_ok() {}
-                self.publish(outcome.status);
+                match self.running.take() {
+                    Some(prepared) => {
+                        self.publish(Status::Working(prepared.action()));
+                        let outcome = self.pipeline.process(recording, &prepared, &self.settings);
+                        // One action at a time: shortcuts pressed meanwhile are dropped.
+                        while self.shortcuts.try_recv().is_ok() {}
+                        self.publish(outcome.status);
+                    }
+                    None => {
+                        // Cannot happen: listening always starts with a prepared action.
+                        log::error!("stopped a recording that had no action; discarding it");
+                        self.publish(Status::Idle);
+                    }
+                }
                 self.controller
                     .handle(ControllerEvent::ProcessingFinished, Instant::now());
             }
             Command::Discard => {
+                self.running = None;
                 self.recorder.cancel();
                 self.publish(Status::Idle);
             }
             Command::Cancel => {
+                self.running = None;
                 self.recorder.cancel();
                 self.publish(Status::Cancelled);
             }
         }
+    }
+
+    /// Gets `action` ready (e.g. reads the selection) before anything is shown or the
+    /// microphone opens; when it cannot run, it never starts.
+    fn start(&mut self, action: Action) {
+        let prepared = match PreparedAction::prepare(action, self.selection.as_ref()) {
+            Ok(prepared) => prepared,
+            Err(problem) => return self.abandon_start(problem),
+        };
+        self.running = Some(prepared);
+        // Show the indicator before the microphone opens: opening it can take
+        // a noticeable moment (first use, Bluetooth headsets).
+        self.publish(Status::Listening { action, level: 0.0 });
+        if let Err(problem) = self.recorder.start() {
+            self.abandon_start(problem);
+        }
+    }
+
+    /// The action never began: forget it entirely and tell the user why.
+    fn abandon_start(&mut self, problem: Problem) {
+        self.running = None;
+        self.controller
+            .handle(ControllerEvent::RecordingFailed, Instant::now());
+        self.publish(Status::Problem(problem));
     }
 
     fn publish(&self, status: Status) {
@@ -149,11 +189,15 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fakes::{speech, FakeInserter, FakePolisher, FakeStore, FakeTranscriber};
-    use crate::{History, PolishError, Problem, Recording};
+    use crate::fakes::{
+        speech, FakeInserter, FakePolisher, FakeSelectionReader, FakeStore, FakeTranscriber,
+    };
+    use crate::rules::MAX_SELECTION_CHARS;
+    use crate::{History, PolishError, Recording, TranscribeError};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
-    use ShortcutEvent::{EscapePressed, HandsFreePressed, PushToTalkDown, PushToTalkUp};
+    use std::sync::Mutex;
+    use Action::{Dictate, DictateInEnglish, EditSelection};
+    use ShortcutEvent::{ActionTapped, EscapePressed};
 
     const WAIT: Duration = Duration::from_secs(5);
 
@@ -197,7 +241,7 @@ mod tests {
             &self,
             _: &Recording,
             _: &crate::PersonalDictionary,
-        ) -> Result<String, String> {
+        ) -> Result<String, TranscribeError> {
             thread::sleep(self.0);
             Ok("hello team".into())
         }
@@ -206,6 +250,7 @@ mod tests {
     struct Rig {
         handle: EngineHandle,
         recorder: Arc<Mutex<RecorderLog>>,
+        selection: Arc<FakeSelectionReader>,
         inserter: Arc<FakeInserter>,
         store: Arc<FakeStore>,
         notified: Arc<AtomicUsize>,
@@ -215,6 +260,8 @@ mod tests {
         start_result: Result<(), Problem>,
         start_delay: Duration,
         transcriber: Arc<dyn crate::Transcriber>,
+        answer: Result<&'static str, PolishError>,
+        selection: Arc<FakeSelectionReader>,
     }
 
     impl Default for Options {
@@ -223,6 +270,8 @@ mod tests {
                 start_result: Ok(()),
                 start_delay: Duration::ZERO,
                 transcriber: FakeTranscriber::new(Ok("hello team")),
+                answer: Ok("Hello team."),
+                selection: FakeSelectionReader::new(Ok(Some("我們明天開會"))),
             }
         }
     }
@@ -235,7 +284,7 @@ mod tests {
             let notified = Arc::new(AtomicUsize::new(0));
             let pipeline = DictationPipeline::new(
                 options.transcriber,
-                FakePolisher::new(Ok("Hello team.")),
+                FakePolisher::new(options.answer),
                 inserter.clone(),
                 store.clone(),
             );
@@ -249,6 +298,7 @@ mod tests {
                         level: 0.42,
                     }),
                     pipeline,
+                    selection: options.selection.clone(),
                     settings: Settings::default(),
                 },
                 Box::new(move || {
@@ -258,14 +308,23 @@ mod tests {
             Self {
                 handle,
                 recorder,
+                selection: options.selection,
                 inserter,
                 store,
                 notified,
             }
         }
 
-        fn press(&self, event: ShortcutEvent) {
-            self.handle.shortcuts.send(event).unwrap();
+        fn tap(&self, action: Action) {
+            self.handle.shortcuts.send(ActionTapped(action)).unwrap();
+        }
+
+        fn escape(&self) {
+            self.handle.shortcuts.send(EscapePressed).unwrap();
+        }
+
+        fn next_raw(&self) -> Status {
+            self.handle.status.recv_timeout(WAIT).expect("status")
         }
 
         /// Next status that is not a live level update.
@@ -280,12 +339,22 @@ mod tests {
             }
         }
 
-        /// Listening is shown at once (level 0), then with the live level.
-        fn expect_listening(&self) {
-            assert!(matches!(
-                self.handle.status.recv_timeout(WAIT).expect("status"),
-                Status::Listening { .. }
-            ));
+        /// The next status shows `action` listening.
+        fn expect_listening(&self, action: Action) {
+            match self.next_raw() {
+                Status::Listening { action: shown, .. } => assert_eq!(shown, action),
+                other => panic!("expected listening, got {other:?}"),
+            }
+        }
+
+        /// Taps `action`, speaks long enough to count, taps again; returns the final status.
+        fn run(&self, action: Action) -> Status {
+            self.tap(action);
+            self.expect_listening(action);
+            hold(Duration::from_millis(550));
+            self.tap(action);
+            assert_eq!(self.next_status(), Status::Working(action));
+            self.next_status()
         }
 
         fn log<T>(&self, f: impl FnOnce(&RecorderLog) -> T) -> T {
@@ -313,18 +382,99 @@ mod tests {
     }
 
     #[test]
-    fn push_to_talk_records_processes_and_reports_done() {
+    fn tapping_dictate_twice_records_processes_and_reports_done() {
         let rig = Rig::new(Options::default());
 
-        rig.press(PushToTalkDown);
-        rig.expect_listening();
-        hold(Duration::from_millis(550));
-        rig.press(PushToTalkUp);
+        assert_eq!(rig.run(Dictate), Status::Done);
 
-        assert_eq!(rig.next_status(), Status::Working);
-        assert_eq!(rig.next_status(), Status::Done);
         assert_eq!(rig.inserter.inserted(), ["Hello team."]);
         assert_eq!(rig.log(|l| (l.starts, l.stops, l.cancels)), (1, 1, 0));
+        assert_eq!(
+            rig.selection.calls(),
+            0,
+            "dictating never reads the selection"
+        );
+        assert_eq!(rig.store.saved()[0].entries()[0].action, Dictate);
+    }
+
+    #[test]
+    fn dictate_in_english_is_carried_to_the_history_entry() {
+        let rig = Rig::new(Options {
+            transcriber: FakeTranscriber::new(Ok("我們開會")),
+            answer: Ok("We have a meeting."),
+            ..Options::default()
+        });
+
+        assert_eq!(rig.run(DictateInEnglish), Status::Done);
+
+        assert_eq!(rig.inserter.inserted(), ["We have a meeting."]);
+        let entry = rig.store.saved()[0].entries()[0].clone();
+        assert_eq!(entry.action, DictateInEnglish);
+        assert_eq!(entry.raw, "我們開會");
+    }
+
+    #[test]
+    fn edit_selection_reads_the_selection_before_listening_and_replaces_it() {
+        let rig = Rig::new(Options {
+            transcriber: FakeTranscriber::new(Ok("translate to English")),
+            answer: Ok("We have a meeting tomorrow."),
+            ..Options::default()
+        });
+
+        assert_eq!(rig.run(EditSelection), Status::Done);
+
+        assert_eq!(rig.selection.calls(), 1);
+        assert_eq!(rig.inserter.inserted(), ["We have a meeting tomorrow."]);
+        let entry = rig.store.saved()[0].entries()[0].clone();
+        assert_eq!(entry.action, EditSelection);
+        assert_eq!(entry.raw, "translate to English");
+        assert_eq!(entry.original.as_deref(), Some("我們明天開會"));
+    }
+
+    #[test]
+    fn nothing_selected_does_not_start_listening() {
+        let rig = Rig::new(Options {
+            selection: FakeSelectionReader::new(Ok(None)),
+            ..Options::default()
+        });
+
+        rig.tap(EditSelection);
+
+        assert_eq!(rig.next_raw(), Status::Problem(Problem::NoSelection));
+        hold(TICK_INTERVAL * 3);
+        let (rest, _, recorder) = rig.shut_down();
+        assert!(rest.is_empty(), "never listened: {rest:?}");
+        let log = recorder.lock().unwrap();
+        assert_eq!((log.starts, log.stops, log.cancels), (0, 0, 0));
+    }
+
+    #[test]
+    fn a_selection_over_the_limit_does_not_start_listening() {
+        let too_long = "a".repeat(MAX_SELECTION_CHARS + 1);
+        let rig = Rig::new(Options {
+            selection: FakeSelectionReader::new(Ok(Some(&too_long))),
+            ..Options::default()
+        });
+
+        rig.tap(EditSelection);
+
+        assert_eq!(rig.next_raw(), Status::Problem(Problem::SelectionTooLong));
+        assert_eq!(rig.log(|l| l.starts), 0);
+        assert!(rig.inserter.inserted().is_empty());
+        assert!(rig.store.saved().is_empty());
+    }
+
+    #[test]
+    fn after_a_refused_start_a_new_attempt_is_allowed() {
+        let rig = Rig::new(Options {
+            selection: FakeSelectionReader::new(Ok(None)),
+            ..Options::default()
+        });
+
+        rig.tap(EditSelection);
+        assert_eq!(rig.next_raw(), Status::Problem(Problem::NoSelection));
+
+        assert_eq!(rig.run(Dictate), Status::Done);
     }
 
     #[test]
@@ -335,32 +485,61 @@ mod tests {
         });
 
         let pressed = Instant::now();
-        rig.press(PushToTalkDown);
-        let first = rig.handle.status.recv_timeout(WAIT).expect("status");
+        rig.tap(Dictate);
+        let first = rig.next_raw();
 
-        assert_eq!(first, Status::Listening { level: 0.0 });
+        assert_eq!(
+            first,
+            Status::Listening {
+                action: Dictate,
+                level: 0.0
+            }
+        );
         assert!(pressed.elapsed() < Duration::from_millis(100));
     }
 
     #[test]
-    fn listening_publishes_the_live_level_on_each_tick() {
+    fn listening_publishes_the_action_and_live_level_on_each_tick() {
         let rig = Rig::new(Options::default());
 
-        rig.press(HandsFreePressed);
-        rig.expect_listening();
+        rig.tap(DictateInEnglish);
+        rig.expect_listening(DictateInEnglish);
 
-        // the next update arrives from the clock, not from a shortcut
-        rig.expect_listening();
-        rig.expect_listening();
+        // the next updates arrive from the clock, not from a shortcut
+        for _ in 0..2 {
+            assert_eq!(
+                rig.next_raw(),
+                Status::Listening {
+                    action: DictateInEnglish,
+                    level: 0.42
+                }
+            );
+        }
     }
 
     #[test]
-    fn a_short_press_is_discarded_back_to_idle() {
+    fn another_actions_shortcut_is_ignored_while_one_is_listening() {
         let rig = Rig::new(Options::default());
 
-        rig.press(PushToTalkDown);
-        rig.expect_listening();
-        rig.press(PushToTalkUp);
+        rig.tap(Dictate);
+        rig.expect_listening(Dictate);
+        rig.tap(DictateInEnglish);
+        hold(Duration::from_millis(550));
+
+        // still Dictate on the indicator, and only one recording was started
+        rig.expect_listening(Dictate);
+        assert_eq!(rig.log(|l| (l.starts, l.stops, l.cancels)), (1, 0, 0));
+        rig.tap(Dictate);
+        assert_eq!(rig.next_status(), Status::Working(Dictate));
+    }
+
+    #[test]
+    fn stopping_within_half_a_second_is_discarded_back_to_idle() {
+        let rig = Rig::new(Options::default());
+
+        rig.tap(Dictate);
+        rig.expect_listening(Dictate);
+        rig.tap(Dictate);
 
         assert_eq!(rig.next_status(), Status::Idle);
         assert_eq!(rig.log(|l| (l.stops, l.cancels)), (0, 1));
@@ -371,9 +550,9 @@ mod tests {
     fn escape_cancels_and_records_nothing() {
         let rig = Rig::new(Options::default());
 
-        rig.press(HandsFreePressed);
-        rig.expect_listening();
-        rig.press(EscapePressed);
+        rig.tap(EditSelection);
+        rig.expect_listening(EditSelection);
+        rig.escape();
 
         assert_eq!(rig.next_status(), Status::Cancelled);
         assert_eq!(rig.log(|l| (l.stops, l.cancels)), (0, 1));
@@ -388,12 +567,12 @@ mod tests {
             ..Options::default()
         });
 
-        rig.press(PushToTalkDown);
+        rig.tap(Dictate);
         assert_eq!(
             rig.next_status(),
             Status::Problem(Problem::MicrophonePermission)
         );
-        rig.press(HandsFreePressed);
+        rig.tap(EditSelection);
         assert_eq!(
             rig.next_status(),
             Status::Problem(Problem::MicrophonePermission)
@@ -409,13 +588,16 @@ mod tests {
             ..Options::default()
         });
 
-        rig.press(PushToTalkDown);
+        rig.tap(Dictate);
         assert_eq!(
-            rig.handle.status.recv_timeout(WAIT).expect("status"),
-            Status::Listening { level: 0.0 }
+            rig.next_raw(),
+            Status::Listening {
+                action: Dictate,
+                level: 0.0
+            }
         );
         assert_eq!(
-            rig.handle.status.recv_timeout(WAIT).expect("status"),
+            rig.next_raw(),
             Status::Problem(Problem::MicrophonePermission)
         );
         hold(TICK_INTERVAL * 3);
@@ -432,13 +614,13 @@ mod tests {
             ..Options::default()
         });
 
-        rig.press(HandsFreePressed);
-        rig.expect_listening();
+        rig.tap(Dictate);
+        rig.expect_listening(Dictate);
         hold(Duration::from_millis(550));
-        rig.press(HandsFreePressed);
-        assert_eq!(rig.next_status(), Status::Working);
-        rig.press(PushToTalkDown);
-        rig.press(HandsFreePressed);
+        rig.tap(Dictate);
+        assert_eq!(rig.next_status(), Status::Working(Dictate));
+        rig.tap(EditSelection);
+        rig.tap(Dictate);
         assert_eq!(rig.next_status(), Status::Done);
         hold(Duration::from_millis(250));
 
@@ -459,11 +641,7 @@ mod tests {
             .unwrap();
         hold(Duration::from_millis(50));
 
-        rig.press(PushToTalkDown);
-        hold(Duration::from_millis(550));
-        rig.press(PushToTalkUp);
-        assert_eq!(rig.next_status(), Status::Working);
-        assert_eq!(rig.next_status(), Status::Done);
+        assert_eq!(rig.run(Dictate), Status::Done);
 
         assert_eq!(rig.inserter.inserted(), ["hello team"]);
     }
@@ -481,7 +659,7 @@ mod tests {
         drop(handle);
         hold(Duration::from_millis(50));
 
-        shortcuts.send(PushToTalkDown).unwrap();
+        shortcuts.send(ActionTapped(Dictate)).unwrap();
         assert!(matches!(
             status.recv_timeout(WAIT).unwrap(),
             Status::Listening { .. }
@@ -491,12 +669,12 @@ mod tests {
     #[test]
     fn on_status_is_called_after_every_status() {
         let rig = Rig::new(Options::default());
-        rig.press(PushToTalkDown);
-        rig.press(EscapePressed);
+        rig.tap(Dictate);
+        rig.escape();
         let mut seen = 0;
         loop {
             seen += 1;
-            if rig.handle.status.recv_timeout(WAIT).unwrap() == Status::Cancelled {
+            if rig.next_raw() == Status::Cancelled {
                 break;
             }
         }
@@ -509,8 +687,8 @@ mod tests {
     #[test]
     fn dropping_the_handle_stops_the_engine_and_releases_the_microphone() {
         let rig = Rig::new(Options::default());
-        rig.press(HandsFreePressed);
-        rig.expect_listening();
+        rig.tap(Dictate);
+        rig.expect_listening(Dictate);
 
         let (_, _, recorder) = rig.shut_down();
 
@@ -519,32 +697,14 @@ mod tests {
 
     #[test]
     fn unreachable_assistant_is_published_as_the_final_status() {
-        let recorder = Arc::new(Mutex::new(RecorderLog::default()));
-        let handle = Engine::spawn(
-            EngineDeps {
-                recorder: Box::new(FakeRecorder {
-                    log: recorder,
-                    start_result: Ok(()),
-                    start_delay: Duration::ZERO,
-                    level: 0.0,
-                }),
-                pipeline: DictationPipeline::new(
-                    FakeTranscriber::new(Ok("hello there")),
-                    FakePolisher::new(Err(PolishError::Unreachable("down".into()))),
-                    FakeInserter::new(Ok(())),
-                    FakeStore::new(History::default()),
-                ),
-                settings: Settings::default(),
-            },
-            Box::new(|| {}),
+        let rig = Rig::new(Options {
+            answer: Err(PolishError::Unreachable("down".into())),
+            ..Options::default()
+        });
+
+        assert_eq!(
+            rig.run(DictateInEnglish),
+            Status::Problem(Problem::AssistantUnreachable(DictateInEnglish))
         );
-
-        handle.shortcuts.send(PushToTalkDown).unwrap();
-        thread::sleep(Duration::from_millis(550));
-        handle.shortcuts.send(PushToTalkUp).unwrap();
-
-        let last = std::iter::from_fn(|| handle.status.recv_timeout(WAIT).ok())
-            .find(|s| matches!(s, Status::Problem(_) | Status::Done));
-        assert_eq!(last, Some(Status::Problem(Problem::AssistantUnreachable)));
     }
 }
