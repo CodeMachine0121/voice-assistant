@@ -81,7 +81,6 @@ pub struct Probe {
 pub enum FocusMove {
     BringToFront,
     HandBack,
-    ShowWithoutFocus,
 }
 
 impl Probe {
@@ -180,7 +179,6 @@ pub fn test_services() -> (Services, Probe) {
         app_focus: AppFocus {
             bring_to_front: record(FocusMove::BringToFront),
             hand_back: record(FocusMove::HandBack),
-            show_without_focus: record(FocusMove::ShowWithoutFocus),
         },
     };
     (

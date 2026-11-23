@@ -112,10 +112,9 @@ pub struct Services {
 pub struct AppFocus {
     /// Makes the app the active app so its windows can come to the front.
     pub bring_to_front: Arc<dyn Fn() + Send + Sync>,
-    /// Hides the app, so the app the user was in becomes active again.
+    /// Gives focus back to the app that was active before `bring_to_front`, if it
+    /// is still running. Never hides this app: its menu must keep working.
     pub hand_back: Arc<dyn Fn() + Send + Sync>,
-    /// Lets the app show windows again after `hand_back`, without taking focus.
-    pub show_without_focus: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl AppFocus {
@@ -123,8 +122,7 @@ impl AppFocus {
     pub fn macos() -> Self {
         Self {
             bring_to_front: Arc::new(voice_macos::activate_app),
-            hand_back: Arc::new(voice_macos::hide_app),
-            show_without_focus: Arc::new(voice_macos::unhide_app_without_activation),
+            hand_back: Arc::new(voice_macos::return_focus),
         }
     }
 }

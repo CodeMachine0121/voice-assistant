@@ -60,21 +60,6 @@ pub fn return_focus() {
     }
 }
 
-/// Hides this app, so macOS makes the app the user was in before active again.
-pub fn hide_app() {
-    if let Some(app) = shared_app("hide the app") {
-        app.hide(None);
-    }
-}
-
-/// Shows this app's windows again after `hide_app`, without taking keyboard focus
-/// from the active app. Does nothing when the app is not hidden.
-pub fn unhide_app_without_activation() {
-    if let Some(app) = shared_app("show the app") {
-        app.unhideWithoutActivation();
-    }
-}
-
 /// An app running on this Mac, as far as handing focus around is concerned.
 trait RunningApp {
     fn is_this_app(&self) -> bool;

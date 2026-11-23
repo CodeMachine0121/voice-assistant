@@ -150,8 +150,6 @@ pub struct AppModel {
     /// The History window should come to the front.
     pub history_focus: FocusRequest,
     pub quit_requested: bool,
-    /// Focus was handed back by hiding the app; its windows stay hidden until shown.
-    handed_back: bool,
 }
 
 impl AppModel {
@@ -164,26 +162,22 @@ impl AppModel {
             settings_focus: FocusRequest::default(),
             history_focus: FocusRequest::default(),
             quit_requested: false,
-            handed_back: false,
         }
     }
 
     /// Takes in every status the engine has published; history is reloaded after each
     /// finished dictation (Done, or a problem that may still have recorded an entry,
-    /// such as cleanup being skipped).
-    pub fn drain_statuses(&mut self, services: &Services, now: Instant) {
+    /// such as cleanup being skipped). `true` when any status arrived.
+    pub fn drain_statuses(&mut self, services: &Services, now: Instant) -> bool {
+        let mut any = false;
         for status in services.engine.status.try_iter() {
-            if self.handed_back {
-                // The indicator must be seen, but without taking focus from the
-                // app being dictated into.
-                (services.app_focus.show_without_focus)();
-                self.handed_back = false;
-            }
+            any = true;
             if matches!(status, Status::Done | Status::Problem(_)) {
                 self.history = services.history_store.load();
             }
             self.indicator.set_status(status, now);
         }
+        any
     }
 
     /// Opening a window also brings it to the front with keyboard focus, whether it
@@ -194,13 +188,13 @@ impl AppModel {
                 if self.settings.is_none() {
                     self.settings = Some(SettingsSession::open(services));
                 }
-                self.bring_to_front(services);
+                (services.app_focus.bring_to_front)();
                 self.settings_focus.request(now);
             }
             TrayCommand::History => {
                 self.history = services.history_store.load();
                 self.history_open = true;
-                self.bring_to_front(services);
+                (services.app_focus.bring_to_front)();
                 self.history_focus.request(now);
             }
             TrayCommand::Quit => self.quit_requested = true,
@@ -219,17 +213,11 @@ impl AppModel {
         self.hand_back_after_last_window(services);
     }
 
-    fn bring_to_front(&mut self, services: &Services) {
-        (services.app_focus.bring_to_front)();
-        self.handed_back = false;
-    }
-
     /// Once no window is left, the app the user was in gets focus back, so the next
     /// dictation pastes there and not into this app.
-    fn hand_back_after_last_window(&mut self, services: &Services) {
+    fn hand_back_after_last_window(&self, services: &Services) {
         if self.settings.is_none() && !self.history_open {
             (services.app_focus.hand_back)();
-            self.handed_back = true;
         }
     }
 }
@@ -501,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn after_handing_back_the_next_status_shows_the_app_without_focus() {
+    fn statuses_never_move_focus() {
         let (services, probe) = test_services();
         let now = Instant::now();
         let mut model = AppModel::new(now);
@@ -512,44 +500,55 @@ mod tests {
             &probe,
             &[Status::Working(Action::Dictate), Status::Cancelled],
         );
-        model.drain_statuses(&services, now);
+        assert!(model.drain_statuses(&services, now));
 
         assert_eq!(
             probe.focus_moves(),
-            [
-                FocusMove::BringToFront,
-                FocusMove::HandBack,
-                FocusMove::ShowWithoutFocus
-            ],
-            "shown once, and only after handing back"
+            [FocusMove::BringToFront, FocusMove::HandBack],
+            "dictating after a window closed leaves focus with the app dictated into"
         );
     }
 
     #[test]
-    fn without_handing_back_statuses_leave_focus_alone() {
+    fn draining_reports_whether_any_status_arrived() {
         let (services, probe) = test_services();
         let now = Instant::now();
         let mut model = AppModel::new(now);
-
+        assert!(!model.drain_statuses(&services, now));
         publish(&probe, &[Status::Working(Action::Dictate)]);
-        model.drain_statuses(&services, now);
-
-        assert!(probe.focus_moves().is_empty());
+        assert!(model.drain_statuses(&services, now));
+        assert!(!model.drain_statuses(&services, now));
     }
 
     #[test]
-    fn opening_a_window_again_after_handing_back_needs_no_extra_show() {
+    fn opening_and_closing_windows_again_and_again_moves_focus_every_time() {
+        let (services, probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+        for _ in 0..3 {
+            model.handle_command(TrayCommand::Settings, &services, now);
+            model.close_settings(&services);
+            model.handle_command(TrayCommand::History, &services, now);
+            model.close_history(&services);
+        }
+
+        let round = [FocusMove::BringToFront, FocusMove::HandBack];
+        assert_eq!(probe.focus_moves(), round.repeat(6));
+    }
+
+    #[test]
+    fn reopening_after_handing_back_shows_the_window_again() {
         let (services, probe) = test_services();
         let now = Instant::now();
         let mut model = AppModel::new(now);
         model.handle_command(TrayCommand::History, &services, now);
         model.close_history(&services);
+
         model.handle_command(TrayCommand::History, &services, now);
 
-        publish(&probe, &[Status::Working(Action::Dictate)]);
-        model.drain_statuses(&services, now);
-
-        assert!(!probe.focus_moves().contains(&FocusMove::ShowWithoutFocus));
+        assert!(model.history_open);
+        assert!(model.history_focus.poll(false, now));
+        assert_eq!(probe.times_brought_to_front(), 2);
     }
 
     #[test]
