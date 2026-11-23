@@ -124,10 +124,15 @@ impl Worker {
         match command {
             Command::StartRecording(action) => self.start(action),
             Command::StopAndProcess => {
+                let running = self.running.take();
+                // Show Working before the microphone closes: closing it can take a moment
+                // (Bluetooth headsets), and the indicator must stop counting right away.
+                if let Some(prepared) = &running {
+                    self.publish(Status::Working(prepared.action()));
+                }
                 let recording = self.recorder.stop();
-                match self.running.take() {
+                match running {
                     Some(prepared) => {
-                        self.publish(Status::Working(prepared.action()));
                         let outcome = self.pipeline.process(recording, &prepared, &self.settings);
                         // One action at a time: shortcuts pressed meanwhile are dropped.
                         while self.shortcuts.try_recv().is_ok() {}
@@ -212,6 +217,7 @@ mod tests {
         log: Arc<Mutex<RecorderLog>>,
         start_result: Result<(), Problem>,
         start_delay: Duration,
+        stop_delay: Duration,
         level: f32,
     }
 
@@ -222,6 +228,7 @@ mod tests {
             self.start_result.clone()
         }
         fn stop(&mut self) -> Recording {
+            thread::sleep(self.stop_delay);
             self.log.lock().unwrap().stops += 1;
             speech()
         }
@@ -259,6 +266,7 @@ mod tests {
     struct Options {
         start_result: Result<(), Problem>,
         start_delay: Duration,
+        stop_delay: Duration,
         transcriber: Arc<dyn crate::Transcriber>,
         answer: Result<&'static str, PolishError>,
         selection: Arc<FakeSelectionReader>,
@@ -269,6 +277,7 @@ mod tests {
             Self {
                 start_result: Ok(()),
                 start_delay: Duration::ZERO,
+                stop_delay: Duration::ZERO,
                 transcriber: FakeTranscriber::new(Ok("hello team")),
                 answer: Ok("Hello team."),
                 selection: FakeSelectionReader::new(Ok(Some("我們明天開會"))),
@@ -295,6 +304,7 @@ mod tests {
                         log: recorder.clone(),
                         start_result: options.start_result,
                         start_delay: options.start_delay,
+                        stop_delay: options.stop_delay,
                         level: 0.42,
                     }),
                     pipeline,
@@ -496,6 +506,24 @@ mod tests {
             }
         );
         assert!(pressed.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn working_is_shown_before_a_slow_microphone_finishes_closing() {
+        let rig = Rig::new(Options {
+            stop_delay: Duration::from_millis(400),
+            ..Options::default()
+        });
+        rig.tap(DictateInEnglish);
+        rig.expect_listening(DictateInEnglish);
+        hold(Duration::from_millis(550));
+
+        let stopped = Instant::now();
+        rig.tap(DictateInEnglish);
+
+        assert_eq!(rig.next_status(), Status::Working(DictateInEnglish));
+        assert!(stopped.elapsed() < Duration::from_millis(200));
+        assert_eq!(rig.next_status(), Status::Done);
     }
 
     #[test]
