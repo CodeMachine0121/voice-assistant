@@ -12,9 +12,18 @@
 //!   meanwhile — a key press or a mouse click. When the last modifier goes up, a
 //!   clean chord that matches exactly one configured tap fires that action.
 //!   Command + C or Command-clicking therefore never starts anything.
+//!   A chord also does not count when it was held longer than [`MAX_TAP_HOLD`],
+//!   when Secure Event Input was on (a password field hides keys from the tap),
+//!   or when the frontmost app changed meanwhile (Command + Tab is never seen by
+//!   the tap). Those last two facts come from [`Surroundings`], asked only when a
+//!   chord starts and when it could fire.
 //! * **Combos** (Space with exact modifiers). The Space press fires at once and
 //!   is swallowed together with its repeats and its release, so no space is typed.
+use std::time::Duration;
 use voice_core::{Action, ActionShortcuts, Settings, Shortcut, ShortcutEvent};
+
+/// The longest a modifier chord may be held and still count as a tap.
+pub const MAX_TAP_HOLD: Duration = Duration::from_secs(1);
 
 /// Virtual key codes (Carbon `kVK_*`) the interpreter cares about.
 pub mod keycode {
@@ -73,7 +82,7 @@ pub enum KeyKind {
     Up,
     /// A modifier key changed state; `KeyInput::flags` tells the new state.
     FlagsChanged,
-    /// A mouse button went down.
+    /// A mouse button went down, or the user scrolled or made a trackpad gesture.
     Pointer,
 }
 
@@ -86,6 +95,16 @@ pub struct KeyInput {
     pub flags: u64,
     /// The key is auto-repeating (held down).
     pub autorepeat: bool,
+    /// When the event happened, on a clock that only moves forward (time since boot).
+    pub timestamp: Duration,
+}
+
+/// What the interpreter needs to know about the system around the keyboard.
+pub trait Surroundings {
+    /// Secure Event Input is on: a password field hides key presses from the tap.
+    fn secure_input(&self) -> bool;
+    /// Process id of the frontmost application, `None` when unknown.
+    fn frontmost_app(&self) -> Option<i32>;
 }
 
 /// What one input means, and whether the front app must not see it.
@@ -156,6 +175,12 @@ pub struct KeyInterpreter {
     chord: u64,
     /// A key or mouse button went down while a modifier was held.
     interrupted: bool,
+    /// When the first modifier of the chord went down.
+    chord_started: Duration,
+    /// Secure Event Input was on when the chord started.
+    chord_secure: bool,
+    /// The frontmost app when the chord started.
+    chord_app: Option<i32>,
     /// The Space of a combo is down: its repeats and its release are swallowed.
     swallowing_space: bool,
 }
@@ -166,6 +191,9 @@ impl KeyInterpreter {
             triggers: triggers(&config.shortcuts),
             chord: 0,
             interrupted: false,
+            chord_started: Duration::ZERO,
+            chord_secure: false,
+            chord_app: None,
             swallowing_space: false,
         }
     }
@@ -176,10 +204,10 @@ impl KeyInterpreter {
         self.triggers = triggers(&config.shortcuts);
     }
 
-    pub fn on_key(&mut self, input: KeyInput) -> KeyDecision {
+    pub fn on_key(&mut self, input: KeyInput, around: &dyn Surroundings) -> KeyDecision {
         match input.kind {
             KeyKind::FlagsChanged => KeyDecision {
-                event: self.modifiers_changed(input.flags),
+                event: self.modifiers_changed(&input, around),
                 consume: false,
             },
             KeyKind::Pointer => {
@@ -198,26 +226,40 @@ impl KeyInterpreter {
         }
     }
 
-    fn modifiers_changed(&mut self, flags: u64) -> Option<ShortcutEvent> {
-        let held = flags & flag::PHYSICAL_MODIFIERS;
-        self.chord |= held;
+    fn modifiers_changed(
+        &mut self,
+        input: &KeyInput,
+        around: &dyn Surroundings,
+    ) -> Option<ShortcutEvent> {
+        let held = input.flags & flag::PHYSICAL_MODIFIERS;
         if held != 0 {
+            if self.chord == 0 {
+                self.chord_started = input.timestamp;
+                self.chord_secure = around.secure_input();
+                self.chord_app = around.frontmost_app();
+            }
+            self.chord |= held;
             return None;
         }
         let (chord, interrupted) = (self.chord, self.interrupted);
         self.chord = 0;
         self.interrupted = false;
-        if chord == 0 || interrupted {
+        let held_for = input.timestamp.saturating_sub(self.chord_started);
+        if chord == 0 || interrupted || held_for > MAX_TAP_HOLD {
             return None;
         }
         let mut tapped = self
             .triggers
             .iter()
             .filter(|(_, trigger)| trigger.tapped(chord));
-        match (tapped.next(), tapped.next()) {
-            (Some((action, _)), None) => Some(ShortcutEvent::ActionTapped(*action)),
-            _ => None,
+        let action = match (tapped.next(), tapped.next()) {
+            (Some((action, _)), None) => *action,
+            _ => return None,
+        };
+        if self.chord_secure || around.secure_input() || around.frontmost_app() != self.chord_app {
+            return None;
         }
+        Some(ShortcutEvent::ActionTapped(action))
     }
 
     fn key_down(&mut self, input: KeyInput) -> KeyDecision {
@@ -285,6 +327,22 @@ mod tests {
     const RIGHT_OPTION_HELD: u64 = flag::OPTION | flag::RIGHT_OPTION;
     const LEFT_CONTROL_HELD: u64 = flag::CONTROL | flag::LEFT_CONTROL;
 
+    /// A quiet system: no secure input, the same app in front all the time.
+    struct Calm;
+
+    impl Surroundings for Calm {
+        fn secure_input(&self) -> bool {
+            false
+        }
+        fn frontmost_app(&self) -> Option<i32> {
+            Some(100)
+        }
+    }
+
+    fn feed(keys: &mut KeyInterpreter, input: KeyInput) -> KeyDecision {
+        keys.on_key(input, &Calm)
+    }
+
     fn defaults() -> KeyInterpreter {
         KeyInterpreter::new(&ShortcutConfig::default())
     }
@@ -305,6 +363,7 @@ mod tests {
             keycode,
             flags,
             autorepeat: false,
+            timestamp: Duration::ZERO,
         }
     }
 
@@ -314,6 +373,7 @@ mod tests {
             keycode,
             flags,
             autorepeat: false,
+            timestamp: Duration::ZERO,
         }
     }
 
@@ -337,18 +397,19 @@ mod tests {
             keycode: 0,
             flags,
             autorepeat: false,
+            timestamp: Duration::ZERO,
         }
     }
 
     fn events(keys: &mut KeyInterpreter, inputs: &[KeyInput]) -> Vec<ShortcutEvent> {
         inputs
             .iter()
-            .filter_map(|input| keys.on_key(*input).event)
+            .filter_map(|input| feed(keys, *input).event)
             .collect()
     }
 
     fn decisions(keys: &mut KeyInterpreter, inputs: &[KeyInput]) -> Vec<KeyDecision> {
-        inputs.iter().map(|input| keys.on_key(*input)).collect()
+        inputs.iter().map(|input| feed(keys, *input)).collect()
     }
 
     fn fired(action: Action) -> KeyDecision {
@@ -442,8 +503,8 @@ mod tests {
     #[test]
     fn a_click_without_modifiers_does_not_spoil_the_next_tap() {
         let mut keys = defaults();
-        keys.on_key(click(0));
-        keys.on_key(down(KEY_E, 0));
+        feed(&mut keys, click(0));
+        feed(&mut keys, down(KEY_E, 0));
 
         let produced = events(&mut keys, &command_tap());
 
@@ -592,7 +653,7 @@ mod tests {
     fn right_option_space_also_edits_the_selection() {
         let mut keys = defaults();
 
-        let decided = keys.on_key(down(keycode::SPACE, RIGHT_OPTION_HELD));
+        let decided = feed(&mut keys, down(keycode::SPACE, RIGHT_OPTION_HELD));
 
         assert_eq!(
             decided,
@@ -722,7 +783,7 @@ mod tests {
     fn escape_cancels_and_is_passed_on() {
         let mut keys = defaults();
 
-        let decided = keys.on_key(down(keycode::ESCAPE, 0));
+        let decided = feed(&mut keys, down(keycode::ESCAPE, 0));
 
         assert_eq!(
             decided,
@@ -906,11 +967,163 @@ mod tests {
     #[test]
     fn reconfiguring_mid_combo_still_swallows_the_space_release() {
         let mut keys = defaults();
-        keys.on_key(down(keycode::SPACE, LEFT_OPTION_HELD));
+        feed(&mut keys, down(keycode::SPACE, LEFT_OPTION_HELD));
         keys.reconfigure(&ShortcutConfig::default());
 
-        let decided = keys.on_key(up(keycode::SPACE, LEFT_OPTION_HELD));
+        let decided = feed(&mut keys, up(keycode::SPACE, LEFT_OPTION_HELD));
 
         assert_eq!(decided, KeyDecision::SWALLOW);
+    }
+
+    /// A system whose answers change between the start of a chord and its release.
+    struct Changing {
+        secure: [bool; 2],
+        app: [Option<i32>; 2],
+        asked: std::cell::Cell<usize>,
+    }
+
+    impl Changing {
+        fn new(secure: [bool; 2], app: [Option<i32>; 2]) -> Self {
+            Self {
+                secure,
+                app,
+                asked: std::cell::Cell::new(0),
+            }
+        }
+
+        /// 0 before the first frontmost-app question, 1 after it.
+        fn phase(&self) -> usize {
+            self.asked.get().min(1)
+        }
+    }
+
+    impl Surroundings for Changing {
+        fn secure_input(&self) -> bool {
+            self.secure[self.phase()]
+        }
+        fn frontmost_app(&self) -> Option<i32> {
+            let app = self.app[self.phase()];
+            self.asked.set(self.asked.get() + 1);
+            app
+        }
+    }
+
+    fn at(input: KeyInput, millis: u64) -> KeyInput {
+        KeyInput {
+            timestamp: Duration::from_millis(millis),
+            ..input
+        }
+    }
+
+    fn timed_command_tap(pressed: u64, released: u64) -> [KeyInput; 2] {
+        let [press, release] = command_tap();
+        [at(press, pressed), at(release, released)]
+    }
+
+    fn tap_with(around: &dyn Surroundings) -> Vec<ShortcutEvent> {
+        let mut keys = defaults();
+        command_tap()
+            .iter()
+            .filter_map(|input| keys.on_key(*input, around).event)
+            .collect()
+    }
+
+    #[test]
+    fn a_tap_held_up_to_one_second_counts() {
+        let mut keys = defaults();
+
+        let produced = events(&mut keys, &timed_command_tap(5_000, 6_000));
+
+        assert_eq!(produced, [ActionTapped(Dictate)]);
+    }
+
+    #[test]
+    fn a_chord_held_longer_than_one_second_is_not_a_tap() {
+        let mut keys = defaults();
+
+        let produced = events(&mut keys, &timed_command_tap(5_000, 6_001));
+
+        assert_eq!(produced, []);
+    }
+
+    #[test]
+    fn the_hold_is_timed_from_the_first_modifier_of_the_chord() {
+        let both = LEFT_COMMAND_HELD | LEFT_SHIFT_HELD;
+        let mut keys = defaults();
+
+        let produced = events(
+            &mut keys,
+            &[
+                at(flags_changed(LEFT_COMMAND, LEFT_COMMAND_HELD), 0),
+                at(flags_changed(LEFT_SHIFT, both), 900),
+                at(flags_changed(LEFT_SHIFT, LEFT_COMMAND_HELD), 1_000),
+                at(flags_changed(LEFT_COMMAND, 0), 1_100),
+            ],
+        );
+
+        assert_eq!(produced, []);
+    }
+
+    #[test]
+    fn a_long_hold_does_not_spoil_the_next_tap() {
+        let mut keys = defaults();
+        events(&mut keys, &timed_command_tap(0, 3_000));
+
+        let produced = events(&mut keys, &timed_command_tap(4_000, 4_200));
+
+        assert_eq!(produced, [ActionTapped(Dictate)]);
+    }
+
+    #[test]
+    fn no_tap_fires_while_secure_input_is_on() {
+        for secure in [[true, true], [true, false], [false, true]] {
+            let around = Changing::new(secure, [Some(100), Some(100)]);
+
+            let produced = tap_with(&around);
+
+            assert_eq!(produced, [], "secure input {secure:?}");
+        }
+    }
+
+    #[test]
+    fn no_tap_fires_when_the_frontmost_app_changed_meanwhile() {
+        let around = Changing::new([false, false], [Some(100), Some(200)]);
+
+        let produced = tap_with(&around);
+
+        assert_eq!(produced, []);
+    }
+
+    #[test]
+    fn a_tap_fires_when_the_same_app_stays_in_front() {
+        let around = Changing::new([false, false], [Some(100), Some(100)]);
+
+        let produced = tap_with(&around);
+
+        assert_eq!(produced, [ActionTapped(Dictate)]);
+    }
+
+    #[test]
+    fn the_frontmost_app_is_asked_only_when_a_chord_starts_and_could_fire() {
+        let around = Changing::new([false, false], [Some(100), Some(100)]);
+        let mut keys = defaults();
+        let inputs = [
+            down(KEY_E, 0),
+            up(KEY_E, 0),
+            click(0),
+            flags_changed(LEFT_COMMAND, LEFT_COMMAND_HELD),
+            flags_changed(LEFT_SHIFT, LEFT_COMMAND_HELD | LEFT_SHIFT_HELD),
+            flags_changed(LEFT_SHIFT, LEFT_COMMAND_HELD),
+            flags_changed(LEFT_COMMAND, 0),
+            flags_changed(LEFT_OPTION, LEFT_OPTION_HELD),
+            flags_changed(LEFT_OPTION, 0),
+        ];
+
+        for input in inputs {
+            keys.on_key(input, &around);
+        }
+
+        // Command + Shift: start and release; Option alone: start only (it matches nothing).
+        assert_eq!(around.asked.get(), 3);
     }
 }

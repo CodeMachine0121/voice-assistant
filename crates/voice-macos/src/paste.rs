@@ -144,10 +144,16 @@ impl Clipboard for SystemClipboard {
 impl ClipboardSnapshot {
     /// The plain text of the first item that offers some.
     pub(crate) fn text(&self) -> Option<String> {
+        self.data(PLAIN_TEXT)
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    /// The bytes of the first representation of type `kind`.
+    pub(crate) fn data(&self, kind: &str) -> Option<&[u8]> {
         self.items.iter().find_map(|item| {
             item.iter()
-                .find(|(kind, _)| kind == PLAIN_TEXT)
-                .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
+                .find(|(offered, _)| offered == kind)
+                .map(|(_, bytes)| bytes.as_slice())
         })
     }
 
