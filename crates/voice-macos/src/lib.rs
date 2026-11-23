@@ -1,6 +1,8 @@
 //! macOS adapters: global shortcuts, reading the selected text, text insertion at
-//! the cursor, privacy permissions and secrets in the Keychain.
+//! the cursor, privacy permissions, secrets in the Keychain and bringing the app to
+//! the front.
 
+mod activation;
 mod keychain;
 pub mod keys;
 mod paste;
@@ -10,6 +12,7 @@ mod service;
 mod shortcuts;
 mod surroundings;
 
+pub use activation::activate_app;
 pub use keychain::{KeychainSecret, KEYCHAIN_SERVICE, OPENAI_KEY_ACCOUNT};
 pub use keys::{
     KeyDecision, KeyInput, KeyInterpreter, KeyKind, ShortcutConfig, Surroundings, MAX_TAP_HOLD,
