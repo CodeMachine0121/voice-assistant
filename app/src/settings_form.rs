@@ -1,4 +1,5 @@
 //! Editable copy of `Settings` for the Settings window, and the conversion back.
+use std::fmt;
 use voice_core::{
     Action, ActionShortcuts, PersonalDictionary, Settings, SpeechProvider, SpeechSettings,
 };
@@ -15,7 +16,7 @@ pub const ADDRESS_MISSING: &str = "Enter the local AI app address.";
 pub const ADDRESS_NOT_LOCAL: &str =
     "This address is not on this Mac — what you say and select will leave the computer.";
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct SettingsForm {
     pub shortcuts: ActionShortcuts,
     /// `None` = system default microphone.
@@ -29,6 +30,28 @@ pub struct SettingsForm {
     pub speech: SpeechSettings,
     /// OpenAI key as typed; blank = keep the saved key. Never part of `Settings`.
     pub new_key: String,
+}
+
+/// Like a derived `Debug`, except that a typed key is never shown.
+impl fmt::Debug for SettingsForm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let new_key = if self.new_key.is_empty() {
+            ""
+        } else {
+            "<redacted>"
+        };
+        f.debug_struct("SettingsForm")
+            .field("shortcuts", &self.shortcuts)
+            .field("microphone", &self.microphone)
+            .field("assistant_url", &self.assistant_url)
+            .field("assistant_model", &self.assistant_model)
+            .field("cleanup_enabled", &self.cleanup_enabled)
+            .field("dictionary", &self.dictionary)
+            .field("new_word", &self.new_word)
+            .field("speech", &self.speech)
+            .field("new_key", &new_key)
+            .finish()
+    }
 }
 
 impl SettingsForm {
@@ -473,6 +496,25 @@ mod tests {
             assistant_choices(&models(&["a"]), "gone"),
             ["", "a", "gone"]
         );
+    }
+
+    #[test]
+    fn debug_output_hides_a_typed_key_but_shows_the_rest() {
+        let mut f = form();
+        f.new_key = "sk-secret".into();
+        f.new_word = "Cafler".into();
+
+        let shown = format!("{f:?}");
+
+        assert!(!shown.contains("sk-secret"), "{shown}");
+        assert!(shown.contains("new_key: \"<redacted>\""), "{shown}");
+        assert!(shown.contains("Cafler"), "{shown}");
+        assert!(shown.contains("gpt-4o-transcribe"), "{shown}");
+    }
+
+    #[test]
+    fn debug_output_of_an_empty_key_field_shows_it_empty() {
+        assert!(format!("{:?}", form()).contains("new_key: \"\""));
     }
 
     #[test]
