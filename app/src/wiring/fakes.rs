@@ -206,7 +206,7 @@ pub fn build() -> Services {
             speech_key.clone(),
             engine.settings.clone(),
             |s| {
-                log::info!("demo: shortcuts now {:?}", s.shortcuts);
+                log::info!("demo: settings now {s:?}");
             },
         ),
         engine,

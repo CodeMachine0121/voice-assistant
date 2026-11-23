@@ -202,14 +202,10 @@ mod tests {
     }
 
     use crate::wiring::testing::test_services;
-    use voice_core::Shortcut;
 
     fn changed() -> Settings {
         Settings {
-            shortcuts: voice_core::ActionShortcuts {
-                dictate: Shortcut::TapFn,
-                ..Default::default()
-            },
+            microphone: Some("USB Mic".into()),
             ..Settings::default()
         }
     }

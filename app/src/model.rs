@@ -241,7 +241,7 @@ mod tests {
     use chrono::Local;
     use std::sync::Mutex;
     use std::time::Duration;
-    use voice_core::{Action, HistoryEntry, Problem, Shortcut};
+    use voice_core::{Action, HistoryEntry, Problem};
 
     fn entry(text: &str) -> HistoryEntry {
         HistoryEntry {
@@ -603,15 +603,12 @@ mod tests {
         services
             .settings_store
             .save(&Settings {
-                shortcuts: voice_core::ActionShortcuts {
-                    dictate: Shortcut::TapFn,
-                    ..Default::default()
-                },
+                microphone: Some("USB Mic".into()),
                 ..Settings::default()
             })
             .unwrap();
         let session = SettingsSession::open(&services);
-        assert_eq!(session.form.shortcuts.dictate, Shortcut::TapFn);
+        assert_eq!(session.form.microphone.as_deref(), Some("USB Mic"));
         assert_eq!(session.devices, ["Mic A"]);
         assert!(!session.is_dirty());
         assert_eq!(session.notice, None);
@@ -646,13 +643,10 @@ mod tests {
     fn invalid_form_is_not_saved() {
         let (services, probe) = test_services();
         let mut session = SettingsSession::open(&services);
-        session
-            .form
-            .shortcuts
-            .set(Action::EditSelection, Shortcut::TapCommand);
+        session.form.assistant_url = " ".into();
         assert!(!session.can_save());
         session.save(&services);
-        assert!(matches!(&session.notice, Some(Notice::Problem(m)) if m.contains("different")));
+        assert!(matches!(&session.notice, Some(Notice::Problem(m)) if m.contains("address")));
         assert!(probe.engine_settings().is_empty());
         assert_eq!(services.settings_store.load(), Settings::default());
     }
