@@ -2,7 +2,7 @@
 use crate::text::{clean_transcript, initial_prompt};
 use crate::whisper::WhisperEngine;
 use std::path::PathBuf;
-use voice_core::{PersonalDictionary, Recording, Transcriber};
+use voice_core::{PersonalDictionary, Recording, TranscribeError, Transcriber};
 
 /// What the speech model offers: raw text segments for 16 kHz mono audio, optionally primed.
 pub(crate) trait SpeechEngine: Send + Sync {
@@ -24,14 +24,15 @@ impl<E: SpeechEngine> Transcriber for DictationTranscriber<E> {
         &self,
         recording: &Recording,
         dictionary: &PersonalDictionary,
-    ) -> Result<String, String> {
+    ) -> Result<String, TranscribeError> {
         if recording.samples.is_empty() {
             return Ok(String::new());
         }
         let prompt = initial_prompt(dictionary);
         let segments = self
             .engine
-            .segments(&recording.samples, prompt.as_deref())?;
+            .segments(&recording.samples, prompt.as_deref())
+            .map_err(TranscribeError::Failed)?;
         Ok(clean_transcript(&segments))
     }
 }
@@ -53,7 +54,7 @@ impl Transcriber for WhisperTranscriber {
         &self,
         recording: &Recording,
         dictionary: &PersonalDictionary,
-    ) -> Result<String, String> {
+    ) -> Result<String, TranscribeError> {
         self.0.transcribe(recording, dictionary)
     }
 }
@@ -134,12 +135,12 @@ mod tests {
     }
 
     #[test]
-    fn model_failure_is_reported() {
+    fn model_failure_is_a_failure_not_unreachable() {
         let engine = FakeEngine::with(Err("model exploded".into()));
         let t = DictationTranscriber::new(engine);
         assert_eq!(
             t.transcribe(&one_second(), &PersonalDictionary::default()),
-            Err("model exploded".to_string())
+            Err(TranscribeError::Failed("model exploded".to_string()))
         );
     }
 
