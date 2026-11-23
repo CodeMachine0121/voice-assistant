@@ -160,6 +160,9 @@ fn ai_models(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Servic
         };
         ui.colored_label(colour, line);
     }
+    if let Some(warning) = session.form.address_warning() {
+        ui.colored_label(PROBLEM_COLOUR, warning);
+    }
     ui.add_space(8.0);
 
     speech_row(ui, session, services);

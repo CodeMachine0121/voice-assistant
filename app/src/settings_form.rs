@@ -8,6 +8,9 @@ pub const BUILT_IN_SPEECH: &str = "Built-in (on this Mac)";
 pub const ANY_ASSISTANT_MODEL: &str = "Whatever is loaded";
 /// Shown next to the address when it is empty.
 pub const ADDRESS_MISSING: &str = "Enter the local AI app address.";
+/// Shown when the address points away from this Mac.
+pub const ADDRESS_NOT_LOCAL: &str =
+    "This address is not on this Mac — what you say and select will leave the computer.";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsForm {
@@ -74,13 +77,13 @@ impl SettingsForm {
     }
 
     /// "Already used by <action>" for the row of `action`, when an action above it in
-    /// the list has the same shortcut.
+    /// the list has a colliding shortcut (see `Shortcut::collides_with`).
     pub fn shortcut_conflict(&self, action: Action) -> Option<String> {
         let mine = self.shortcuts.for_action(action);
         Action::ALL
             .iter()
             .take_while(|&&a| a != action)
-            .find(|&&a| self.shortcuts.for_action(a) == mine)
+            .find(|&&a| self.shortcuts.for_action(a).collides_with(*mine))
             .map(|a| format!("Already used by {}", a.label()))
     }
 
@@ -105,6 +108,13 @@ impl SettingsForm {
             .then_some(ADDRESS_MISSING)
     }
 
+    /// A warning when the local AI app address is not on this Mac: speech and selected
+    /// text are sent there.
+    pub fn address_warning(&self) -> Option<&'static str> {
+        let address = self.assistant_url.trim();
+        (!address.is_empty() && !is_on_this_mac(address)).then_some(ADDRESS_NOT_LOCAL)
+    }
+
     /// Whether the built-in speech model's location and download are relevant.
     pub fn shows_built_in_speech_controls(&self) -> bool {
         self.speech_source == SpeechSource::BuiltIn
@@ -114,6 +124,21 @@ impl SettingsForm {
     pub fn is_changed_from(&self, stored: &Settings) -> bool {
         self.to_settings() != *stored || !self.new_word.trim().is_empty()
     }
+}
+
+/// Whether `address` (a URL, with or without scheme) names this Mac.
+fn is_on_this_mac(address: &str) -> bool {
+    let rest = address.split_once("://").map_or(address, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = match authority.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    let host = host.to_ascii_lowercase();
+    host == "localhost" || host == "::1" || host.starts_with("127.")
 }
 
 /// Row label of a speech source.
@@ -329,6 +354,48 @@ mod tests {
             Some("Already used by Dictate")
         );
         assert!(f.problem().is_some());
+    }
+
+    #[test]
+    fn a_right_command_tap_is_reported_as_used_by_the_command_tap() {
+        let mut f = form();
+        f.shortcuts
+            .set(Action::EditSelection, Shortcut::TapRightCommand);
+        assert_eq!(
+            f.shortcut_conflict(Action::EditSelection).as_deref(),
+            Some("Already used by Dictate")
+        );
+        assert!(f.problem().is_some(), "saving stays blocked");
+    }
+
+    #[test]
+    fn addresses_on_this_mac_get_no_warning() {
+        let mut f = form();
+        for address in [
+            "http://localhost:1234/v1",
+            "http://127.0.0.1:1234/v1",
+            "http://[::1]:1234/v1",
+            "localhost:1234",
+            "HTTP://LOCALHOST/v1",
+            "",
+        ] {
+            f.assistant_url = address.to_string();
+            assert_eq!(f.address_warning(), None, "{address}");
+        }
+    }
+
+    #[test]
+    fn addresses_elsewhere_are_warned_about() {
+        let mut f = form();
+        for address in [
+            "http://192.168.1.20:1234/v1",
+            "https://api.example.com/v1",
+            "http://localhost.example.com/v1",
+            "http://localhost@evil.example/v1",
+        ] {
+            f.assistant_url = address.to_string();
+            assert_eq!(f.address_warning(), Some(ADDRESS_NOT_LOCAL), "{address}");
+        }
     }
 
     #[test]
