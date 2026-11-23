@@ -7,24 +7,33 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use voice_core::{
     rules, DictationPipeline, Engine, EngineDeps, EngineHandle, History, HistoryStore,
-    PersonalDictionary, PolishError, Polisher, Problem, Recorder, Recording, Settings,
-    SettingsStore, TextInserter, Transcriber,
+    PersonalDictionary, PolishError, Polisher, Problem, Recorder, Recording, SelectionReader,
+    Settings, SettingsStore, TextInserter, TranscribeError, Transcriber, WritingTask,
 };
 
 /// How long the demo speech model and writing assistant each pretend to work.
 const DEMO_WORK: Duration = Duration::from_millis(350);
-/// Sentences the demo "hears", with their cleaned-up form.
-const SAMPLES: [(&str, &str); 3] = [
+/// Sentences the demo "hears": the heard words, the cleaned-up form and the English form.
+const SAMPLES: [(&str, &str, &str); 3] = [
     (
         "um so the meeting is uh moved to three pm",
+        "The meeting is moved to 3 PM.",
         "The meeting is moved to 3 PM.",
     ),
     (
         "remind me to buy milk and eggs",
         "Remind me to buy milk and eggs.",
+        "Remind me to buy milk and eggs.",
     ),
-    ("你好 这是一个测试", "你好，这是一个测试。"),
+    (
+        "你好 这是一个测试",
+        "你好，這是一個測試。",
+        "Hello, this is a test.",
+    ),
 ];
+
+/// What the demo "has selected" when Edit starts.
+const DEMO_SELECTION: &str = "This is the demo selection.";
 
 #[derive(Default)]
 pub struct InMemorySettings(Mutex<Settings>);
@@ -99,7 +108,7 @@ pub struct DemoSpeech {
 }
 
 impl Transcriber for DemoSpeech {
-    fn transcribe(&self, _: &Recording, _: &PersonalDictionary) -> Result<String, String> {
+    fn transcribe(&self, _: &Recording, _: &PersonalDictionary) -> Result<String, TranscribeError> {
         std::thread::sleep(DEMO_WORK);
         let i = self.heard.fetch_add(1, Ordering::SeqCst);
         Ok(SAMPLES[i % SAMPLES.len()].0.to_string())
@@ -107,17 +116,37 @@ impl Transcriber for DemoSpeech {
 }
 
 impl Polisher for DemoSpeech {
-    fn polish(&self, raw: &str, _: &PersonalDictionary) -> Result<String, PolishError> {
+    fn polish(
+        &self,
+        task: &WritingTask<'_>,
+        _: &PersonalDictionary,
+    ) -> Result<String, PolishError> {
         std::thread::sleep(DEMO_WORK);
         let i = self.polished.fetch_add(1, Ordering::SeqCst) + 1;
         if i.is_multiple_of(4) {
             return Err(PolishError::Unreachable("demo".into()));
         }
-        SAMPLES
-            .iter()
-            .find(|(heard, _)| *heard == raw)
-            .map(|(_, clean)| clean.to_string())
-            .ok_or_else(|| PolishError::InvalidResponse("unknown demo sentence".into()))
+        let sample = |heard: &str| SAMPLES.iter().find(|(h, _, _)| *h == heard);
+        match task {
+            WritingTask::CleanUp { heard } => sample(heard).map(|(_, clean, _)| clean.to_string()),
+            WritingTask::TranslateToEnglish { heard } => {
+                sample(heard).map(|(_, _, english)| english.to_string())
+            }
+            WritingTask::EditSelection {
+                instruction,
+                selection,
+            } => Some(format!("{selection} (edited: {instruction})")),
+        }
+        .ok_or_else(|| PolishError::InvalidResponse("unknown demo sentence".into()))
+    }
+}
+
+/// Always "has selected" the same sentence.
+pub struct DemoSelection;
+
+impl SelectionReader for DemoSelection {
+    fn selected_text(&self) -> Result<Option<String>, Problem> {
+        Ok(Some(DEMO_SELECTION.to_string()))
     }
 }
 
@@ -139,6 +168,7 @@ fn spawn_engine(history: Arc<dyn HistoryStore>, repaint: RepaintHandle) -> Engin
         EngineDeps {
             recorder: Box::new(DemoRecorder::default()),
             pipeline,
+            selection: Arc::new(DemoSelection),
             settings: Settings::default(),
         },
         Box::new(move || repaint.request()),
@@ -189,11 +219,7 @@ pub fn build() -> Services {
             settings_store.clone(),
             engine.settings.clone(),
             |s| {
-                log::info!(
-                    "demo: shortcuts now {:?} / {:?}",
-                    s.push_to_talk,
-                    s.hands_free
-                );
+                log::info!("demo: shortcuts now {:?}", s.shortcuts);
             },
         ),
         engine,
@@ -221,7 +247,7 @@ pub fn build() -> Services {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voice_core::{speech::contains_speech, ShortcutEvent, Status};
+    use voice_core::{speech::contains_speech, Action, ShortcutEvent, Status};
 
     #[test]
     fn in_memory_stores_round_trip() {
@@ -260,16 +286,50 @@ mod tests {
         let none = PersonalDictionary::default();
         let mut outcomes = Vec::new();
         for _ in 0..4 {
-            let raw = speech.transcribe(&Recording::default(), &none).unwrap();
-            outcomes.push(speech.polish(&raw, &none));
+            let heard = speech.transcribe(&Recording::default(), &none).unwrap();
+            outcomes.push(speech.polish(&WritingTask::CleanUp { heard: &heard }, &none));
         }
         assert_eq!(outcomes[0], Ok(SAMPLES[0].1.to_string()));
         assert_eq!(outcomes[1], Ok(SAMPLES[1].1.to_string()));
         assert!(matches!(outcomes[3], Err(PolishError::Unreachable(_))));
         assert!(matches!(
-            speech.polish("never said", &none),
+            speech.polish(
+                &WritingTask::CleanUp {
+                    heard: "never said"
+                },
+                &none
+            ),
             Err(PolishError::InvalidResponse(_))
         ));
+    }
+
+    #[test]
+    fn demo_assistant_translates_and_edits() {
+        let speech = DemoSpeech::default();
+        let none = PersonalDictionary::default();
+        let translated = speech.polish(
+            &WritingTask::TranslateToEnglish {
+                heard: SAMPLES[2].0,
+            },
+            &none,
+        );
+        assert_eq!(translated, Ok(SAMPLES[2].2.to_string()));
+        let edited = speech.polish(
+            &WritingTask::EditSelection {
+                instruction: "shorten",
+                selection: "long text",
+            },
+            &none,
+        );
+        assert_eq!(edited, Ok("long text (edited: shorten)".to_string()));
+    }
+
+    #[test]
+    fn demo_selection_is_always_available() {
+        assert_eq!(
+            DemoSelection.selected_text(),
+            Ok(Some(DEMO_SELECTION.to_string()))
+        );
     }
 
     #[test]
@@ -281,12 +341,10 @@ mod tests {
     fn demo_engine_runs_a_real_dictation_into_history() {
         let history: Arc<dyn HistoryStore> = Arc::new(InMemoryHistory::default());
         let handle = spawn_engine(history.clone(), RepaintHandle::default());
-        handle
-            .shortcuts
-            .send(ShortcutEvent::PushToTalkDown)
-            .unwrap();
+        let tap = ShortcutEvent::ActionTapped(Action::Dictate);
+        handle.shortcuts.send(tap).unwrap();
         std::thread::sleep(rules::MIN_DICTATION + Duration::from_millis(100));
-        handle.shortcuts.send(ShortcutEvent::PushToTalkUp).unwrap();
+        handle.shortcuts.send(tap).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let status = handle
@@ -300,6 +358,7 @@ mod tests {
         let entries = history.load().entries().to_vec();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].polished, SAMPLES[0].1);
+        assert_eq!(entries[0].action, Action::Dictate);
     }
 
     #[test]
