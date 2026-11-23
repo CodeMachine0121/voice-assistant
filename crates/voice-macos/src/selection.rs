@@ -72,33 +72,61 @@ impl<F: FocusedSelection, C: Clipboard, K: Keyboard, A: AccessCheck> SelectionCo
         self.keyboard
             .copy()
             .map_err(|e| Problem::Other(format!("Could not copy the selected text ({e})")))?;
-        if !self.wait_for_change(before) {
+        let Some(copied) = self.wait_for_copy(before) else {
             // Nothing was copied, so nothing selected; the clipboard was not touched.
             return Ok(None);
-        }
-        let copied = self.clipboard.snapshot();
-        if let Err(e) = self.clipboard.restore(previous) {
-            log::warn!("could not restore the clipboard after copying the selection: {e}");
-        }
-        if copied_from_empty_selection(&copied) {
+        };
+        self.put_back(previous, copied.change_count);
+        if copied_from_empty_selection(&copied.content) {
             return Ok(None);
         }
-        Ok(copied.text().filter(|t| !t.is_empty()))
+        Ok(copied.content.text().filter(|t| !t.is_empty()))
     }
 
-    /// Whether the clipboard changed within the copy wait.
-    fn wait_for_change(&self, before: isize) -> bool {
+    /// Waits for the copy to land on the clipboard. Apps clear the clipboard and
+    /// write to it in separate steps, so after the first change this keeps looking
+    /// until plain text is there or the copy wait is over. `None` when the
+    /// clipboard never changed.
+    fn wait_for_copy(&self, before: isize) -> Option<Copied> {
         let deadline = Instant::now() + self.copy_wait;
+        let mut latest = None;
         loop {
-            if self.clipboard.change_count() != before {
-                return true;
+            let change_count = self.clipboard.change_count();
+            if change_count != before {
+                let content = self.clipboard.snapshot();
+                let has_text = content.text().is_some();
+                latest = Some(Copied {
+                    content,
+                    change_count,
+                });
+                if has_text {
+                    return latest;
+                }
             }
             if Instant::now() >= deadline {
-                return false;
+                return latest;
             }
             std::thread::sleep(COPY_POLL);
         }
     }
+
+    /// Restores the earlier clipboard content, unless something was copied after our ⌘C.
+    fn put_back(&self, previous: ClipboardSnapshot, copied_change_count: isize) {
+        if self.clipboard.change_count() != copied_change_count {
+            // Putting the old content back would erase what was copied meanwhile.
+            log::info!("clipboard changed after copying the selection; leaving it as it is");
+            return;
+        }
+        if let Err(e) = self.clipboard.restore(previous) {
+            log::warn!("could not restore the clipboard after copying the selection: {e}");
+        }
+    }
+}
+
+/// What the clipboard held once the copy landed, and its change count at that moment.
+struct Copied {
+    content: ClipboardSnapshot,
+    change_count: isize,
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -220,6 +248,10 @@ mod tests {
         content: RefCell<ClipboardSnapshot>,
         changes: Cell<isize>,
         restore_broken: bool,
+        /// How often the change count was read; stands in for time passing.
+        reads: Cell<usize>,
+        /// Writes that land when the change count is read for the n-th time.
+        scheduled: RefCell<Vec<(usize, ClipboardSnapshot)>>,
     }
 
     impl FakeClipboard {
@@ -238,6 +270,11 @@ mod tests {
             *self.content.borrow_mut() = content;
             self.changes.set(self.changes.get() + 1);
         }
+
+        /// `content` is written just before the change count is read for the `read`-th time.
+        fn schedule(&self, read: usize, content: ClipboardSnapshot) {
+            self.scheduled.borrow_mut().push((read, content));
+        }
     }
 
     impl Clipboard for &FakeClipboard {
@@ -251,6 +288,18 @@ mod tests {
         }
 
         fn change_count(&self) -> isize {
+            self.reads.set(self.reads.get() + 1);
+            let due: Vec<_> = {
+                let mut scheduled = self.scheduled.borrow_mut();
+                let (due, later) = scheduled
+                    .drain(..)
+                    .partition(|(read, _)| *read <= self.reads.get());
+                *scheduled = later;
+                due
+            };
+            for (_, content) in due {
+                self.write(content);
+            }
             self.changes.get()
         }
 
@@ -494,6 +543,56 @@ mod tests {
         let read = reader(None, &clipboard, &app, true).selected_text();
 
         assert_eq!(read, Ok(Some("Hello world".to_string())));
+    }
+
+    fn patient<'a>(
+        clipboard: &'a FakeClipboard,
+        app: &'a FrontApp<'a>,
+    ) -> SelectionCopy<Focused, &'a FakeClipboard, &'a FrontApp<'a>, Access> {
+        SelectionCopy {
+            copy_wait: Duration::from_secs(2),
+            ..reader(None, clipboard, app, true)
+        }
+    }
+
+    #[test]
+    fn text_written_after_the_app_cleared_the_clipboard_is_waited_for() {
+        let clipboard = FakeClipboard::holding(text("abc"));
+        // The app clears the clipboard at once and writes the text a few polls later.
+        let app = FrontApp::selecting(&clipboard, Some(ClipboardSnapshot::default()));
+        clipboard.schedule(4, text("今天天氣很好"));
+
+        let read = patient(&clipboard, &app).selected_text();
+
+        assert_eq!(read, Ok(Some("今天天氣很好".to_string())));
+        assert_eq!(clipboard.current(), text("abc"));
+    }
+
+    #[test]
+    fn a_cleared_clipboard_without_text_by_the_end_of_the_wait_is_nothing_selected() {
+        let clipboard = FakeClipboard::holding(text("abc"));
+        let app = FrontApp::selecting(&clipboard, Some(ClipboardSnapshot::default()));
+        let reader = SelectionCopy {
+            copy_wait: Duration::from_millis(30),
+            ..reader(None, &clipboard, &app, true)
+        };
+
+        let read = reader.selected_text();
+
+        assert_eq!((read, clipboard.current()), (Ok(None), text("abc")));
+    }
+
+    #[test]
+    fn something_copied_after_our_copy_is_kept_on_the_clipboard() {
+        let clipboard = FakeClipboard::holding(text("abc"));
+        let app = FrontApp::selecting(&clipboard, Some(text("Hello world")));
+        // Reads: before the copy, the poll that sees the copy, the check before restoring.
+        clipboard.schedule(3, text("copied by the user meanwhile"));
+
+        let read = patient(&clipboard, &app).selected_text();
+
+        assert_eq!(read, Ok(Some("Hello world".to_string())));
+        assert_eq!(clipboard.current(), text("copied by the user meanwhile"));
     }
 
     #[test]
