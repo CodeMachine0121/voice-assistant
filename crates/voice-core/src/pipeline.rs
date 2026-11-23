@@ -93,10 +93,13 @@ impl DictationPipeline {
         let (text, assistant_problem) = match (action, reply) {
             (_, None) => (heard.clone(), None),
             // The selection stays as it was: nothing to write, nothing to record.
-            (PreparedAction::EditSelection { .. }, Some(Reply::Unusable | Reply::Unreachable)) => {
+            (PreparedAction::EditSelection { .. }, Some(Reply::Unreachable)) => {
                 return Outcome::problem_without_entry(Problem::AssistantUnreachable(
                     Action::EditSelection,
                 ))
+            }
+            (PreparedAction::EditSelection { .. }, Some(Reply::Unusable)) => {
+                return Outcome::problem_without_entry(Problem::InstructionNotCarriedOut)
             }
             // Only Dictate keeps the speaker's language, so only it is forced to Traditional;
             // an Edit instruction may ask for Simplified.
@@ -522,8 +525,9 @@ mod tests {
 
             assert_eq!(
                 outcome.status,
-                Status::Problem(Problem::AssistantUnreachable(Action::EditSelection))
+                Status::Problem(Problem::InstructionNotCarriedOut)
             );
+            assert_eq!(outcome.status_message(), "Couldn't run the instruction");
             assert_eq!(outcome.entry, None);
             rig.assert_nothing_written_or_recorded();
         }

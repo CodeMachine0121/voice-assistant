@@ -8,6 +8,8 @@ pub enum Problem {
     /// The writing assistant could not be reached while running this action.
     AssistantUnreachable(Action),
     SpeechModelUnreachable,
+    /// The writing assistant answered an Edit selection with nothing usable.
+    InstructionNotCarriedOut,
     /// Edit selection was started with nothing selected.
     NoSelection,
     /// Edit selection was started with more than `rules::MAX_SELECTION_CHARS` selected.
@@ -31,6 +33,7 @@ impl fmt::Display for Problem {
                 f,
                 "Couldn't run the instruction — writing assistant not reachable"
             ),
+            Problem::InstructionNotCarriedOut => write!(f, "Couldn't run the instruction"),
             Problem::SpeechModelUnreachable => write!(
                 f,
                 "Speech model not reachable — is your local AI app running?"
