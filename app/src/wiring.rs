@@ -118,8 +118,10 @@ pub struct AppFocus {
 }
 
 impl AppFocus {
-    /// The real thing, through AppKit.
+    /// The real thing, through AppKit. Starts following which other app the user
+    /// is in, so build it on the main thread at startup.
     pub fn macos() -> Self {
+        voice_macos::track_focus();
         Self {
             bring_to_front: Arc::new(voice_macos::activate_app),
             hand_back: Arc::new(voice_macos::return_focus),

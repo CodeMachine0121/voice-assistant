@@ -44,7 +44,13 @@ impl VoiceApp {
 
 impl eframe::App for VoiceApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        take_in_messages(ctx, &mut self.model, &self.services, &self.commands);
+        let now = Instant::now();
+        take_in_messages(ctx, &mut self.model, &self.services, &self.commands, now);
+        // The menu-bar icon is not an egui window, so it follows the status here,
+        // where time passing is noticed even while `ui` is skipped.
+        if let Some(tray) = &mut self.tray {
+            tray.show(tray_appearance(&self.model.indicator.effective_status(now)));
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -54,14 +60,8 @@ impl eframe::App for VoiceApp {
             return;
         }
 
-        if let Some(tray) = &mut self.tray {
-            tray.show(tray_appearance(&self.model.indicator.effective_status(now)));
-        }
         if let Some(view) = self.model.indicator.view(now) {
             ui::indicator::show(&ctx, &view);
-        }
-        if let Some(wait) = self.model.indicator.time_to_expiry(now) {
-            ctx.request_repaint_after(wait + Duration::from_millis(20));
         }
 
         if let Some(session) = &mut self.model.settings {
@@ -91,14 +91,15 @@ impl eframe::App for VoiceApp {
 /// which eframe calls on every wake-up, also while the (invisible) root window
 /// counts as hidden and `ui` is skipped; macOS marks it hidden e.g. while the screen
 /// is locked. Whatever arrived then still has to reach the screen, so a full frame
-/// is asked for.
+/// is asked for. Wakes up again when the shown status expires, so the menu-bar
+/// icon and the indicator go back to idle without waiting for another event.
 fn take_in_messages(
     ctx: &egui::Context,
     model: &mut AppModel,
     services: &Services,
     commands: &Receiver<TrayCommand>,
+    now: Instant,
 ) {
-    let now = Instant::now();
     let mut changed = model.drain_statuses(services, now);
     for command in commands.try_iter() {
         changed = true;
@@ -108,10 +109,14 @@ fn take_in_messages(
         ctx.send_viewport_cmd(ViewportCommand::Close);
         return;
     }
+    let expired = model.status_expired(now);
     let hidden = ctx.input(|i| i.viewport().visible() == Some(false));
-    if changed && hidden {
+    if (changed || expired) && hidden {
         ctx.send_viewport_cmd(ViewportCommand::RequestPaintWhileHidden);
         ctx.request_repaint();
+    }
+    if let Some(wait) = model.indicator.time_to_expiry(now) {
+        ctx.request_repaint_after(wait + Duration::from_millis(20));
     }
 }
 
@@ -129,6 +134,16 @@ mod tests {
         services: &Services,
         commands: &Receiver<TrayCommand>,
     ) -> (egui::Context, Vec<ViewportCommand>) {
+        logic_at(Instant::now(), occluded, model, services, commands)
+    }
+
+    fn logic_at(
+        now: Instant,
+        occluded: bool,
+        model: &mut AppModel,
+        services: &Services,
+        commands: &Receiver<TrayCommand>,
+    ) -> (egui::Context, Vec<ViewportCommand>) {
         let ctx = egui::Context::default();
         let mut input = RawInput::default();
         input.viewports.insert(
@@ -140,7 +155,7 @@ mod tests {
             },
         );
         let output = ctx.run_logic(&input, |ctx| {
-            take_in_messages(ctx, model, services, commands)
+            take_in_messages(ctx, model, services, commands, now)
         });
         let root = output
             .viewport_commands
@@ -199,6 +214,47 @@ mod tests {
 
         assert!(model.history_open);
         assert!(!commands.contains(&ViewportCommand::RequestPaintWhileHidden));
+    }
+
+    #[test]
+    fn a_message_expiring_while_hidden_asks_for_a_painted_frame() {
+        let (services, probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+        let (_tx, rx) = unbounded();
+        probe.send_status(voice_core::Status::Done);
+        logic_at(now, true, &mut model, &services, &rx);
+        let expiry = now + model.indicator.time_to_expiry(now).unwrap();
+
+        let (_ctx, commands) = logic_at(expiry, true, &mut model, &services, &rx);
+
+        assert!(commands.contains(&ViewportCommand::RequestPaintWhileHidden));
+    }
+
+    #[test]
+    fn logic_wakes_up_again_when_the_shown_message_expires() {
+        let (services, probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+        let (_tx, rx) = unbounded();
+        probe.send_status(voice_core::Status::Done);
+        let ctx = egui::Context::default();
+        // A new context starts with an immediate repaint pending; serve it first.
+        let _ = ctx.run_logic(&RawInput::default(), |_| {});
+        let delays = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = delays.clone();
+        ctx.set_request_repaint_callback(move |info| seen.lock().unwrap().push(info.delay));
+
+        let _ = ctx.run_logic(&RawInput::default(), |ctx| {
+            take_in_messages(ctx, &mut model, &services, &rx, now)
+        });
+
+        let wait = model.indicator.time_to_expiry(now).unwrap();
+        assert!(delays
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|d| *d >= wait && *d <= wait + Duration::from_millis(20)));
     }
 
     #[test]

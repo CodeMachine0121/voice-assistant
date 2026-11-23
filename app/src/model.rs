@@ -150,6 +150,8 @@ pub struct AppModel {
     /// The History window should come to the front.
     pub history_focus: FocusRequest,
     pub quit_requested: bool,
+    /// The status as last noticed, to tell when time alone has changed it.
+    noticed_status: Status,
 }
 
 impl AppModel {
@@ -162,6 +164,7 @@ impl AppModel {
             settings_focus: FocusRequest::default(),
             history_focus: FocusRequest::default(),
             quit_requested: false,
+            noticed_status: Status::Idle,
         }
     }
 
@@ -178,6 +181,15 @@ impl AppModel {
             self.indicator.set_status(status, now);
         }
         any
+    }
+
+    /// `true` once when the shown status has changed by time passing alone (a
+    /// message expiring), not by a new status from the engine.
+    pub fn status_expired(&mut self, now: Instant) -> bool {
+        let status = self.indicator.effective_status(now);
+        let expired = status != self.noticed_status && status == Status::Idle;
+        self.noticed_status = status;
+        expired
     }
 
     /// Opening a window also brings it to the front with keyboard focus, whether it
@@ -549,6 +561,31 @@ mod tests {
         assert!(model.history_open);
         assert!(model.history_focus.poll(false, now));
         assert_eq!(probe.times_brought_to_front(), 2);
+    }
+
+    #[test]
+    fn a_message_expiring_is_noticed_once() {
+        let (services, probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+        publish(&probe, &[Status::Done]);
+        model.drain_statuses(&services, now);
+        assert!(!model.status_expired(now), "a new status is not an expiry");
+
+        let later = now + model.indicator.time_to_expiry(now).unwrap();
+        assert!(model.status_expired(later));
+        assert!(!model.status_expired(later), "noticed only once");
+    }
+
+    #[test]
+    fn a_status_that_does_not_expire_is_never_reported_as_expired() {
+        let (services, probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+        assert!(!model.status_expired(now));
+        publish(&probe, &[Status::Working(Action::Dictate)]);
+        model.drain_statuses(&services, now);
+        assert!(!model.status_expired(now + std::time::Duration::from_secs(600)));
     }
 
     #[test]
