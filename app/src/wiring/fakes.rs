@@ -1,7 +1,6 @@
-//! Demo adapters: the real dictation engine with a pretend microphone, speech model
-//! and writing assistant, for running the app without devices or permissions.
+//! Demo adapters: the real dictation engine with a pretend microphone, speech provider
+//! and writing assistant, for running the app without devices, network or permissions.
 use super::{Permissions, PrivacyPane, RepaintHandle, Services};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -10,6 +9,7 @@ use voice_core::{
     PersonalDictionary, PolishError, Polisher, Problem, Recorder, Recording, SelectionReader,
     Settings, SettingsStore, TextInserter, TranscribeError, Transcriber, WritingTask,
 };
+use voice_stt::{MemorySecretStore, OpenAiKey};
 
 /// How long the demo speech model and writing assistant each pretend to work.
 const DEMO_WORK: Duration = Duration::from_millis(350);
@@ -190,25 +190,6 @@ pub fn fake_permissions() -> Permissions {
     }
 }
 
-pub fn fake_default_model_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    home.join("Library/Application Support/VoiceAssistant/models/ggml-small.bin")
-}
-
-pub fn fake_download(
-    _path: &std::path::Path,
-    progress: &mut dyn FnMut(u64, Option<u64>),
-) -> Result<(), String> {
-    const TOTAL: u64 = 100 * 1024 * 1024;
-    for step in 1..=20u64 {
-        std::thread::sleep(Duration::from_millis(60));
-        progress(TOTAL / 20 * step, Some(TOTAL));
-    }
-    Ok(())
-}
-
 pub fn build() -> Services {
     let settings_store: Arc<dyn SettingsStore> = Arc::new(InMemorySettings::default());
     let history_store: Arc<dyn HistoryStore> = Arc::new(InMemoryHistory::default());
@@ -238,8 +219,11 @@ pub fn build() -> Services {
                 "llama-3.2-3b-instruct".to_string(),
             ])
         }),
-        default_model_path: Arc::new(fake_default_model_path),
-        download_model: Arc::new(fake_download),
+        // Demo mode never talks to OpenAI, so the key is only kept in memory.
+        speech_key: Arc::new(OpenAiKey::with_environment(
+            Arc::new(MemorySecretStore::default()),
+            || None,
+        )),
         permissions: fake_permissions(),
     }
 }
@@ -372,25 +356,12 @@ mod tests {
     }
 
     #[test]
-    fn fake_download_reports_growing_progress() {
-        let mut seen = Vec::new();
-        fake_download(std::path::Path::new("/x"), &mut |d, t| seen.push((d, t))).unwrap();
-        assert_eq!(seen.len(), 20);
-        assert_eq!(seen.last().unwrap().0, seen.last().unwrap().1.unwrap());
-    }
-
-    #[test]
-    fn default_model_path_is_under_application_support() {
-        assert!(fake_default_model_path().ends_with("VoiceAssistant/models/ggml-small.bin"));
-    }
-
-    #[test]
     fn built_services_answer() {
         let s = build();
         assert_eq!((s.list_input_devices)().len(), 2);
         assert_eq!((s.list_models)("http://x").unwrap().len(), 2);
         assert_eq!(s.settings_store.load(), Settings::default());
         (s.save_settings)(&Settings::default()).unwrap();
-        assert!((s.default_model_path)().ends_with("ggml-small.bin"));
+        assert_eq!(s.speech_key.status(), voice_stt::KeyStatus::Missing);
     }
 }

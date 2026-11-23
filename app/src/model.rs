@@ -2,14 +2,13 @@
 use crate::indicator::IndicatorState;
 use crate::permissions_view::PermissionSnapshot;
 use crate::settings_form::SettingsForm;
-use crate::tasks::{
-    download_target, spawn_download, spawn_list_models, ModelsState, TaskEvent, TaskState,
-};
+use crate::tasks::{spawn_list_models, ModelsState, TaskEvent, TaskState};
 use crate::tray::TrayCommand;
 use crate::wiring::Services;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::time::Instant;
 use voice_core::{History, Settings, Status};
+use voice_stt::KeyStatus;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Notice {
@@ -74,26 +73,6 @@ impl SettingsSession {
         );
     }
 
-    pub fn download_model(&mut self, services: &Services) {
-        if self.tasks.download.is_running() {
-            return;
-        }
-        self.tasks.apply(TaskEvent::DownloadProgress {
-            done: 0,
-            total: None,
-        });
-        let target = download_target(
-            &self.form.speech_model_path,
-            &(services.default_model_path)(),
-        );
-        spawn_download(
-            services.download_model.clone(),
-            target,
-            self.events_tx.clone(),
-            services.repaint.clone(),
-        );
-    }
-
     /// Takes in what the background work has reported so far.
     pub fn drain_tasks(&mut self) {
         for event in self.events_rx.try_iter() {
@@ -116,6 +95,15 @@ impl SettingsSession {
         }
         // A word typed but not yet added would otherwise be silently dropped.
         self.form.add_word();
+        // The key goes first: when it cannot be kept, nothing else is saved either.
+        if let Some(key) = self.form.typed_key() {
+            if let Err(e) = services.speech_key.save(key) {
+                self.notice = Some(Notice::Problem(format!(
+                    "Could not save the OpenAI key: {e}"
+                )));
+                return;
+            }
+        }
         let settings = self.form.to_settings();
         match (services.save_settings)(&settings) {
             Ok(()) => {
@@ -125,6 +113,23 @@ impl SettingsSession {
             }
             Err(e) => self.notice = Some(Notice::Problem(format!("Could not save: {e}"))),
         }
+    }
+}
+
+impl SettingsSession {
+    /// Where the OpenAI key for the next dictation comes from.
+    pub fn key_status(&self, services: &Services) -> KeyStatus {
+        services.speech_key.status()
+    }
+
+    /// Forgets the saved OpenAI key right away (not waiting for Save).
+    pub fn remove_key(&mut self, services: &Services) {
+        self.notice = match services.speech_key.remove() {
+            Ok(()) => None,
+            Err(e) => Some(Notice::Problem(format!(
+                "Could not remove the OpenAI key: {e}"
+            ))),
+        };
     }
 }
 
@@ -191,7 +196,7 @@ mod tests {
     use chrono::Local;
     use std::sync::Mutex;
     use std::time::Duration;
-    use voice_core::{Action, HistoryEntry, Problem, Shortcut, SpeechSource};
+    use voice_core::{Action, HistoryEntry, Problem, Shortcut};
 
     fn entry(text: &str) -> HistoryEntry {
         HistoryEntry {
@@ -482,17 +487,105 @@ mod tests {
     fn saving_a_chosen_speech_model_reaches_the_adapters() {
         let (services, probe) = test_services();
         let mut session = SettingsSession::open(&services);
-        session.form.speech_source = SpeechSource::LocalAiApp {
-            model: "breeze-asr-25".into(),
-        };
+        session.form.speech.model = "gpt-4o-mini-transcribe".into();
+
         session.save(&services);
+
         let applied = probe.applied_settings();
+        assert_eq!(applied[0].speech.model, "gpt-4o-mini-transcribe");
+    }
+
+    #[test]
+    fn saving_a_typed_key_keeps_it_out_of_the_settings_and_clears_the_field() {
+        let (services, probe) = test_services();
+        let mut session = SettingsSession::open(&services);
+        session.form.new_key = "sk-test".into();
+
+        session.save(&services);
+
+        assert_eq!(probe.saved_key().as_deref(), Some("sk-test"));
+        assert_eq!(session.key_status(&services), KeyStatus::Saved);
+        assert_eq!(session.notice, Some(Notice::Saved));
+        assert_eq!(session.form.new_key, "");
+        assert!(!session.is_dirty());
+        let stored = serde_json::to_string(&services.settings_store.load()).unwrap();
+        assert!(!stored.contains("sk-test"), "{stored}");
+    }
+
+    #[test]
+    fn reopening_settings_never_shows_the_saved_key() {
+        let (services, _probe) = test_services();
+        services.speech_key.save("sk-test").unwrap();
+
+        let session = SettingsSession::open(&services);
+
+        assert_eq!(session.form.new_key, "");
+        assert_eq!(session.key_status(&services), KeyStatus::Saved);
+    }
+
+    #[test]
+    fn saving_with_the_key_field_empty_keeps_the_saved_key() {
+        let (services, probe) = test_services();
+        services.speech_key.save("sk-saved").unwrap();
+        let mut session = SettingsSession::open(&services);
+        session.form.cleanup_enabled = false;
+
+        session.save(&services);
+
+        assert_eq!(probe.saved_key().as_deref(), Some("sk-saved"));
+        assert!(!services.settings_store.load().cleanup_enabled);
+    }
+
+    #[test]
+    fn a_key_that_cannot_be_kept_saves_nothing_else() {
+        let (services, probe) = test_services();
+        probe.fail_key_storage("keychain locked");
+        let mut session = SettingsSession::open(&services);
+        session.form.new_key = "sk-test".into();
+        session.form.cleanup_enabled = false;
+
+        session.save(&services);
+
         assert_eq!(
-            applied[0].speech_source,
-            SpeechSource::LocalAiApp {
-                model: "breeze-asr-25".into()
-            }
+            session.notice,
+            Some(Notice::Problem(
+                "Could not save the OpenAI key: keychain locked".into()
+            ))
         );
+        assert!(services.settings_store.load().cleanup_enabled);
+        assert!(probe.applied_settings().is_empty());
+        assert_eq!(session.form.new_key, "sk-test", "typed key kept for retry");
+    }
+
+    #[test]
+    fn removing_the_key_forgets_it() {
+        let (services, probe) = test_services();
+        services.speech_key.save("sk-saved").unwrap();
+        let mut session = SettingsSession::open(&services);
+
+        session.remove_key(&services);
+
+        assert_eq!(probe.saved_key(), None);
+        assert_eq!(session.key_status(&services), KeyStatus::Missing);
+        assert_eq!(session.notice, None);
+    }
+
+    #[test]
+    fn a_key_that_cannot_be_removed_is_reported() {
+        let (services, probe) = test_services();
+        services.speech_key.save("sk-saved").unwrap();
+        probe.fail_key_storage("keychain locked");
+        let mut session = SettingsSession::open(&services);
+
+        session.remove_key(&services);
+
+        assert_eq!(
+            session.notice,
+            Some(Notice::Problem(
+                "Could not remove the OpenAI key: keychain locked".into()
+            ))
+        );
+        assert_eq!(probe.saved_key().as_deref(), Some("sk-saved"));
     }
 
     #[test]
@@ -505,85 +598,5 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         session.drain_tasks();
         assert_eq!(session.tasks.models, ModelsState::Loading);
-    }
-
-    #[test]
-    fn download_runs_to_completion() {
-        let (services, _probe) = test_services();
-        let mut session = SettingsSession::open(&services);
-        session.download_model(&services);
-        assert!(session.tasks.download.is_running());
-        wait_for_tasks(&mut session, |t| !t.download.is_running());
-        assert_eq!(
-            session.tasks.download,
-            crate::tasks::DownloadState::Finished
-        );
-    }
-
-    #[test]
-    fn download_goes_to_the_typed_path_when_given() {
-        let (mut services, _probe) = test_services();
-        let target = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let seen = target.clone();
-        services.download_model = std::sync::Arc::new(move |path, _| {
-            *seen.lock().unwrap() = Some(path.to_path_buf());
-            Ok(())
-        });
-        let mut session = SettingsSession::open(&services);
-        session.form.speech_model_path = "/mine/model.bin".into();
-        session.download_model(&services);
-        wait_for_tasks(&mut session, |t| !t.download.is_running());
-        assert_eq!(
-            target.lock().unwrap().as_deref(),
-            Some(std::path::Path::new("/mine/model.bin"))
-        );
-    }
-
-    #[test]
-    fn download_to_the_default_location_when_no_path_is_typed() {
-        let (mut services, _probe) = test_services();
-        let target = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let seen = target.clone();
-        services.download_model = std::sync::Arc::new(move |path, _| {
-            *seen.lock().unwrap() = Some(path.to_path_buf());
-            Ok(())
-        });
-        let mut session = SettingsSession::open(&services);
-        session.download_model(&services);
-        wait_for_tasks(&mut session, |t| !t.download.is_running());
-        assert_eq!(
-            target.lock().unwrap().as_deref(),
-            Some(std::path::Path::new("/default/model.bin"))
-        );
-    }
-
-    #[test]
-    fn a_second_download_click_while_running_is_ignored() {
-        let (mut services, _probe) = test_services();
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = calls.clone();
-        services.download_model = std::sync::Arc::new(move |_, _| {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(100));
-            Ok(())
-        });
-        let mut session = SettingsSession::open(&services);
-        session.download_model(&services);
-        session.download_model(&services);
-        wait_for_tasks(&mut session, |t| !t.download.is_running());
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn download_failure_is_shown() {
-        let (mut services, _probe) = test_services();
-        services.download_model = std::sync::Arc::new(|_, _| Err("offline".into()));
-        let mut session = SettingsSession::open(&services);
-        session.download_model(&services);
-        wait_for_tasks(&mut session, |t| !t.download.is_running());
-        assert_eq!(
-            session.tasks.download,
-            crate::tasks::DownloadState::Failed("offline".into())
-        );
     }
 }

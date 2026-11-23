@@ -4925,6 +4925,7 @@ dependencies = [
  "eframe",
  "env_logger",
  "log",
+ "serde_json",
  "tray-icon",
  "voice-audio",
  "voice-core",

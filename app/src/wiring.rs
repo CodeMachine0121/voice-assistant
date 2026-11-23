@@ -2,7 +2,7 @@
 //!
 //! The rest of the app talks to `Services` and nothing else. `real` wires the
 //! production adapters; `fakes` backs a demo mode (`VOICE_ASSISTANT_DEMO=1`) that
-//! runs without microphone, speech model, writing assistant or permissions.
+//! runs without microphone, speech provider, writing assistant or permissions.
 mod fakes;
 mod real;
 #[cfg(test)]
@@ -10,17 +10,14 @@ pub mod testing;
 
 use crossbeam_channel::Sender;
 use eframe::egui;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use voice_core::{EngineHandle, HistoryStore, Settings, SettingsStore};
+use voice_stt::OpenAiKey;
 
 /// Names of the audio input devices, for the microphone picker.
 pub type DeviceListFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 /// Models offered by the writing assistant at a base URL.
 pub type ModelListFn = Arc<dyn Fn(&str) -> Result<Vec<String>, String> + Send + Sync>;
-/// Downloads the default speech model to a path, reporting `(downloaded, total)` bytes.
-pub type ModelDownloadFn =
-    Arc<dyn Fn(&Path, &mut dyn FnMut(u64, Option<u64>)) -> Result<(), String> + Send + Sync>;
 /// Saves settings and puts them into effect everywhere; nothing changes on failure.
 pub type SettingsSaveFn = Arc<dyn Fn(&Settings) -> Result<(), String> + Send + Sync>;
 
@@ -74,8 +71,8 @@ pub struct Services {
     pub repaint: RepaintHandle,
     pub list_input_devices: DeviceListFn,
     pub list_models: ModelListFn,
-    pub default_model_path: Arc<dyn Fn() -> PathBuf + Send + Sync>,
-    pub download_model: ModelDownloadFn,
+    /// The OpenAI key the speech provider authenticates with.
+    pub speech_key: Arc<OpenAiKey>,
     pub permissions: Permissions,
     pub save_settings: SettingsSaveFn,
 }
