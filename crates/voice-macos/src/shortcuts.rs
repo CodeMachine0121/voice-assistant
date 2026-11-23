@@ -1,8 +1,9 @@
-//! Global shortcut listener: a listen-only `CGEventTap` on its own thread.
+//! Global shortcut listener: a `CGEventTap` on its own thread.
 //!
-//! The tap thread only decodes events and forwards them to [`KeyInterpreter`];
-//! every mapping rule lives there.
-use crate::keys::{KeyInput, KeyInterpreter, KeyKind, ShortcutConfig};
+//! The tap thread only decodes events, forwards them to [`KeyInterpreter`] and
+//! drops the ones it says to consume (the Space of a combo shortcut); every
+//! mapping rule lives there.
+use crate::keys::{KeyDecision, KeyInput, KeyInterpreter, KeyKind, ShortcutConfig};
 use core_foundation::base::TCFType;
 use core_foundation::mach_port::CFMachPortRef;
 use core_foundation::runloop::{kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoop};
@@ -23,7 +24,7 @@ extern "C" {
 }
 
 /// Decodes the parts of a `CGEvent` the interpreter needs. `None` for event
-/// types that are not keyboard events.
+/// types that are neither keyboard events nor mouse-button presses.
 pub(crate) fn decode(
     event_type: CGEventType,
     keycode: i64,
@@ -34,6 +35,9 @@ pub(crate) fn decode(
         CGEventType::KeyDown => KeyKind::Down,
         CGEventType::KeyUp => KeyKind::Up,
         CGEventType::FlagsChanged => KeyKind::FlagsChanged,
+        CGEventType::LeftMouseDown | CGEventType::RightMouseDown | CGEventType::OtherMouseDown => {
+            KeyKind::Pointer
+        }
         _ => return None,
     };
     Some(KeyInput {
@@ -69,19 +73,17 @@ impl Shared {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Interprets one key event and forwards what it means.
-    fn handle(&self, input: Option<KeyInput>) {
-        if let Some(input) = input {
-            let produced = self.interpreter().on_key(input);
-            self.emit(produced);
-        }
-    }
-
-    fn emit(&self, event: Option<ShortcutEvent>) {
+    /// Interprets one input, forwards what it means and tells whether to drop it.
+    fn handle(&self, input: Option<KeyInput>) -> bool {
+        let Some(input) = input else {
+            return false;
+        };
+        let KeyDecision { event, consume } = self.interpreter().on_key(input);
         if let Some(event) = event {
             // The receiver is gone only while the app shuts down.
             let _ = self.sink.send(event);
         }
+        consume
     }
 }
 
@@ -135,22 +137,30 @@ fn run_tap(shared: &Arc<Shared>, ready: &Sender<Option<CFRunLoop>>) {
             }
             return CallbackResult::Keep;
         }
-        callback_shared.handle(decode(
+        let consume = callback_shared.handle(decode(
             event_type,
             event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE),
             event.get_flags().bits(),
             event.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT),
         ));
-        CallbackResult::Keep
+        if consume {
+            CallbackResult::Drop
+        } else {
+            CallbackResult::Keep
+        }
     };
     let tap = CGEventTap::new(
         CGEventTapLocation::Session,
         CGEventTapPlacement::HeadInsertEventTap,
-        CGEventTapOptions::ListenOnly,
+        // Not listen-only: the Space of a combo shortcut must be dropped.
+        CGEventTapOptions::Default,
         vec![
             CGEventType::KeyDown,
             CGEventType::KeyUp,
             CGEventType::FlagsChanged,
+            CGEventType::LeftMouseDown,
+            CGEventType::RightMouseDown,
+            CGEventType::OtherMouseDown,
         ],
         callback,
     );
@@ -188,8 +198,7 @@ pub struct ShortcutListener {
 impl ShortcutListener {
     /// Switches to new shortcuts without restarting the tap.
     pub fn update(&self, config: ShortcutConfig) {
-        let produced = self.shared.interpreter().reconfigure(&config);
-        self.shared.emit(produced);
+        self.shared.interpreter().reconfigure(&config);
     }
 }
 
@@ -206,7 +215,7 @@ impl Drop for ShortcutListener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voice_core::Shortcut;
+    use voice_core::Action;
 
     #[test]
     fn keyboard_event_types_are_decoded() {
@@ -250,10 +259,27 @@ mod tests {
     }
 
     #[test]
-    fn non_keyboard_events_are_not_decoded() {
-        let decoded = decode(CGEventType::MouseMoved, 0, 0, 0);
+    fn mouse_button_presses_are_decoded_as_pointer_input() {
+        let decoded = [
+            CGEventType::LeftMouseDown,
+            CGEventType::RightMouseDown,
+            CGEventType::OtherMouseDown,
+        ]
+        .map(|t| decode(t, 0, 0x0010_0008, 0).map(|i| i.kind));
 
-        assert_eq!(decoded, None);
+        assert_eq!(decoded, [Some(KeyKind::Pointer); 3]);
+    }
+
+    #[test]
+    fn other_events_are_not_decoded() {
+        let decoded = [
+            CGEventType::MouseMoved,
+            CGEventType::LeftMouseUp,
+            CGEventType::ScrollWheel,
+        ]
+        .map(|t| decode(t, 0, 0, 0));
+
+        assert_eq!(decoded, [None; 3]);
     }
 
     #[test]
@@ -268,24 +294,61 @@ mod tests {
         assert_eq!(recognised, [true, true, false]);
     }
 
-    #[test]
-    fn interpreted_key_events_reach_the_shortcut_channel() {
+    fn shared() -> (Shared, crossbeam_channel::Receiver<ShortcutEvent>) {
         let (sink, events) = crossbeam_channel::unbounded();
         let shared = Shared {
-            interpreter: Mutex::new(KeyInterpreter::new(&ShortcutConfig {
-                push_to_talk: Shortcut::RightOption,
-                hands_free: Shortcut::ControlOptionSpace,
-            })),
+            interpreter: Mutex::new(KeyInterpreter::new(&ShortcutConfig::default())),
             sink,
             stopped: AtomicBool::new(false),
         };
+        (shared, events)
+    }
 
-        shared.handle(decode(CGEventType::FlagsChanged, 61, 0x0008_0040, 0));
+    #[test]
+    fn interpreted_key_events_reach_the_shortcut_channel() {
+        let (shared, events) = shared();
+
+        shared.handle(decode(CGEventType::FlagsChanged, 55, 0x0010_0008, 0));
         shared.handle(decode(CGEventType::MouseMoved, 0, 0, 0));
+        shared.handle(decode(CGEventType::FlagsChanged, 55, 0, 0));
 
         assert_eq!(
             events.try_iter().collect::<Vec<_>>(),
-            [ShortcutEvent::PushToTalkDown]
+            [ShortcutEvent::ActionTapped(Action::Dictate)]
+        );
+    }
+
+    #[test]
+    fn command_click_reaches_the_interpreter_and_cancels_the_tap() {
+        let (shared, events) = shared();
+
+        shared.handle(decode(CGEventType::FlagsChanged, 55, 0x0010_0008, 0));
+        shared.handle(decode(CGEventType::LeftMouseDown, 0, 0x0010_0008, 0));
+        shared.handle(decode(CGEventType::FlagsChanged, 55, 0, 0));
+
+        assert_eq!(events.try_iter().count(), 0);
+    }
+
+    #[test]
+    fn only_the_space_of_a_combo_shortcut_is_dropped() {
+        let (shared, events) = shared();
+
+        let dropped = [
+            shared.handle(decode(CGEventType::FlagsChanged, 58, 0x0008_0020, 0)),
+            shared.handle(decode(CGEventType::KeyDown, 49, 0x0008_0020, 0)),
+            shared.handle(decode(CGEventType::KeyUp, 49, 0x0008_0020, 0)),
+            shared.handle(decode(CGEventType::FlagsChanged, 58, 0, 0)),
+            shared.handle(decode(CGEventType::KeyDown, 53, 0, 0)),
+            shared.handle(decode(CGEventType::MouseMoved, 0, 0, 0)),
+        ];
+
+        assert_eq!(dropped, [false, true, true, false, false, false]);
+        assert_eq!(
+            events.try_iter().collect::<Vec<_>>(),
+            [
+                ShortcutEvent::ActionTapped(Action::EditSelection),
+                ShortcutEvent::EscapePressed
+            ]
         );
     }
 
@@ -294,10 +357,7 @@ mod tests {
     #[test]
     fn starting_either_listens_or_reports_missing_permission() {
         let (sink, events) = crossbeam_channel::unbounded();
-        let config = ShortcutConfig {
-            push_to_talk: Shortcut::RightOption,
-            hands_free: Shortcut::ControlOptionSpace,
-        };
+        let config = ShortcutConfig::default();
 
         let started = EventTapShortcuts::start(config.clone(), sink);
 
