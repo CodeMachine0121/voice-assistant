@@ -139,7 +139,10 @@ mod tests {
 
     fn changed() -> Settings {
         Settings {
-            push_to_talk: Shortcut::Fn,
+            shortcuts: voice_core::ActionShortcuts {
+                dictate: Shortcut::TapFn,
+                ..Default::default()
+            },
             ..Settings::default()
         }
     }

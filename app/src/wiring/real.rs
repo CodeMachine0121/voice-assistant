@@ -10,12 +10,16 @@ use std::sync::{Arc, Mutex, RwLock};
 use voice_audio::CpalRecorder;
 use voice_core::{
     DictationPipeline, Engine, EngineDeps, HistoryStore, PersonalDictionary, PolishError, Polisher,
-    Problem, Recorder, Recording, Settings, SettingsStore, Transcriber,
+    Problem, Recorder, Recording, Settings, SettingsStore, SpeechSource, TranscribeError,
+    Transcriber, WritingTask,
 };
-use voice_macos::{MacPermissions, PasteInserter, ShortcutConfig, ShortcutHandle, ShortcutService};
+use voice_macos::{
+    ClipboardSelectionReader, MacPermissions, PasteInserter, ShortcutConfig, ShortcutHandle,
+    ShortcutService,
+};
 use voice_polish::LmStudioPolisher;
 use voice_storage::{JsonHistoryStore, JsonSettingsStore};
-use voice_stt::WhisperTranscriber;
+use voice_stt::{ServerTranscriber, WhisperTranscriber};
 
 /// Message shown when no speech model file exists yet.
 pub const SPEECH_MODEL_MISSING: &str =
@@ -32,15 +36,15 @@ pub fn speech_model_path(settings: &Settings) -> PathBuf {
 /// Loads a speech model from a path.
 type ModelLoader = dyn Fn(&std::path::Path) -> Result<Arc<dyn Transcriber>, String> + Send + Sync;
 
-/// Speech recognition that follows the configured model file and loads it lazily,
+/// The built-in speech model: follows the configured model file and loads it lazily,
 /// so the app starts even before the model has been downloaded.
-pub struct ConfigurableTranscriber {
+pub struct BuiltInSpeech {
     path: Mutex<PathBuf>,
     loaded: Mutex<Option<(PathBuf, Arc<dyn Transcriber>)>>,
     loader: Box<ModelLoader>,
 }
 
-impl ConfigurableTranscriber {
+impl BuiltInSpeech {
     pub fn new(path: PathBuf, loader: Box<ModelLoader>) -> Self {
         Self {
             path: Mutex::new(path),
@@ -53,7 +57,7 @@ impl ConfigurableTranscriber {
         *lock(&self.path) = path;
     }
 
-    fn current(&self) -> Result<Arc<dyn Transcriber>, String> {
+    fn current(&self) -> Result<Arc<dyn Transcriber>, TranscribeError> {
         let path = lock(&self.path).clone();
         let mut loaded = lock(&self.loaded);
         if let Some((loaded_path, model)) = loaded.as_ref() {
@@ -63,21 +67,79 @@ impl ConfigurableTranscriber {
         }
         if !path.exists() {
             *loaded = None;
-            return Err(SPEECH_MODEL_MISSING.to_string());
+            return Err(TranscribeError::Failed(SPEECH_MODEL_MISSING.to_string()));
         }
-        let model = (self.loader)(&path)?;
+        let model = (self.loader)(&path).map_err(TranscribeError::Failed)?;
         *loaded = Some((path, model.clone()));
         Ok(model)
     }
 }
 
-impl Transcriber for ConfigurableTranscriber {
+impl Transcriber for BuiltInSpeech {
     fn transcribe(
         &self,
         recording: &Recording,
         dictionary: &PersonalDictionary,
-    ) -> Result<String, String> {
+    ) -> Result<String, TranscribeError> {
         self.current()?.transcribe(recording, dictionary)
+    }
+}
+
+/// Builds a transcriber that talks to the speech model `model` served at `base_url`.
+type ServerFactory = dyn Fn(String, String) -> Arc<dyn Transcriber> + Send + Sync;
+
+/// Where speech turns into words: the built-in model or a model served by the local AI
+/// app, as `Settings::speech_source` says. `apply` switches it when settings are saved.
+pub struct SpeechModelSwitch {
+    built_in: BuiltInSpeech,
+    server: Box<ServerFactory>,
+    chosen: RwLock<Option<Arc<dyn Transcriber>>>,
+}
+
+impl SpeechModelSwitch {
+    pub fn new(settings: &Settings, loader: Box<ModelLoader>, server: Box<ServerFactory>) -> Self {
+        let switch = Self {
+            built_in: BuiltInSpeech::new(speech_model_path(settings), loader),
+            server,
+            chosen: RwLock::new(None),
+        };
+        switch.apply(settings);
+        switch
+    }
+
+    /// Uses the speech source and model file of `settings` from the next dictation on.
+    pub fn apply(&self, settings: &Settings) {
+        self.built_in.set_path(speech_model_path(settings));
+        let server = match &settings.speech_source {
+            SpeechSource::BuiltIn => None,
+            SpeechSource::LocalAiApp { model } => {
+                Some((self.server)(settings.assistant_url.clone(), model.clone()))
+            }
+        };
+        match self.chosen.write() {
+            Ok(mut guard) => *guard = server,
+            Err(poisoned) => *poisoned.into_inner() = server,
+        }
+    }
+
+    fn server(&self) -> Option<Arc<dyn Transcriber>> {
+        match self.chosen.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
+impl Transcriber for SpeechModelSwitch {
+    fn transcribe(
+        &self,
+        recording: &Recording,
+        dictionary: &PersonalDictionary,
+    ) -> Result<String, TranscribeError> {
+        match self.server() {
+            Some(server) => server.transcribe(recording, dictionary),
+            None => self.built_in.transcribe(recording, dictionary),
+        }
     }
 }
 
@@ -105,8 +167,12 @@ impl ConfigurablePolisher {
 }
 
 impl Polisher for ConfigurablePolisher {
-    fn polish(&self, raw: &str, dictionary: &PersonalDictionary) -> Result<String, PolishError> {
-        self.current().polish(raw, dictionary)
+    fn polish(
+        &self,
+        task: &WritingTask<'_>,
+        dictionary: &PersonalDictionary,
+    ) -> Result<String, PolishError> {
+        self.current().polish(task, dictionary)
     }
 }
 
@@ -263,11 +329,12 @@ pub fn build() -> Services {
     let settings = settings_store.load();
     let repaint = RepaintHandle::default();
 
-    let transcriber = Arc::new(ConfigurableTranscriber::new(
-        speech_model_path(&settings),
+    let transcriber = Arc::new(SpeechModelSwitch::new(
+        &settings,
         Box::new(|path| {
             WhisperTranscriber::new(path.to_path_buf()).map(|t| Arc::new(t) as Arc<dyn Transcriber>)
         }),
+        Box::new(|base_url, model| Arc::new(ServerTranscriber::new(base_url, model))),
     ));
     let polisher = Arc::new(ConfigurablePolisher::new(polisher_for(&settings)));
     let recorder = SharedRecorder::new(CpalRecorder::new(settings.microphone.clone()));
@@ -287,6 +354,7 @@ pub fn build() -> Services {
                 Box::new(MacPermissions::request_microphone),
             )),
             pipeline,
+            selection: Arc::new(ClipboardSelectionReader::new()),
             settings: settings.clone(),
         },
         Box::new(move || wake.request()),
@@ -307,7 +375,7 @@ pub fn build() -> Services {
         settings_store.clone(),
         engine.settings.clone(),
         move |s: &Settings| {
-            transcriber.set_path(speech_model_path(s));
+            transcriber.apply(s);
             polisher.replace(polisher_for(s));
             recorder.choose_device(s.microphone.clone());
             listener.apply(ShortcutConfig::from(s));
@@ -336,12 +404,20 @@ mod tests {
 
     struct Echo(&'static str);
     impl Transcriber for Echo {
-        fn transcribe(&self, _: &Recording, _: &PersonalDictionary) -> Result<String, String> {
+        fn transcribe(
+            &self,
+            _: &Recording,
+            _: &PersonalDictionary,
+        ) -> Result<String, TranscribeError> {
             Ok(self.0.to_string())
         }
     }
     impl Polisher for Echo {
-        fn polish(&self, _: &str, _: &PersonalDictionary) -> Result<String, PolishError> {
+        fn polish(
+            &self,
+            _: &WritingTask<'_>,
+            _: &PersonalDictionary,
+        ) -> Result<String, PolishError> {
             Ok(self.0.to_string())
         }
     }
@@ -361,54 +437,141 @@ mod tests {
         })
     }
 
+    fn heard(t: &dyn Transcriber) -> Result<String, TranscribeError> {
+        t.transcribe(&Recording::default(), &PersonalDictionary::default())
+    }
+
     #[test]
     fn missing_speech_model_tells_the_user_to_download_it() {
         let count = Arc::new(AtomicUsize::new(0));
-        let t = ConfigurableTranscriber::new(
+        let t = BuiltInSpeech::new(
             PathBuf::from("/definitely/not/here.bin"),
             counting_loader(count.clone()),
         );
-        let err = t
-            .transcribe(&Recording::default(), &PersonalDictionary::default())
-            .unwrap_err();
-        assert_eq!(err, SPEECH_MODEL_MISSING);
+        assert_eq!(
+            heard(&t),
+            Err(TranscribeError::Failed(SPEECH_MODEL_MISSING.to_string()))
+        );
         assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 
     #[test]
     fn speech_model_is_loaded_once_and_reloaded_when_the_path_changes() {
         let count = Arc::new(AtomicUsize::new(0));
-        let first = existing_file("a");
-        let t = ConfigurableTranscriber::new(first.clone(), counting_loader(count.clone()));
-        let none = PersonalDictionary::default();
-        assert_eq!(t.transcribe(&Recording::default(), &none).unwrap(), "heard");
-        t.transcribe(&Recording::default(), &none).unwrap();
+        let t = BuiltInSpeech::new(existing_file("a"), counting_loader(count.clone()));
+        assert_eq!(heard(&t).unwrap(), "heard");
+        heard(&t).unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
         t.set_path(existing_file("b"));
-        t.transcribe(&Recording::default(), &none).unwrap();
+        heard(&t).unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn speech_model_load_errors_are_reported() {
-        let t = ConfigurableTranscriber::new(
+        let t = BuiltInSpeech::new(
             existing_file("c"),
             Box::new(|_| Err("not a model".to_string())),
         );
-        let err = t
-            .transcribe(&Recording::default(), &PersonalDictionary::default())
-            .unwrap_err();
-        assert_eq!(err, "not a model");
+        assert_eq!(
+            heard(&t),
+            Err(TranscribeError::Failed("not a model".to_string()))
+        );
+    }
+
+    fn local_ai_app(model: &str) -> Settings {
+        Settings {
+            speech_source: SpeechSource::LocalAiApp {
+                model: model.to_string(),
+            },
+            assistant_url: "http://ai:1/v1".into(),
+            ..Settings::default()
+        }
+    }
+
+    /// A switch whose built-in side hears "built-in" and whose server side says which
+    /// address and model it was built for.
+    fn switch(settings: &Settings, loads: Arc<AtomicUsize>) -> SpeechModelSwitch {
+        SpeechModelSwitch::new(
+            &Settings {
+                speech_model_path: Some(existing_file("switch")),
+                ..settings.clone()
+            },
+            Box::new(move |_| {
+                loads.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(Echo("built-in")) as Arc<dyn Transcriber>)
+            }),
+            Box::new(|url, model| {
+                let said: &'static str = Box::leak(format!("{model}@{url}").into_boxed_str());
+                Arc::new(Echo(said))
+            }),
+        )
+    }
+
+    #[test]
+    fn built_in_speech_is_the_default_choice() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let s = switch(&Settings::default(), loads.clone());
+        assert_eq!(heard(&s).unwrap(), "built-in");
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_chosen_local_speech_model_does_the_listening() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let s = switch(&local_ai_app("breeze-asr-25"), loads.clone());
+        assert_eq!(heard(&s).unwrap(), "breeze-asr-25@http://ai:1/v1");
+        assert_eq!(loads.load(Ordering::SeqCst), 0, "built-in model not loaded");
+    }
+
+    #[test]
+    fn saving_settings_switches_between_the_two_sources() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let s = switch(&Settings::default(), loads);
+        assert_eq!(heard(&s).unwrap(), "built-in");
+        s.apply(&local_ai_app("breeze-asr-25"));
+        assert_eq!(heard(&s).unwrap(), "breeze-asr-25@http://ai:1/v1");
+        s.apply(&local_ai_app("other"));
+        assert_eq!(heard(&s).unwrap(), "other@http://ai:1/v1");
+        s.apply(&Settings {
+            speech_model_path: Some(existing_file("switch")),
+            ..Settings::default()
+        });
+        assert_eq!(heard(&s).unwrap(), "built-in");
+    }
+
+    #[test]
+    fn an_unreachable_local_speech_model_reports_that_it_is_unreachable() {
+        struct Down;
+        impl Transcriber for Down {
+            fn transcribe(
+                &self,
+                _: &Recording,
+                _: &PersonalDictionary,
+            ) -> Result<String, TranscribeError> {
+                Err(TranscribeError::Unreachable("refused".into()))
+            }
+        }
+        let s = SpeechModelSwitch::new(
+            &local_ai_app("m"),
+            Box::new(|_| Err("unused".into())),
+            Box::new(|_, _| Arc::new(Down)),
+        );
+        assert_eq!(
+            heard(&s),
+            Err(TranscribeError::Unreachable("refused".into()))
+        );
     }
 
     #[test]
     fn writing_assistant_follows_the_latest_settings() {
         let p = ConfigurablePolisher::new(Arc::new(Echo("old")));
         let none = PersonalDictionary::default();
-        assert_eq!(p.polish("x", &none).unwrap(), "old");
+        let task = WritingTask::CleanUp { heard: "x" };
+        assert_eq!(p.polish(&task, &none).unwrap(), "old");
         p.replace(Arc::new(Echo("new")));
-        assert_eq!(p.polish("x", &none).unwrap(), "new");
+        assert_eq!(p.polish(&task, &none).unwrap(), "new");
     }
 
     #[test]

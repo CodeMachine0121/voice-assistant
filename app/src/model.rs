@@ -35,7 +35,7 @@ impl SettingsSession {
     pub fn open(services: &Services) -> Self {
         let stored = services.settings_store.load();
         let (events_tx, events_rx) = unbounded();
-        Self {
+        let mut session = Self {
             form: SettingsForm::from_settings(&stored),
             stored,
             devices: (services.list_input_devices)(),
@@ -44,7 +44,10 @@ impl SettingsSession {
             permissions: PermissionSnapshot::take(&services.permissions, Instant::now()),
             events_tx,
             events_rx,
-        }
+        };
+        // The model lists are asked for as soon as the window opens.
+        session.refresh_models(services);
+        session
     }
 
     /// Device names for the picker; a chosen device that is not plugged in stays listed.
@@ -108,7 +111,7 @@ impl SettingsSession {
 
     pub fn save(&mut self, services: &Services) {
         if let Some(problem) = self.form.problem() {
-            self.notice = Some(Notice::Problem(problem.to_string()));
+            self.notice = Some(Notice::Problem(problem));
             return;
         }
         // A word typed but not yet added would otherwise be silently dropped.
@@ -186,12 +189,15 @@ mod tests {
     use super::*;
     use crate::wiring::testing::{test_services, Probe};
     use chrono::Local;
+    use std::sync::Mutex;
     use std::time::Duration;
-    use voice_core::{HistoryEntry, Problem, Shortcut};
+    use voice_core::{Action, HistoryEntry, Problem, Shortcut, SpeechSource};
 
     fn entry(text: &str) -> HistoryEntry {
         HistoryEntry {
             at: Local::now(),
+            action: Action::Dictate,
+            original: None,
             raw: format!("raw {text}"),
             polished: text.to_string(),
         }
@@ -227,9 +233,9 @@ mod tests {
         let (services, probe) = test_services();
         let now = Instant::now();
         let mut model = AppModel::new(now);
-        publish(&probe, &[Status::Working]);
+        publish(&probe, &[Status::Working(Action::DictateInEnglish)]);
         model.drain_statuses(&services, now);
-        assert_eq!(model.indicator.view(now).unwrap().text, "Working…");
+        assert_eq!(model.indicator.view(now).unwrap().text, "Translating…");
     }
 
     #[test]
@@ -240,7 +246,10 @@ mod tests {
         publish(
             &probe,
             &[
-                Status::Listening { level: 0.2 },
+                Status::Listening {
+                    action: Action::Dictate,
+                    level: 0.2,
+                },
                 Status::Problem(Problem::NoSpeech),
             ],
         );
@@ -279,7 +288,12 @@ mod tests {
         let now = Instant::now();
         let mut model = AppModel::new(now);
         store_history(&services, &["hello there"]);
-        publish(&probe, &[Status::Problem(Problem::AssistantUnreachable)]);
+        publish(
+            &probe,
+            &[Status::Problem(Problem::AssistantUnreachable(
+                Action::Dictate,
+            ))],
+        );
         model.drain_statuses(&services, now);
         assert_eq!(model.history.entries().len(), 1);
     }
@@ -290,7 +304,10 @@ mod tests {
         let now = Instant::now();
         let mut model = AppModel::new(now);
         store_history(&services, &["Hello."]);
-        publish(&probe, &[Status::Working, Status::Cancelled]);
+        publish(
+            &probe,
+            &[Status::Working(Action::Dictate), Status::Cancelled],
+        );
         model.drain_statuses(&services, now);
         assert!(model.history.entries().is_empty());
     }
@@ -337,12 +354,15 @@ mod tests {
         services
             .settings_store
             .save(&Settings {
-                push_to_talk: Shortcut::Fn,
+                shortcuts: voice_core::ActionShortcuts {
+                    dictate: Shortcut::TapFn,
+                    ..Default::default()
+                },
                 ..Settings::default()
             })
             .unwrap();
         let session = SettingsSession::open(&services);
-        assert_eq!(session.form.push_to_talk, Shortcut::Fn);
+        assert_eq!(session.form.shortcuts.dictate, Shortcut::TapFn);
         assert_eq!(session.devices, ["Mic A"]);
         assert!(!session.is_dirty());
         assert_eq!(session.notice, None);
@@ -377,7 +397,10 @@ mod tests {
     fn invalid_form_is_not_saved() {
         let (services, probe) = test_services();
         let mut session = SettingsSession::open(&services);
-        session.form.hands_free = session.form.push_to_talk.clone();
+        session
+            .form
+            .shortcuts
+            .set(Action::EditSelection, Shortcut::TapCommand);
         assert!(!session.can_save());
         session.save(&services);
         assert!(matches!(&session.notice, Some(Notice::Problem(m)) if m.contains("different")));
@@ -400,9 +423,52 @@ mod tests {
     }
 
     #[test]
-    fn refreshing_models_lists_them() {
+    fn opening_settings_lists_the_models_the_local_ai_app_reports() {
+        let (mut services, _probe) = test_services();
+        services.list_models =
+            std::sync::Arc::new(|_| Ok(vec!["breeze-asr-25".into(), "twil-8b".into()]));
+        let mut session = SettingsSession::open(&services);
+        assert_eq!(session.tasks.models, ModelsState::Loading);
+        wait_for_tasks(&mut session, |t| t.models != ModelsState::Loading);
+        assert_eq!(
+            session.tasks.models,
+            ModelsState::Loaded(vec!["breeze-asr-25".into(), "twil-8b".into()])
+        );
+    }
+
+    #[test]
+    fn checking_the_connection_asks_the_typed_address() {
+        let (mut services, _probe) = test_services();
+        let asked = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        services.list_models = std::sync::Arc::new(move |url| {
+            seen.lock().unwrap().push(url.to_string());
+            Err("refused".into())
+        });
+        let mut session = SettingsSession::open(&services);
+        wait_for_tasks(&mut session, |t| t.models != ModelsState::Loading);
+        session.form.assistant_url = " http://my-mac:9999/v1 ".into();
+        session.refresh_models(&services);
+        wait_for_tasks(&mut session, |t| t.models != ModelsState::Loading);
+        assert_eq!(
+            asked.lock().unwrap().last().map(String::as_str),
+            Some("http://my-mac:9999/v1")
+        );
+        assert_eq!(
+            session
+                .tasks
+                .models
+                .connection_line(session.form.assistant_url.trim())
+                .as_deref(),
+            Some("Local AI app not reachable at http://my-mac:9999/v1")
+        );
+    }
+
+    #[test]
+    fn refreshing_lists_the_models_again() {
         let (services, _probe) = test_services();
         let mut session = SettingsSession::open(&services);
+        wait_for_tasks(&mut session, |t| t.models != ModelsState::Loading);
         session.refresh_models(&services);
         assert_eq!(session.tasks.models, ModelsState::Loading);
         wait_for_tasks(&mut session, |t| t.models != ModelsState::Loading);
@@ -413,9 +479,27 @@ mod tests {
     }
 
     #[test]
+    fn saving_a_chosen_speech_model_reaches_the_adapters() {
+        let (services, probe) = test_services();
+        let mut session = SettingsSession::open(&services);
+        session.form.speech_source = SpeechSource::LocalAiApp {
+            model: "breeze-asr-25".into(),
+        };
+        session.save(&services);
+        let applied = probe.applied_settings();
+        assert_eq!(
+            applied[0].speech_source,
+            SpeechSource::LocalAiApp {
+                model: "breeze-asr-25".into()
+            }
+        );
+    }
+
+    #[test]
     fn refreshing_twice_while_loading_starts_one_request() {
         let (services, _probe) = test_services();
         let mut session = SettingsSession::open(&services);
+        wait_for_tasks(&mut session, |t| t.models != ModelsState::Loading);
         session.tasks.models = ModelsState::Loading;
         session.refresh_models(&services);
         std::thread::sleep(Duration::from_millis(50));

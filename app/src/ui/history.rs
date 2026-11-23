@@ -1,9 +1,11 @@
 //! The History window.
 use crate::history_view::{rows, EMPTY_TEXT};
+use crate::ui::action_colour;
 use eframe::egui::{
-    self, Frame, RichText, ScrollArea, ViewportBuilder, ViewportCommand, ViewportId,
+    self, Color32, CornerRadius, Frame, Margin, RichText, ScrollArea, ViewportBuilder,
+    ViewportCommand, ViewportId,
 };
-use voice_core::History;
+use voice_core::{Action, History};
 
 pub fn id() -> ViewportId {
     ViewportId::from_hash_of("history")
@@ -44,21 +46,44 @@ fn draw(ui: &mut egui::Ui, history: &History) {
                 Frame::group(ui.style()).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
+                        chip(ui, row.action, row.chip);
                         ui.label(RichText::new(&row.time).weak().small());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Copy").clicked() {
-                                ui.ctx().copy_text(row.polished.clone());
+                                ui.ctx().copy_text(row.result.clone());
                             }
                         });
                     });
-                    ui.label(RichText::new(&row.polished).size(15.0));
-                    if row.raw_differs {
-                        ui.label(RichText::new(format!("Heard: {}", row.raw)).weak().small());
+                    if let Some(instruction) = &row.instruction {
+                        ui.label(RichText::new(instruction).weak());
+                    }
+                    if let Some(original) = &row.original {
+                        ui.label(RichText::new(original).weak().small());
+                    }
+                    ui.label(RichText::new(&row.result).size(15.0));
+                    if let Some(heard) = &row.heard {
+                        ui.label(RichText::new(format!("Heard: {heard}")).weak().small());
                     }
                 });
                 if index + 1 < rows.len() {
                     ui.add_space(4.0);
                 }
             }
+        });
+}
+
+/// A small coloured label naming the action.
+fn chip(ui: &mut egui::Ui, action: Action, text: &str) {
+    Frame::NONE
+        .fill(action_colour(action))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(8, 1))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(text)
+                    .small()
+                    .strong()
+                    .color(Color32::from_rgb(20, 20, 22)),
+            );
         });
 }

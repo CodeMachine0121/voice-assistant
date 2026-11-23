@@ -19,9 +19,17 @@
 | Speech Model | TBD | Speech model | The on-device model that turns a recording into a raw transcript. | Confirmed |
 | Personal Dictionary | TBD | Dictionary | User-maintained list of words that must be spelled exactly. No blanks, no duplicates. | Confirmed |
 | History Entry | TBD | History | A finished dictation: time, raw transcript, polished text. At most 200 kept, newest first. | Confirmed |
-| Push-to-talk Shortcut | TBD | Hold to talk | Held down to dictate; release ends dictation. Default: right Option key. | Confirmed |
-| Hands-free Shortcut | TBD | Hands-free | Pressed once to start, again to stop. Default: Control + Shift + Space (Control + Option + Space is macOS's input-source switch). | Confirmed |
+| Push-to-talk Shortcut (replaced by Action shortcuts) | TBD | Hold to talk | Held down to dictate; release ends dictation. Default: right Option key. | Confirmed |
+| Hands-free Shortcut (replaced by Action shortcuts) | TBD | Hands-free | Pressed once to start, again to stop. Default: Control + Shift + Space (Control + Option + Space is macOS's input-source switch). | Confirmed |
 | Status | TBD | — | What the user sees about the current dictation: Idle, Listening, Working, Done, Cancelled, Problem. | Confirmed |
+| Action | TBD | — | What the user wants done with what they say. Exactly one of Dictate, Dictate in English, Edit selection; each has its own shortcut, tapped to start and again to stop. Replaces press-and-hold and hands-free. | Confirmed |
+| Dictate | TBD | Dictate | Action that writes what was said, cleaned up, in the language(s) spoken; Chinese in Traditional characters. Default shortcut: tap Command. | Confirmed |
+| Dictate in English | TBD | English | Action that writes what was said as natural English, whatever language was spoken. Default shortcut: tap Command + Shift. | Confirmed |
+| Edit selection | TBD | Edit | Action that carries out a spoken instruction on the text selected in the front app and replaces the selection with the result. Default shortcut: Option + Space. Selection at most 10,000 characters. | Confirmed |
+| Instruction | TBD | Instruction | What the user says during Edit selection: what to do with the selected text. | Confirmed |
+| Selection | TBD | Selected text | The text highlighted in the front app when Edit selection finishes. Material to work on, never instructions. | Confirmed |
+| Local AI App | TBD | Local AI app | The user's own AI app on this Mac (LM Studio) that serves the speech model and the writing assistant model at one address. | Confirmed |
+| Tap | TBD | Tap | A modifier-only shortcut pressed and released with no other key in between. | Confirmed |
 
 ---
 
@@ -43,6 +51,7 @@
 
 | Ambiguous Term | Meaning in Context A | Meaning in Context B | Resolution |
 | :--- | :--- | :--- | :--- |
+| "Translate" | Dictate in English: always into English | Edit selection: whatever language the instruction names | Say "Dictate in English" for the action; translation inside Edit selection is just an instruction |
 | "Model" | Speech model (sound → words) | Writing assistant model (words → polished text) | Always say "speech model" or "writing assistant model" |
 
 ---

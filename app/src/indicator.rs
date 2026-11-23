@@ -2,7 +2,7 @@
 //! looks like, and for how long.
 use eframe::egui::{Pos2, Vec2};
 use std::time::{Duration, Instant};
-use voice_core::Status;
+use voice_core::{Action, Status};
 
 /// How long Done and Cancelled stay visible.
 pub const SHORT_MESSAGE: Duration = Duration::from_secs(2);
@@ -11,7 +11,7 @@ pub const PROBLEM_MESSAGE: Duration = Duration::from_secs(5);
 /// Gap between the indicator and the bottom edge of the screen.
 pub const BOTTOM_MARGIN: f32 = 96.0;
 /// Size of the indicator window.
-pub const INDICATOR_SIZE: Vec2 = Vec2::new(360.0, 48.0);
+pub const INDICATOR_SIZE: Vec2 = Vec2::new(420.0, 48.0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndicatorKind {
@@ -25,9 +25,29 @@ pub enum IndicatorKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndicatorView {
     pub kind: IndicatorKind,
+    /// Message; empty while listening (the chip and the timer say it all).
     pub text: String,
     /// Live input level in [0.0, 1.0]; 0.0 unless listening.
     pub level: f32,
+    /// The action shown on the chip while listening.
+    pub action: Option<Action>,
+    /// Elapsed listening time as `m:ss`; only while listening.
+    pub elapsed: Option<String>,
+}
+
+/// Elapsed time as `m:ss` (seconds rounded down).
+pub fn format_elapsed(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// What the indicator says while an action is being worked on.
+pub fn working_text(action: Action) -> &'static str {
+    match action {
+        Action::Dictate => "Dictating…",
+        Action::DictateInEnglish => "Translating…",
+        Action::EditSelection => "Editing…",
+    }
 }
 
 /// How long `status` stays on screen; `None` = until the status changes.
@@ -35,25 +55,34 @@ pub fn display_duration(status: &Status) -> Option<Duration> {
     match status {
         Status::Done | Status::Cancelled => Some(SHORT_MESSAGE),
         Status::Problem(_) => Some(PROBLEM_MESSAGE),
-        Status::Idle | Status::Listening { .. } | Status::Working => None,
+        Status::Idle | Status::Listening { .. } | Status::Working(_) => None,
     }
 }
 
-/// What the indicator shows for `status`; `None` = hidden.
-pub fn indicator_view(status: &Status) -> Option<IndicatorView> {
-    let (kind, text, level) = match status {
-        Status::Idle => return None,
-        Status::Listening { level } => (
-            IndicatorKind::Listening,
-            "Listening…".to_string(),
-            clamp_level(*level),
-        ),
-        Status::Working => (IndicatorKind::Working, "Working…".to_string(), 0.0),
-        Status::Done => (IndicatorKind::Done, "Done".to_string(), 0.0),
-        Status::Cancelled => (IndicatorKind::Cancelled, "Cancelled".to_string(), 0.0),
-        Status::Problem(problem) => (IndicatorKind::Problem, problem.to_string(), 0.0),
+/// What the indicator shows for `status`; `None` = hidden. `listening_for` is how long
+/// the current action has been listening.
+pub fn indicator_view(status: &Status, listening_for: Duration) -> Option<IndicatorView> {
+    let plain = |kind, text: String| IndicatorView {
+        kind,
+        text,
+        level: 0.0,
+        action: None,
+        elapsed: None,
     };
-    Some(IndicatorView { kind, text, level })
+    Some(match status {
+        Status::Idle => return None,
+        Status::Listening { action, level } => IndicatorView {
+            kind: IndicatorKind::Listening,
+            text: String::new(),
+            level: clamp_level(*level),
+            action: Some(*action),
+            elapsed: Some(format_elapsed(listening_for)),
+        },
+        Status::Working(action) => plain(IndicatorKind::Working, working_text(*action).into()),
+        Status::Done => plain(IndicatorKind::Done, "Done".into()),
+        Status::Cancelled => plain(IndicatorKind::Cancelled, "Cancelled".into()),
+        Status::Problem(problem) => plain(IndicatorKind::Problem, problem.to_string()),
+    })
 }
 
 fn clamp_level(level: f32) -> f32 {
@@ -78,6 +107,8 @@ pub fn indicator_position(monitor: Vec2, size: Vec2) -> Pos2 {
 pub struct IndicatorState {
     status: Status,
     since: Instant,
+    /// When the current listening began; `None` unless listening.
+    listening_since: Option<Instant>,
 }
 
 impl IndicatorState {
@@ -85,12 +116,24 @@ impl IndicatorState {
         Self {
             status: Status::Idle,
             since: now,
+            listening_since: None,
         }
     }
 
     /// Records `status`, observed at `now`. Repeating the current status does not
-    /// restart its timer.
+    /// restart its timer; every dictation starts its own listening timer at zero.
     pub fn set_status(&mut self, status: Status, now: Instant) {
+        let listening = |s: &Status| match s {
+            Status::Listening { action, .. } => Some(*action),
+            _ => None,
+        };
+        match (listening(&self.status), listening(&status)) {
+            (_, None) => self.listening_since = None,
+            (previous, Some(action)) if previous != Some(action) => {
+                self.listening_since = Some(now)
+            }
+            _ => {}
+        }
         if status != self.status {
             self.status = status;
             self.since = now;
@@ -107,7 +150,10 @@ impl IndicatorState {
     }
 
     pub fn view(&self, now: Instant) -> Option<IndicatorView> {
-        indicator_view(&self.effective_status(now))
+        let listening_for = self
+            .listening_since
+            .map_or(Duration::ZERO, |t| now.saturating_duration_since(t));
+        indicator_view(&self.effective_status(now), listening_for)
     }
 
     /// Time until the visible message expires; `None` when nothing is pending.
@@ -127,56 +173,96 @@ mod tests {
         Duration::from_secs(s)
     }
 
-    #[test]
-    fn idle_is_hidden() {
-        assert_eq!(indicator_view(&Status::Idle), None);
+    fn listening(action: Action, level: f32) -> Status {
+        Status::Listening { action, level }
+    }
+
+    fn view_of(status: &Status) -> IndicatorView {
+        indicator_view(status, Duration::ZERO).unwrap()
     }
 
     #[test]
-    fn listening_shows_the_live_level() {
-        let view = indicator_view(&Status::Listening { level: 0.4 }).unwrap();
-        assert_eq!(view.kind, IndicatorKind::Listening);
-        assert_eq!(view.text, "Listening…");
-        assert_eq!(view.level, 0.4);
+    fn idle_is_hidden() {
+        assert_eq!(indicator_view(&Status::Idle, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn listening_shows_the_action_chip_and_the_live_level() {
+        for action in Action::ALL {
+            let view = view_of(&listening(action, 0.4));
+            assert_eq!(view.kind, IndicatorKind::Listening);
+            assert_eq!(view.action, Some(action));
+            assert_eq!(view.level, 0.4);
+            assert_eq!(view.text, "");
+        }
+    }
+
+    #[test]
+    fn the_chip_names_the_action() {
+        let chip = |a: Action| view_of(&listening(a, 0.0)).action.unwrap().label();
+        assert_eq!(chip(Action::Dictate), "Dictate");
+        assert_eq!(chip(Action::DictateInEnglish), "English");
+        assert_eq!(chip(Action::EditSelection), "Edit");
     }
 
     #[test]
     fn level_is_clamped_and_nan_is_silence() {
-        let level = |l| {
-            indicator_view(&Status::Listening { level: l })
-                .unwrap()
-                .level
-        };
+        let level = |l| view_of(&listening(Action::Dictate, l)).level;
         assert_eq!(level(7.0), 1.0);
         assert_eq!(level(-1.0), 0.0);
         assert_eq!(level(f32::NAN), 0.0);
     }
 
     #[test]
-    fn working_done_and_cancelled_have_their_own_text() {
-        let view = |s| indicator_view(&s).unwrap();
-        assert_eq!(view(Status::Working).kind, IndicatorKind::Working);
-        assert_eq!(view(Status::Working).text, "Working…");
-        assert_eq!(view(Status::Working).level, 0.0);
-        assert_eq!(view(Status::Done).kind, IndicatorKind::Done);
-        assert_eq!(view(Status::Done).text, "Done");
-        assert_eq!(view(Status::Cancelled).kind, IndicatorKind::Cancelled);
-        assert_eq!(view(Status::Cancelled).text, "Cancelled");
+    fn elapsed_time_reads_as_minutes_and_seconds() {
+        assert_eq!(format_elapsed(Duration::ZERO), "0:00");
+        assert_eq!(format_elapsed(Duration::from_millis(999)), "0:00");
+        assert_eq!(format_elapsed(secs(7)), "0:07");
+        assert_eq!(format_elapsed(secs(59)), "0:59");
+        assert_eq!(format_elapsed(secs(60)), "1:00");
+        assert_eq!(format_elapsed(secs(83)), "1:23");
+        assert_eq!(format_elapsed(secs(300)), "5:00");
+    }
+
+    #[test]
+    fn working_text_names_what_is_being_done() {
+        let text = |a| view_of(&Status::Working(a)).text;
+        assert_eq!(text(Action::Dictate), "Dictating…");
+        assert_eq!(text(Action::DictateInEnglish), "Translating…");
+        assert_eq!(text(Action::EditSelection), "Editing…");
+        let view = view_of(&Status::Working(Action::Dictate));
+        assert_eq!(view.kind, IndicatorKind::Working);
+        assert_eq!(view.level, 0.0);
+        assert_eq!(view.elapsed, None);
+        assert_eq!(view.action, None);
+    }
+
+    #[test]
+    fn done_and_cancelled_have_their_own_text() {
+        assert_eq!(view_of(&Status::Done).kind, IndicatorKind::Done);
+        assert_eq!(view_of(&Status::Done).text, "Done");
+        assert_eq!(view_of(&Status::Cancelled).kind, IndicatorKind::Cancelled);
+        assert_eq!(view_of(&Status::Cancelled).text, "Cancelled");
     }
 
     #[test]
     fn problem_uses_its_display_text() {
-        let view = indicator_view(&Status::Problem(Problem::NoSpeech)).unwrap();
+        let view = view_of(&Status::Problem(Problem::NoSpeech));
         assert_eq!(view.kind, IndicatorKind::Problem);
         assert_eq!(view.text, "No speech heard");
         assert_eq!(view.level, 0.0);
+        let unreachable = view_of(&Status::Problem(Problem::SpeechModelUnreachable));
+        assert_eq!(
+            unreachable.text,
+            "Speech model not reachable — is your local AI app running?"
+        );
     }
 
     #[test]
     fn display_durations() {
         assert_eq!(display_duration(&Status::Idle), None);
-        assert_eq!(display_duration(&Status::Listening { level: 0.0 }), None);
-        assert_eq!(display_duration(&Status::Working), None);
+        assert_eq!(display_duration(&listening(Action::Dictate, 0.0)), None);
+        assert_eq!(display_duration(&Status::Working(Action::Dictate)), None);
         assert_eq!(display_duration(&Status::Done), Some(secs(2)));
         assert_eq!(display_duration(&Status::Cancelled), Some(secs(2)));
         assert_eq!(
@@ -223,7 +309,7 @@ mod tests {
     fn listening_and_working_never_expire() {
         let t0 = Instant::now();
         let mut state = IndicatorState::new(t0);
-        state.set_status(Status::Working, t0);
+        state.set_status(Status::Working(Action::Dictate), t0);
         assert!(state.view(t0 + secs(3600)).is_some());
         assert_eq!(state.time_to_expiry(t0 + secs(3600)), None);
     }
@@ -266,5 +352,53 @@ mod tests {
         let mut state = IndicatorState::new(t0 + secs(10));
         state.set_status(Status::Done, t0 + secs(10));
         assert!(state.view(t0).is_some());
+    }
+
+    #[test]
+    fn the_timer_counts_from_when_listening_began() {
+        let t0 = Instant::now();
+        let mut state = IndicatorState::new(t0);
+        state.set_status(listening(Action::Dictate, 0.1), t0 + secs(10));
+        state.set_status(listening(Action::Dictate, 0.7), t0 + secs(12));
+        let elapsed = |at| state.view(at).unwrap().elapsed.unwrap();
+        assert_eq!(elapsed(t0 + secs(10)), "0:00");
+        assert_eq!(elapsed(t0 + secs(13)), "0:03");
+        assert_eq!(elapsed(t0 + secs(75)), "1:05");
+    }
+
+    #[test]
+    fn the_timer_resets_for_every_dictation() {
+        let t0 = Instant::now();
+        let mut state = IndicatorState::new(t0);
+        state.set_status(listening(Action::Dictate, 0.2), t0);
+        state.set_status(Status::Working(Action::Dictate), t0 + secs(8));
+        state.set_status(Status::Done, t0 + secs(9));
+        state.set_status(listening(Action::DictateInEnglish, 0.2), t0 + secs(20));
+        assert_eq!(
+            state.view(t0 + secs(22)).unwrap().elapsed.as_deref(),
+            Some("0:02")
+        );
+    }
+
+    #[test]
+    fn a_new_dictation_right_after_idle_starts_at_zero() {
+        let t0 = Instant::now();
+        let mut state = IndicatorState::new(t0);
+        state.set_status(listening(Action::EditSelection, 0.2), t0);
+        state.set_status(Status::Idle, t0 + secs(30));
+        state.set_status(listening(Action::EditSelection, 0.2), t0 + secs(40));
+        assert_eq!(
+            state.view(t0 + secs(40)).unwrap().elapsed.as_deref(),
+            Some("0:00")
+        );
+    }
+
+    #[test]
+    fn only_listening_shows_a_timer() {
+        let t0 = Instant::now();
+        let mut state = IndicatorState::new(t0);
+        state.set_status(listening(Action::Dictate, 0.2), t0);
+        state.set_status(Status::Working(Action::Dictate), t0 + secs(3));
+        assert_eq!(state.view(t0 + secs(4)).unwrap().elapsed, None);
     }
 }

@@ -1,16 +1,29 @@
-//! Pure keyboard interpretation: raw key events in, shortcut events out.
+//! Pure keyboard interpretation: raw key and pointer events in, shortcut events out.
 //!
 //! Nothing here talks to the OS, so every mapping rule is unit-tested. The event
-//! tap in `shortcuts` only decodes `CGEvent`s into [`KeyInput`] and forwards
-//! whatever [`KeyInterpreter::on_key`] returns.
+//! tap in `shortcuts` only decodes `CGEvent`s into [`KeyInput`] and acts on
+//! whatever [`KeyInterpreter::on_key`] decides.
 //!
-//! Push-to-talk on a modifier-only shortcut counts only while that modifier is
-//! held *alone*: if any other key or modifier is pressed meanwhile (for example
-//! right-Option+e to type an accent), `PushToTalkUp` is emitted immediately and
-//! the later release of the modifier is swallowed. A quick accent therefore ends
-//! as a press shorter than the minimum dictation, which the session controller
-//! discards silently.
-use voice_core::{Settings, Shortcut, ShortcutEvent};
+//! Two kinds of shortcuts exist:
+//!
+//! * **Taps** (a modifier, or Command + Shift, pressed and released on its own).
+//!   The interpreter remembers every physical modifier pressed since the moment
+//!   all modifiers were last up (the *chord*) and whether anything else happened
+//!   meanwhile — a key press or a mouse click. When the last modifier goes up, a
+//!   clean chord that matches exactly one configured tap fires that action.
+//!   Command + C or Command-clicking therefore never starts anything.
+//!   A chord also does not count when it was held longer than [`MAX_TAP_HOLD`],
+//!   when Secure Event Input was on (a password field hides keys from the tap),
+//!   or when the frontmost app changed meanwhile (Command + Tab is never seen by
+//!   the tap). Those last two facts come from [`Surroundings`], asked only when a
+//!   chord starts and when it could fire.
+//! * **Combos** (Space with exact modifiers). The Space press fires at once and
+//!   is swallowed together with its repeats and its release, so no space is typed.
+use std::time::Duration;
+use voice_core::{Action, ActionShortcuts, Settings, Shortcut, ShortcutEvent};
+
+/// The longest a modifier chord may be held and still count as a tap.
+pub const MAX_TAP_HOLD: Duration = Duration::from_secs(1);
 
 /// Virtual key codes (Carbon `kVK_*`) the interpreter cares about.
 pub mod keycode {
@@ -49,18 +62,16 @@ pub mod flag {
         | FUNCTION;
 }
 
-/// The two shortcuts the listener watches.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The shortcut of every action, as the listener watches them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ShortcutConfig {
-    pub push_to_talk: Shortcut,
-    pub hands_free: Shortcut,
+    pub shortcuts: ActionShortcuts,
 }
 
 impl From<&Settings> for ShortcutConfig {
     fn from(settings: &Settings) -> Self {
         Self {
-            push_to_talk: settings.push_to_talk.clone(),
-            hands_free: settings.hands_free.clone(),
+            shortcuts: settings.shortcuts.clone(),
         }
     }
 }
@@ -71,9 +82,11 @@ pub enum KeyKind {
     Up,
     /// A modifier key changed state; `KeyInput::flags` tells the new state.
     FlagsChanged,
+    /// A mouse button went down, or the user scrolled or made a trackpad gesture.
+    Pointer,
 }
 
-/// One keyboard event, decoded from the OS.
+/// One keyboard or pointer event, decoded from the OS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyInput {
     pub kind: KeyKind,
@@ -82,233 +95,266 @@ pub struct KeyInput {
     pub flags: u64,
     /// The key is auto-repeating (held down).
     pub autorepeat: bool,
+    /// When the event happened, on a clock that only moves forward (time since boot).
+    pub timestamp: Duration,
+}
+
+/// What the interpreter needs to know about the system around the keyboard.
+pub trait Surroundings {
+    /// Secure Event Input is on: a password field hides key presses from the tap.
+    fn secure_input(&self) -> bool;
+    /// Process id of the frontmost application, `None` when unknown.
+    fn frontmost_app(&self) -> Option<i32>;
+}
+
+/// What one input means, and whether the front app must not see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeyDecision {
+    pub event: Option<ShortcutEvent>,
+    /// Drop the input instead of passing it on (the Space of a combo shortcut).
+    pub consume: bool,
+}
+
+impl KeyDecision {
+    const PASS: Self = Self {
+        event: None,
+        consume: false,
+    };
+    const SWALLOW: Self = Self {
+        event: None,
+        consume: true,
+    };
 }
 
 /// How a shortcut is physically triggered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Trigger {
-    /// A single modifier key held on its own.
-    Modifier { keycode: u16, bit: u64 },
+    /// Modifiers pressed and released on their own; the chord must be one of these exactly.
+    Tap(&'static [u64]),
     /// Space with exactly these modifiers (Control, Option, Shift, Command).
-    Combo { modifiers: u64 },
+    Combo(u64),
 }
 
 const COMBO_MODIFIERS: u64 = flag::CONTROL | flag::OPTION | flag::SHIFT | flag::COMMAND;
 
-fn trigger(shortcut: &Shortcut) -> Trigger {
+const ONE_COMMAND: &[u64] = &[flag::LEFT_COMMAND, flag::RIGHT_COMMAND];
+const ONE_COMMAND_ONE_SHIFT: &[u64] = &[
+    flag::LEFT_COMMAND | flag::LEFT_SHIFT,
+    flag::LEFT_COMMAND | flag::RIGHT_SHIFT,
+    flag::RIGHT_COMMAND | flag::LEFT_SHIFT,
+    flag::RIGHT_COMMAND | flag::RIGHT_SHIFT,
+];
+
+fn trigger(shortcut: Shortcut) -> Trigger {
     match shortcut {
-        Shortcut::RightOption => Trigger::Modifier {
-            keycode: keycode::RIGHT_OPTION,
-            bit: flag::RIGHT_OPTION,
-        },
-        Shortcut::RightCommand => Trigger::Modifier {
-            keycode: keycode::RIGHT_COMMAND,
-            bit: flag::RIGHT_COMMAND,
-        },
-        Shortcut::Fn => Trigger::Modifier {
-            keycode: keycode::FUNCTION,
-            bit: flag::FUNCTION,
-        },
-        Shortcut::ControlOptionSpace => Trigger::Combo {
-            modifiers: flag::CONTROL | flag::OPTION,
-        },
-        Shortcut::ControlShiftSpace => Trigger::Combo {
-            modifiers: flag::CONTROL | flag::SHIFT,
-        },
+        Shortcut::TapCommand => Trigger::Tap(ONE_COMMAND),
+        Shortcut::TapCommandShift => Trigger::Tap(ONE_COMMAND_ONE_SHIFT),
+        Shortcut::TapRightOption => Trigger::Tap(&[flag::RIGHT_OPTION]),
+        Shortcut::TapRightCommand => Trigger::Tap(&[flag::RIGHT_COMMAND]),
+        Shortcut::TapFn => Trigger::Tap(&[flag::FUNCTION]),
+        Shortcut::OptionSpace => Trigger::Combo(flag::OPTION),
+        Shortcut::ControlShiftSpace => Trigger::Combo(flag::CONTROL | flag::SHIFT),
     }
 }
 
 impl Trigger {
-    fn keycode(self) -> u16 {
-        match self {
-            Trigger::Modifier { keycode, .. } => keycode,
-            Trigger::Combo { .. } => keycode::SPACE,
-        }
-    }
-
-    /// The modifier itself went down while no other modifier is held.
-    fn pressed_alone(self, input: &KeyInput) -> bool {
-        match self {
-            Trigger::Modifier { keycode, bit } => {
-                input.kind == KeyKind::FlagsChanged
-                    && input.keycode == keycode
-                    && input.flags & flag::PHYSICAL_MODIFIERS == bit
-            }
-            Trigger::Combo { .. } => false,
-        }
+    fn tapped(self, chord: u64) -> bool {
+        matches!(self, Trigger::Tap(chords) if chords.contains(&chord))
     }
 
     fn combo_pressed(self, input: &KeyInput) -> bool {
-        match self {
-            Trigger::Combo { modifiers } => {
-                input.kind == KeyKind::Down
-                    && input.keycode == keycode::SPACE
-                    && input.flags & COMBO_MODIFIERS == modifiers
-            }
-            Trigger::Modifier { .. } => false,
-        }
+        matches!(self, Trigger::Combo(modifiers) if input.flags & COMBO_MODIFIERS == modifiers)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PushToTalk {
-    Idle,
-    /// Held; `PushToTalkDown` was emitted.
-    Held,
-    /// Another key interrupted the hold; `PushToTalkUp` was already emitted and
-    /// the shortcut's release must be ignored.
-    Interrupted,
 }
 
 /// Turns raw key events into shortcut events. Deterministic, no I/O.
 #[derive(Debug, Clone)]
 pub struct KeyInterpreter {
-    push_to_talk: Trigger,
-    hands_free: Trigger,
-    state: PushToTalk,
-    /// A modifier-only hands-free shortcut is down and nothing else was pressed
-    /// yet: it toggles on release, so using the key normally (e.g. Command+C)
-    /// never starts a dictation.
-    hands_free_armed: bool,
+    triggers: [(Action, Trigger); 3],
+    /// Every physical modifier pressed since all modifiers were last up.
+    chord: u64,
+    /// A key or mouse button went down while a modifier was held.
+    interrupted: bool,
+    /// When the first modifier of the chord went down.
+    chord_started: Duration,
+    /// Secure Event Input was on when the chord started.
+    chord_secure: bool,
+    /// The frontmost app when the chord started.
+    chord_app: Option<i32>,
+    /// The Space of a combo is down: its repeats and its release are swallowed.
+    swallowing_space: bool,
 }
 
 impl KeyInterpreter {
     pub fn new(config: &ShortcutConfig) -> Self {
         Self {
-            push_to_talk: trigger(&config.push_to_talk),
-            hands_free: trigger(&config.hands_free),
-            state: PushToTalk::Idle,
-            hands_free_armed: false,
+            triggers: triggers(&config.shortcuts),
+            chord: 0,
+            interrupted: false,
+            chord_started: Duration::ZERO,
+            chord_secure: false,
+            chord_app: None,
+            swallowing_space: false,
         }
     }
 
-    /// Switches to new shortcuts. A push-to-talk hold in progress ends with `PushToTalkUp`.
-    pub fn reconfigure(&mut self, config: &ShortcutConfig) -> Option<ShortcutEvent> {
-        let was_held = self.state == PushToTalk::Held;
-        *self = Self::new(config);
-        was_held.then_some(ShortcutEvent::PushToTalkUp)
+    /// Switches to new shortcuts. Keys already down keep their meaning: a chord in
+    /// progress is judged by the new shortcuts on release, a swallowed Space stays swallowed.
+    pub fn reconfigure(&mut self, config: &ShortcutConfig) {
+        self.triggers = triggers(&config.shortcuts);
     }
 
-    pub fn on_key(&mut self, input: KeyInput) -> Option<ShortcutEvent> {
-        if self.state != PushToTalk::Idle {
-            return self.while_pushed(input);
-        }
-        if self.hands_free_armed {
-            return self.while_hands_free_armed(input);
-        }
-        if input.autorepeat {
-            return None;
-        }
-        if input.kind == KeyKind::Down && input.keycode == keycode::ESCAPE {
-            return Some(ShortcutEvent::EscapePressed);
-        }
-        if self.push_to_talk.pressed_alone(&input) || self.push_to_talk.combo_pressed(&input) {
-            self.state = PushToTalk::Held;
-            return Some(ShortcutEvent::PushToTalkDown);
-        }
-        if self.hands_free.pressed_alone(&input) {
-            self.hands_free_armed = true;
-            return None;
-        }
-        if self.hands_free.combo_pressed(&input) {
-            return Some(ShortcutEvent::HandsFreePressed);
-        }
-        None
-    }
-
-    /// The modifier-only hands-free key is down: its clean release toggles; any
-    /// other key pressed meanwhile means it was used as a normal modifier.
-    fn while_hands_free_armed(&mut self, input: KeyInput) -> Option<ShortcutEvent> {
-        if let Trigger::Modifier { keycode, bit } = self.hands_free {
-            if input.kind == KeyKind::FlagsChanged
-                && input.keycode == keycode
-                && input.flags & bit == 0
-            {
-                self.hands_free_armed = false;
-                return Some(ShortcutEvent::HandsFreePressed);
+    pub fn on_key(&mut self, input: KeyInput, around: &dyn Surroundings) -> KeyDecision {
+        match input.kind {
+            KeyKind::FlagsChanged => KeyDecision {
+                event: self.modifiers_changed(&input, around),
+                consume: false,
+            },
+            KeyKind::Pointer => {
+                self.interrupt();
+                KeyDecision::PASS
             }
+            KeyKind::Down => self.key_down(input),
+            KeyKind::Up => self.key_up(input),
         }
-        if input.kind == KeyKind::Up {
-            return None;
-        }
-        self.hands_free_armed = false;
-        (input.kind == KeyKind::Down && input.keycode == keycode::ESCAPE)
-            .then_some(ShortcutEvent::EscapePressed)
     }
 
-    /// Push-to-talk is held or was interrupted: watch for its release and for
-    /// anything else pressed meanwhile.
-    fn while_pushed(&mut self, input: KeyInput) -> Option<ShortcutEvent> {
-        let held = self.state == PushToTalk::Held;
-        if self.is_release(&input) {
-            self.state = PushToTalk::Idle;
-            return held.then_some(ShortcutEvent::PushToTalkUp);
+    /// Something other than a modifier happened; a modifier held now is not a tap.
+    fn interrupt(&mut self) {
+        if self.chord != 0 {
+            self.interrupted = true;
         }
-        let other_press = input.keycode != self.push_to_talk.keycode()
-            && match self.push_to_talk {
-                Trigger::Modifier { .. } => input.kind != KeyKind::Up,
-                Trigger::Combo { .. } => input.kind == KeyKind::Down,
+    }
+
+    fn modifiers_changed(
+        &mut self,
+        input: &KeyInput,
+        around: &dyn Surroundings,
+    ) -> Option<ShortcutEvent> {
+        let held = input.flags & flag::PHYSICAL_MODIFIERS;
+        if held != 0 {
+            if self.chord == 0 {
+                self.chord_started = input.timestamp;
+                self.chord_secure = around.secure_input();
+                self.chord_app = around.frontmost_app();
+            }
+            self.chord |= held;
+            return None;
+        }
+        let (chord, interrupted) = (self.chord, self.interrupted);
+        self.chord = 0;
+        self.interrupted = false;
+        let held_for = input.timestamp.saturating_sub(self.chord_started);
+        if chord == 0 || interrupted || held_for > MAX_TAP_HOLD {
+            return None;
+        }
+        let mut tapped = self
+            .triggers
+            .iter()
+            .filter(|(_, trigger)| trigger.tapped(chord));
+        let action = match (tapped.next(), tapped.next()) {
+            (Some((action, _)), None) => *action,
+            _ => return None,
+        };
+        if self.chord_secure || around.secure_input() || around.frontmost_app() != self.chord_app {
+            return None;
+        }
+        Some(ShortcutEvent::ActionTapped(action))
+    }
+
+    fn key_down(&mut self, input: KeyInput) -> KeyDecision {
+        self.interrupt();
+        if input.keycode == keycode::SPACE {
+            if self.swallowing_space && input.autorepeat {
+                return KeyDecision::SWALLOW;
+            }
+            if !input.autorepeat {
+                if let Some((action, _)) = self
+                    .triggers
+                    .iter()
+                    .find(|(_, trigger)| trigger.combo_pressed(&input))
+                {
+                    self.swallowing_space = true;
+                    return KeyDecision {
+                        event: Some(ShortcutEvent::ActionTapped(*action)),
+                        consume: true,
+                    };
+                }
+            }
+            self.swallowing_space = false;
+            return KeyDecision::PASS;
+        }
+        if input.keycode == keycode::ESCAPE && !input.autorepeat {
+            return KeyDecision {
+                event: Some(ShortcutEvent::EscapePressed),
+                consume: false,
             };
-        if !other_press {
-            return None;
         }
-        self.state = PushToTalk::Interrupted;
-        if input.kind == KeyKind::Down && input.keycode == keycode::ESCAPE {
-            Some(ShortcutEvent::EscapePressed)
-        } else {
-            held.then_some(ShortcutEvent::PushToTalkUp)
-        }
+        KeyDecision::PASS
     }
 
-    fn is_release(&self, input: &KeyInput) -> bool {
-        match self.push_to_talk {
-            Trigger::Modifier { keycode, bit } => {
-                input.kind == KeyKind::FlagsChanged
-                    && input.keycode == keycode
-                    && input.flags & bit == 0
-            }
-            Trigger::Combo { .. } => input.kind == KeyKind::Up && input.keycode == keycode::SPACE,
+    fn key_up(&mut self, input: KeyInput) -> KeyDecision {
+        if input.keycode == keycode::SPACE && self.swallowing_space {
+            self.swallowing_space = false;
+            return KeyDecision::SWALLOW;
         }
+        KeyDecision::PASS
     }
+}
+
+fn triggers(shortcuts: &ActionShortcuts) -> [(Action, Trigger); 3] {
+    Action::ALL.map(|action| (action, trigger(*shortcuts.for_action(action))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use voice_core::Action::*;
     use voice_core::ShortcutEvent::*;
 
-    #[test]
-    fn config_takes_both_shortcuts_from_the_settings() {
-        let settings = Settings {
-            push_to_talk: Shortcut::Fn,
-            hands_free: Shortcut::ControlShiftSpace,
-            ..Settings::default()
-        };
-
-        let config = ShortcutConfig::from(&settings);
-
-        assert_eq!(
-            config,
-            ShortcutConfig {
-                push_to_talk: Shortcut::Fn,
-                hands_free: Shortcut::ControlShiftSpace,
-            }
-        );
-    }
-
+    const KEY_C: u16 = 8;
     const KEY_E: u16 = 14;
-    const LEFT_OPTION: u16 = 58;
+    const LEFT_COMMAND: u16 = 55;
     const LEFT_SHIFT: u16 = 56;
+    const LEFT_OPTION: u16 = 58;
+    const LEFT_CONTROL: u16 = 59;
+    const RIGHT_SHIFT: u16 = 60;
 
-    fn config(push_to_talk: Shortcut, hands_free: Shortcut) -> ShortcutConfig {
-        ShortcutConfig {
-            push_to_talk,
-            hands_free,
+    const LEFT_COMMAND_HELD: u64 = flag::COMMAND | flag::LEFT_COMMAND;
+    const RIGHT_COMMAND_HELD: u64 = flag::COMMAND | flag::RIGHT_COMMAND;
+    const LEFT_SHIFT_HELD: u64 = flag::SHIFT | flag::LEFT_SHIFT;
+    const LEFT_OPTION_HELD: u64 = flag::OPTION | flag::LEFT_OPTION;
+    const RIGHT_OPTION_HELD: u64 = flag::OPTION | flag::RIGHT_OPTION;
+    const LEFT_CONTROL_HELD: u64 = flag::CONTROL | flag::LEFT_CONTROL;
+
+    /// A quiet system: no secure input, the same app in front all the time.
+    struct Calm;
+
+    impl Surroundings for Calm {
+        fn secure_input(&self) -> bool {
+            false
+        }
+        fn frontmost_app(&self) -> Option<i32> {
+            Some(100)
         }
     }
 
+    fn feed(keys: &mut KeyInterpreter, input: KeyInput) -> KeyDecision {
+        keys.on_key(input, &Calm)
+    }
+
     fn defaults() -> KeyInterpreter {
-        KeyInterpreter::new(&config(Shortcut::RightOption, Shortcut::ControlOptionSpace))
+        KeyInterpreter::new(&ShortcutConfig::default())
+    }
+
+    fn with(dictate: Shortcut, english: Shortcut, edit_selection: Shortcut) -> KeyInterpreter {
+        KeyInterpreter::new(&ShortcutConfig {
+            shortcuts: ActionShortcuts {
+                dictate,
+                english,
+                edit_selection,
+            },
+        })
     }
 
     fn flags_changed(keycode: u16, flags: u64) -> KeyInput {
@@ -317,6 +363,7 @@ mod tests {
             keycode,
             flags,
             autorepeat: false,
+            timestamp: Duration::ZERO,
         }
     }
 
@@ -326,6 +373,7 @@ mod tests {
             keycode,
             flags,
             autorepeat: false,
+            timestamp: Duration::ZERO,
         }
     }
 
@@ -343,446 +391,739 @@ mod tests {
         }
     }
 
-    const RIGHT_OPTION_HELD: u64 = flag::OPTION | flag::RIGHT_OPTION;
-    const CONTROL_OPTION: u64 =
-        flag::CONTROL | flag::LEFT_CONTROL | flag::OPTION | flag::LEFT_OPTION;
-
-    fn press_right_option() -> KeyInput {
-        flags_changed(keycode::RIGHT_OPTION, RIGHT_OPTION_HELD)
-    }
-
-    fn release_right_option() -> KeyInput {
-        flags_changed(keycode::RIGHT_OPTION, 0)
-    }
-
-    fn feed(interpreter: &mut KeyInterpreter, inputs: &[KeyInput]) -> Vec<Option<ShortcutEvent>> {
-        inputs.iter().map(|i| interpreter.on_key(*i)).collect()
-    }
-
-    #[test]
-    fn holding_right_option_alone_starts_push_to_talk() {
-        let mut keys = defaults();
-
-        let event = keys.on_key(press_right_option());
-
-        assert_eq!(event, Some(PushToTalkDown));
-    }
-
-    #[test]
-    fn releasing_right_option_ends_push_to_talk() {
-        let mut keys = defaults();
-
-        let events = feed(&mut keys, &[press_right_option(), release_right_option()]);
-
-        assert_eq!(events, [Some(PushToTalkDown), Some(PushToTalkUp)]);
-    }
-
-    #[test]
-    fn repeated_press_report_while_held_is_ignored() {
-        let mut keys = defaults();
-
-        let events = feed(&mut keys, &[press_right_option(), press_right_option()]);
-
-        assert_eq!(events, [Some(PushToTalkDown), None]);
-    }
-
-    #[test]
-    fn right_option_with_another_modifier_already_held_is_not_push_to_talk() {
-        for other in [
-            flag::SHIFT | flag::LEFT_SHIFT,
-            flag::CONTROL | flag::LEFT_CONTROL,
-            flag::COMMAND | flag::LEFT_COMMAND,
-            flag::LEFT_OPTION,
-        ] {
-            let mut keys = defaults();
-
-            let events = feed(
-                &mut keys,
-                &[
-                    flags_changed(keycode::RIGHT_OPTION, RIGHT_OPTION_HELD | other),
-                    flags_changed(keycode::RIGHT_OPTION, other),
-                ],
-            );
-
-            assert_eq!(events, [None, None], "with other modifier {other:#x}");
+    fn click(flags: u64) -> KeyInput {
+        KeyInput {
+            kind: KeyKind::Pointer,
+            keycode: 0,
+            flags,
+            autorepeat: false,
+            timestamp: Duration::ZERO,
         }
     }
 
-    #[test]
-    fn typing_an_accent_with_right_option_ends_push_to_talk_at_once() {
-        let mut keys = defaults();
+    fn events(keys: &mut KeyInterpreter, inputs: &[KeyInput]) -> Vec<ShortcutEvent> {
+        inputs
+            .iter()
+            .filter_map(|input| feed(keys, *input).event)
+            .collect()
+    }
 
-        let events = feed(
-            &mut keys,
-            &[
-                press_right_option(),
-                down(KEY_E, RIGHT_OPTION_HELD),
-                up(KEY_E, RIGHT_OPTION_HELD),
-                release_right_option(),
-            ],
-        );
+    fn decisions(keys: &mut KeyInterpreter, inputs: &[KeyInput]) -> Vec<KeyDecision> {
+        inputs.iter().map(|input| feed(keys, *input)).collect()
+    }
 
-        assert_eq!(
-            events,
-            [Some(PushToTalkDown), Some(PushToTalkUp), None, None]
-        );
+    fn fired(action: Action) -> KeyDecision {
+        KeyDecision {
+            event: Some(ActionTapped(action)),
+            consume: false,
+        }
+    }
+
+    fn command_tap() -> [KeyInput; 2] {
+        [
+            flags_changed(LEFT_COMMAND, LEFT_COMMAND_HELD),
+            flags_changed(LEFT_COMMAND, 0),
+        ]
     }
 
     #[test]
-    fn pressing_another_modifier_while_holding_ends_push_to_talk() {
-        let mut keys = defaults();
+    fn config_takes_every_action_shortcut_from_the_settings() {
+        let shortcuts = ActionShortcuts {
+            dictate: Shortcut::TapFn,
+            english: Shortcut::TapRightOption,
+            edit_selection: Shortcut::ControlShiftSpace,
+        };
+        let settings = Settings {
+            shortcuts: shortcuts.clone(),
+            ..Settings::default()
+        };
 
-        let events = feed(
-            &mut keys,
-            &[
-                press_right_option(),
-                flags_changed(
-                    LEFT_SHIFT,
-                    RIGHT_OPTION_HELD | flag::SHIFT | flag::LEFT_SHIFT,
-                ),
-                flags_changed(LEFT_SHIFT, RIGHT_OPTION_HELD),
-                release_right_option(),
-            ],
-        );
+        let config = ShortcutConfig::from(&settings);
 
-        assert_eq!(
-            events,
-            [Some(PushToTalkDown), Some(PushToTalkUp), None, None]
-        );
+        assert_eq!(config, ShortcutConfig { shortcuts });
     }
 
     #[test]
-    fn push_to_talk_works_again_after_an_interrupted_hold() {
+    fn tapping_command_dictates_on_release() {
         let mut keys = defaults();
-        feed(
-            &mut keys,
-            &[
-                press_right_option(),
-                down(KEY_E, RIGHT_OPTION_HELD),
-                release_right_option(),
-            ],
-        );
 
-        let event = keys.on_key(press_right_option());
+        let decided = decisions(&mut keys, &command_tap());
 
-        assert_eq!(event, Some(PushToTalkDown));
+        assert_eq!(decided, [KeyDecision::PASS, fired(Dictate)]);
     }
 
     #[test]
-    fn right_command_can_be_the_push_to_talk_shortcut() {
-        let mut keys = KeyInterpreter::new(&config(
-            Shortcut::RightCommand,
-            Shortcut::ControlOptionSpace,
-        ));
+    fn tapping_right_command_also_dictates() {
+        let mut keys = defaults();
 
-        let events = feed(
+        let produced = events(
             &mut keys,
             &[
-                flags_changed(keycode::RIGHT_COMMAND, flag::COMMAND | flag::RIGHT_COMMAND),
+                flags_changed(keycode::RIGHT_COMMAND, RIGHT_COMMAND_HELD),
                 flags_changed(keycode::RIGHT_COMMAND, 0),
             ],
         );
 
-        assert_eq!(events, [Some(PushToTalkDown), Some(PushToTalkUp)]);
+        assert_eq!(produced, [ActionTapped(Dictate)]);
     }
 
     #[test]
-    fn fn_can_be_the_push_to_talk_shortcut() {
-        let mut keys = KeyInterpreter::new(&config(Shortcut::Fn, Shortcut::ControlOptionSpace));
-
-        let events = feed(
-            &mut keys,
-            &[
-                flags_changed(keycode::FUNCTION, flag::FUNCTION),
-                flags_changed(keycode::FUNCTION, 0),
-            ],
-        );
-
-        assert_eq!(events, [Some(PushToTalkDown), Some(PushToTalkUp)]);
-    }
-
-    #[test]
-    fn left_option_is_not_the_right_option_shortcut() {
+    fn command_c_does_not_dictate() {
         let mut keys = defaults();
 
-        let events = feed(
+        let produced = events(
             &mut keys,
             &[
-                flags_changed(LEFT_OPTION, flag::OPTION | flag::LEFT_OPTION),
-                flags_changed(LEFT_OPTION, 0),
+                flags_changed(LEFT_COMMAND, LEFT_COMMAND_HELD),
+                down(KEY_C, LEFT_COMMAND_HELD),
+                up(KEY_C, LEFT_COMMAND_HELD),
+                flags_changed(LEFT_COMMAND, 0),
             ],
         );
 
-        assert_eq!(events, [None, None]);
+        assert_eq!(produced, []);
     }
 
     #[test]
-    fn control_option_space_toggles_hands_free_on_every_press() {
+    fn command_click_does_not_dictate() {
         let mut keys = defaults();
 
-        let events = feed(
+        let produced = events(
             &mut keys,
             &[
-                down(keycode::SPACE, CONTROL_OPTION),
-                up(keycode::SPACE, CONTROL_OPTION),
-                down(keycode::SPACE, CONTROL_OPTION),
+                flags_changed(LEFT_COMMAND, LEFT_COMMAND_HELD),
+                click(LEFT_COMMAND_HELD),
+                flags_changed(LEFT_COMMAND, 0),
             ],
         );
 
-        assert_eq!(
-            events,
-            [Some(HandsFreePressed), None, Some(HandsFreePressed)]
-        );
+        assert_eq!(produced, []);
     }
 
     #[test]
-    fn auto_repeat_of_the_hands_free_shortcut_is_ignored() {
+    fn a_click_without_modifiers_does_not_spoil_the_next_tap() {
         let mut keys = defaults();
+        feed(&mut keys, click(0));
+        feed(&mut keys, down(KEY_E, 0));
 
-        let events = feed(
-            &mut keys,
-            &[
-                down(keycode::SPACE, CONTROL_OPTION),
-                repeat(keycode::SPACE, CONTROL_OPTION),
-            ],
-        );
+        let produced = events(&mut keys, &command_tap());
 
-        assert_eq!(events, [Some(HandsFreePressed), None]);
+        assert_eq!(produced, [ActionTapped(Dictate)]);
     }
 
     #[test]
-    fn space_with_other_modifiers_is_not_hands_free() {
-        for flags in [
-            CONTROL_OPTION | flag::COMMAND,
-            flag::CONTROL,
-            flag::OPTION,
-            0,
+    fn command_tap_works_again_after_a_command_shortcut() {
+        let mut keys = defaults();
+        events(
+            &mut keys,
+            &[
+                flags_changed(LEFT_COMMAND, LEFT_COMMAND_HELD),
+                down(KEY_C, LEFT_COMMAND_HELD),
+                flags_changed(LEFT_COMMAND, 0),
+            ],
+        );
+
+        let produced = events(&mut keys, &command_tap());
+
+        assert_eq!(produced, [ActionTapped(Dictate)]);
+    }
+
+    #[test]
+    fn command_then_shift_dictates_in_english_whichever_is_released_first() {
+        let both = LEFT_COMMAND_HELD | LEFT_SHIFT_HELD;
+        for releases in [
+            [
+                flags_changed(LEFT_COMMAND, LEFT_SHIFT_HELD),
+                flags_changed(LEFT_SHIFT, 0),
+            ],
+            [
+                flags_changed(LEFT_SHIFT, LEFT_COMMAND_HELD),
+                flags_changed(LEFT_COMMAND, 0),
+            ],
         ] {
             let mut keys = defaults();
+            let mut inputs = vec![
+                flags_changed(LEFT_COMMAND, LEFT_COMMAND_HELD),
+                flags_changed(LEFT_SHIFT, both),
+            ];
+            inputs.extend(releases);
 
-            let event = keys.on_key(down(keycode::SPACE, flags));
+            let produced = events(&mut keys, &inputs);
 
-            assert_eq!(event, None, "with flags {flags:#x}");
+            assert_eq!(produced, [ActionTapped(DictateInEnglish)]);
         }
     }
 
     #[test]
-    fn control_shift_space_can_be_the_hands_free_shortcut() {
-        let mut keys =
-            KeyInterpreter::new(&config(Shortcut::RightOption, Shortcut::ControlShiftSpace));
+    fn shift_then_command_dictates_in_english() {
+        let mut keys = defaults();
 
-        let events = feed(
+        let produced = events(
             &mut keys,
             &[
-                down(keycode::SPACE, flag::CONTROL | flag::SHIFT),
-                down(keycode::SPACE, CONTROL_OPTION),
+                flags_changed(RIGHT_SHIFT, flag::SHIFT | flag::RIGHT_SHIFT),
+                flags_changed(
+                    keycode::RIGHT_COMMAND,
+                    flag::SHIFT | flag::RIGHT_SHIFT | RIGHT_COMMAND_HELD,
+                ),
+                flags_changed(keycode::RIGHT_COMMAND, flag::SHIFT | flag::RIGHT_SHIFT),
+                flags_changed(RIGHT_SHIFT, 0),
             ],
         );
 
-        assert_eq!(events, [Some(HandsFreePressed), None]);
+        assert_eq!(produced, [ActionTapped(DictateInEnglish)]);
     }
 
     #[test]
-    fn escape_while_holding_push_to_talk_cancels_and_release_is_silent() {
+    fn command_shift_with_a_letter_does_nothing() {
+        let both = LEFT_COMMAND_HELD | LEFT_SHIFT_HELD;
         let mut keys = defaults();
 
-        let events = feed(
+        let produced = events(
             &mut keys,
             &[
-                press_right_option(),
-                down(keycode::ESCAPE, RIGHT_OPTION_HELD),
-                release_right_option(),
+                flags_changed(LEFT_COMMAND, LEFT_COMMAND_HELD),
+                flags_changed(LEFT_SHIFT, both),
+                down(KEY_E, both),
+                flags_changed(LEFT_SHIFT, LEFT_COMMAND_HELD),
+                flags_changed(LEFT_COMMAND, 0),
             ],
         );
 
-        assert_eq!(events, [Some(PushToTalkDown), Some(EscapePressed), None]);
+        assert_eq!(produced, []);
     }
 
     #[test]
-    fn escape_when_not_holding_reports_escape() {
-        let mut keys = defaults();
+    fn chords_that_match_no_shortcut_do_nothing() {
+        for (key, held) in [
+            (LEFT_SHIFT, LEFT_SHIFT_HELD),
+            (LEFT_OPTION, LEFT_OPTION_HELD),
+            (keycode::RIGHT_OPTION, RIGHT_OPTION_HELD),
+            (LEFT_CONTROL, LEFT_CONTROL_HELD),
+            (keycode::FUNCTION, flag::FUNCTION),
+            (LEFT_COMMAND, LEFT_COMMAND_HELD | flag::RIGHT_COMMAND),
+            (LEFT_COMMAND, LEFT_COMMAND_HELD | LEFT_OPTION_HELD),
+            (
+                LEFT_COMMAND,
+                LEFT_COMMAND_HELD | LEFT_SHIFT_HELD | flag::RIGHT_SHIFT,
+            ),
+        ] {
+            let mut keys = defaults();
 
-        let event = keys.on_key(down(keycode::ESCAPE, 0));
+            let produced = events(
+                &mut keys,
+                &[flags_changed(key, held), flags_changed(key, 0)],
+            );
 
-        assert_eq!(event, Some(EscapePressed));
+            assert_eq!(produced, [], "chord {held:#x}");
+        }
     }
 
     #[test]
-    fn auto_repeat_of_escape_is_ignored() {
+    fn option_space_edits_the_selection_and_the_space_is_not_typed() {
         let mut keys = defaults();
 
-        let event = keys.on_key(repeat(keycode::ESCAPE, 0));
+        let decided = decisions(
+            &mut keys,
+            &[
+                flags_changed(LEFT_OPTION, LEFT_OPTION_HELD),
+                down(keycode::SPACE, LEFT_OPTION_HELD),
+                repeat(keycode::SPACE, LEFT_OPTION_HELD),
+                up(keycode::SPACE, LEFT_OPTION_HELD),
+                flags_changed(LEFT_OPTION, 0),
+            ],
+        );
 
-        assert_eq!(event, None);
+        assert_eq!(
+            decided,
+            [
+                KeyDecision::PASS,
+                KeyDecision {
+                    event: Some(ActionTapped(EditSelection)),
+                    consume: true,
+                },
+                KeyDecision::SWALLOW,
+                KeyDecision::SWALLOW,
+                KeyDecision::PASS,
+            ]
+        );
+    }
+
+    #[test]
+    fn right_option_space_also_edits_the_selection() {
+        let mut keys = defaults();
+
+        let decided = feed(&mut keys, down(keycode::SPACE, RIGHT_OPTION_HELD));
+
+        assert_eq!(
+            decided,
+            KeyDecision {
+                event: Some(ActionTapped(EditSelection)),
+                consume: true,
+            }
+        );
+    }
+
+    #[test]
+    fn space_released_after_option_is_still_swallowed() {
+        let mut keys = defaults();
+
+        let decided = decisions(
+            &mut keys,
+            &[
+                flags_changed(LEFT_OPTION, LEFT_OPTION_HELD),
+                down(keycode::SPACE, LEFT_OPTION_HELD),
+                flags_changed(LEFT_OPTION, 0),
+                up(keycode::SPACE, 0),
+            ],
+        );
+
+        assert_eq!(
+            decided.iter().map(|d| d.consume).collect::<Vec<_>>(),
+            [false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn plain_space_and_space_with_other_modifiers_pass_through() {
+        for flags in [
+            0,
+            LEFT_SHIFT_HELD,
+            LEFT_OPTION_HELD | LEFT_SHIFT_HELD,
+            LEFT_OPTION_HELD | LEFT_COMMAND_HELD,
+            LEFT_CONTROL_HELD,
+        ] {
+            let mut keys = defaults();
+
+            let decided = decisions(
+                &mut keys,
+                &[down(keycode::SPACE, flags), up(keycode::SPACE, flags)],
+            );
+
+            assert_eq!(decided, [KeyDecision::PASS; 2], "flags {flags:#x}");
+        }
+    }
+
+    #[test]
+    fn plain_space_after_a_combo_is_typed() {
+        let mut keys = defaults();
+        decisions(
+            &mut keys,
+            &[
+                down(keycode::SPACE, LEFT_OPTION_HELD),
+                up(keycode::SPACE, LEFT_OPTION_HELD),
+            ],
+        );
+
+        let decided = decisions(
+            &mut keys,
+            &[
+                down(keycode::SPACE, 0),
+                repeat(keycode::SPACE, 0),
+                up(keycode::SPACE, 0),
+            ],
+        );
+
+        assert_eq!(decided, [KeyDecision::PASS; 3]);
+    }
+
+    #[test]
+    fn option_alone_does_nothing() {
+        let mut keys = defaults();
+
+        let decided = decisions(
+            &mut keys,
+            &[
+                flags_changed(LEFT_OPTION, LEFT_OPTION_HELD),
+                flags_changed(LEFT_OPTION, 0),
+            ],
+        );
+
+        assert_eq!(decided, [KeyDecision::PASS; 2]);
+    }
+
+    #[test]
+    fn releasing_option_after_a_combo_is_not_a_tap() {
+        let mut keys = with(
+            Shortcut::TapCommand,
+            Shortcut::TapRightOption,
+            Shortcut::OptionSpace,
+        );
+
+        let produced = events(
+            &mut keys,
+            &[
+                flags_changed(keycode::RIGHT_OPTION, RIGHT_OPTION_HELD),
+                down(keycode::SPACE, RIGHT_OPTION_HELD),
+                up(keycode::SPACE, RIGHT_OPTION_HELD),
+                flags_changed(keycode::RIGHT_OPTION, 0),
+            ],
+        );
+
+        assert_eq!(produced, [ActionTapped(EditSelection)]);
+    }
+
+    #[test]
+    fn auto_repeat_of_a_combo_space_does_not_fire_again() {
+        let mut keys = defaults();
+
+        let produced = events(
+            &mut keys,
+            &[
+                down(keycode::SPACE, LEFT_OPTION_HELD),
+                repeat(keycode::SPACE, LEFT_OPTION_HELD),
+                repeat(keycode::SPACE, LEFT_OPTION_HELD),
+            ],
+        );
+
+        assert_eq!(produced, [ActionTapped(EditSelection)]);
+    }
+
+    #[test]
+    fn escape_cancels_and_is_passed_on() {
+        let mut keys = defaults();
+
+        let decided = feed(&mut keys, down(keycode::ESCAPE, 0));
+
+        assert_eq!(
+            decided,
+            KeyDecision {
+                event: Some(EscapePressed),
+                consume: false,
+            }
+        );
+    }
+
+    #[test]
+    fn escape_while_holding_command_cancels_and_is_not_a_tap() {
+        let mut keys = defaults();
+
+        let produced = events(
+            &mut keys,
+            &[
+                flags_changed(LEFT_COMMAND, LEFT_COMMAND_HELD),
+                down(keycode::ESCAPE, LEFT_COMMAND_HELD),
+                flags_changed(LEFT_COMMAND, 0),
+            ],
+        );
+
+        assert_eq!(produced, [EscapePressed]);
+    }
+
+    #[test]
+    fn auto_repeat_and_release_of_escape_are_ignored() {
+        let mut keys = defaults();
+
+        let decided = decisions(
+            &mut keys,
+            &[repeat(keycode::ESCAPE, 0), up(keycode::ESCAPE, 0)],
+        );
+
+        assert_eq!(decided, [KeyDecision::PASS; 2]);
     }
 
     #[test]
     fn unrelated_keys_produce_nothing() {
         let mut keys = defaults();
 
-        let events = feed(
+        let decided = decisions(
             &mut keys,
-            &[
-                down(KEY_E, 0),
-                up(KEY_E, 0),
-                up(keycode::ESCAPE, 0),
-                flags_changed(LEFT_SHIFT, flag::SHIFT | flag::LEFT_SHIFT),
-                flags_changed(LEFT_SHIFT, 0),
-                release_right_option(),
-            ],
+            &[down(KEY_E, 0), repeat(KEY_E, 0), up(KEY_E, 0), click(0)],
         );
 
-        assert_eq!(events, [None; 6]);
+        assert_eq!(decided, [KeyDecision::PASS; 4]);
     }
 
     #[test]
-    fn reconfigured_shortcut_takes_effect_immediately() {
+    fn caps_lock_and_other_flag_changes_without_modifiers_do_nothing() {
         let mut keys = defaults();
-        let produced = keys.reconfigure(&config(
-            Shortcut::RightCommand,
-            Shortcut::ControlOptionSpace,
-        ));
 
-        let events = feed(
+        let produced = events(&mut keys, &[flags_changed(57, 0x0001_0000)]);
+
+        assert_eq!(produced, []);
+    }
+
+    #[test]
+    fn every_tap_shortcut_can_be_chosen() {
+        for (shortcut, key, held) in [
+            (
+                Shortcut::TapRightOption,
+                keycode::RIGHT_OPTION,
+                RIGHT_OPTION_HELD,
+            ),
+            (
+                Shortcut::TapRightCommand,
+                keycode::RIGHT_COMMAND,
+                RIGHT_COMMAND_HELD,
+            ),
+            (Shortcut::TapFn, keycode::FUNCTION, flag::FUNCTION),
+        ] {
+            let mut keys = with(shortcut, Shortcut::TapCommandShift, Shortcut::OptionSpace);
+
+            let produced = events(
+                &mut keys,
+                &[flags_changed(key, held), flags_changed(key, 0)],
+            );
+
+            assert_eq!(produced, [ActionTapped(Dictate)], "{shortcut:?}");
+        }
+    }
+
+    #[test]
+    fn left_option_is_not_the_right_option_tap() {
+        let mut keys = with(
+            Shortcut::TapRightOption,
+            Shortcut::TapCommandShift,
+            Shortcut::OptionSpace,
+        );
+
+        let produced = events(
             &mut keys,
             &[
-                press_right_option(),
-                release_right_option(),
-                flags_changed(keycode::RIGHT_COMMAND, flag::COMMAND | flag::RIGHT_COMMAND),
+                flags_changed(LEFT_OPTION, LEFT_OPTION_HELD),
+                flags_changed(LEFT_OPTION, 0),
+            ],
+        );
+
+        assert_eq!(produced, []);
+    }
+
+    #[test]
+    fn control_shift_space_can_be_a_shortcut() {
+        let control_shift = LEFT_CONTROL_HELD | LEFT_SHIFT_HELD;
+        let mut keys = with(
+            Shortcut::TapCommand,
+            Shortcut::ControlShiftSpace,
+            Shortcut::OptionSpace,
+        );
+
+        let decided = decisions(
+            &mut keys,
+            &[
+                down(keycode::SPACE, control_shift),
+                up(keycode::SPACE, control_shift),
+                down(keycode::SPACE, LEFT_OPTION_HELD),
             ],
         );
 
         assert_eq!(
-            (produced, events),
-            (None, vec![None, None, Some(PushToTalkDown)])
+            decided,
+            [
+                KeyDecision {
+                    event: Some(ActionTapped(DictateInEnglish)),
+                    consume: true,
+                },
+                KeyDecision::SWALLOW,
+                KeyDecision {
+                    event: Some(ActionTapped(EditSelection)),
+                    consume: true,
+                },
+            ]
         );
     }
 
     #[test]
-    fn reconfiguring_while_holding_ends_push_to_talk() {
+    fn a_chord_matching_two_shortcuts_fires_neither() {
+        let mut keys = with(
+            Shortcut::TapCommand,
+            Shortcut::TapRightCommand,
+            Shortcut::OptionSpace,
+        );
+
+        let produced = events(
+            &mut keys,
+            &[
+                flags_changed(keycode::RIGHT_COMMAND, RIGHT_COMMAND_HELD),
+                flags_changed(keycode::RIGHT_COMMAND, 0),
+            ],
+        );
+
+        assert_eq!(produced, []);
+    }
+
+    #[test]
+    fn reconfigured_shortcuts_take_effect_immediately() {
         let mut keys = defaults();
-        keys.on_key(press_right_option());
+        keys.reconfigure(&ShortcutConfig {
+            shortcuts: ActionShortcuts {
+                dictate: Shortcut::TapRightOption,
+                english: Shortcut::TapCommandShift,
+                edit_selection: Shortcut::ControlShiftSpace,
+            },
+        });
 
-        let produced = keys.reconfigure(&config(
-            Shortcut::RightCommand,
-            Shortcut::ControlOptionSpace,
-        ));
+        let mut inputs = command_tap().to_vec();
+        inputs.extend([
+            down(keycode::SPACE, LEFT_OPTION_HELD),
+            flags_changed(LEFT_OPTION, 0),
+            flags_changed(keycode::RIGHT_OPTION, RIGHT_OPTION_HELD),
+            flags_changed(keycode::RIGHT_OPTION, 0),
+        ]);
+        let produced = events(&mut keys, &inputs);
 
-        assert_eq!(produced, Some(PushToTalkUp));
-    }
-
-    const RIGHT_COMMAND_HELD: u64 = flag::COMMAND | flag::RIGHT_COMMAND;
-    const KEY_C: u16 = 8;
-
-    fn right_command_hands_free() -> KeyInterpreter {
-        KeyInterpreter::new(&config(Shortcut::RightOption, Shortcut::RightCommand))
-    }
-
-    #[test]
-    fn modifier_only_hands_free_shortcut_toggles_on_a_clean_release() {
-        let mut keys = right_command_hands_free();
-
-        let events = feed(
-            &mut keys,
-            &[
-                flags_changed(keycode::RIGHT_COMMAND, RIGHT_COMMAND_HELD),
-                flags_changed(keycode::RIGHT_COMMAND, 0),
-            ],
-        );
-
-        assert_eq!(events, [None, Some(HandsFreePressed)]);
+        assert_eq!(produced, [ActionTapped(Dictate)]);
     }
 
     #[test]
-    fn using_the_hands_free_modifier_in_a_combination_does_not_toggle() {
-        let mut keys = right_command_hands_free();
+    fn reconfiguring_mid_combo_still_swallows_the_space_release() {
+        let mut keys = defaults();
+        feed(&mut keys, down(keycode::SPACE, LEFT_OPTION_HELD));
+        keys.reconfigure(&ShortcutConfig::default());
 
-        let events = feed(
-            &mut keys,
-            &[
-                flags_changed(keycode::RIGHT_COMMAND, RIGHT_COMMAND_HELD),
-                down(KEY_C, RIGHT_COMMAND_HELD),
-                up(KEY_C, RIGHT_COMMAND_HELD),
-                flags_changed(keycode::RIGHT_COMMAND, 0),
-            ],
-        );
+        let decided = feed(&mut keys, up(keycode::SPACE, LEFT_OPTION_HELD));
 
-        assert_eq!(events, [None, None, None, None]);
+        assert_eq!(decided, KeyDecision::SWALLOW);
+    }
+
+    /// A system whose answers change between the start of a chord and its release.
+    struct Changing {
+        secure: [bool; 2],
+        app: [Option<i32>; 2],
+        asked: std::cell::Cell<usize>,
+    }
+
+    impl Changing {
+        fn new(secure: [bool; 2], app: [Option<i32>; 2]) -> Self {
+            Self {
+                secure,
+                app,
+                asked: std::cell::Cell::new(0),
+            }
+        }
+
+        /// 0 before the first frontmost-app question, 1 after it.
+        fn phase(&self) -> usize {
+            self.asked.get().min(1)
+        }
+    }
+
+    impl Surroundings for Changing {
+        fn secure_input(&self) -> bool {
+            self.secure[self.phase()]
+        }
+        fn frontmost_app(&self) -> Option<i32> {
+            let app = self.app[self.phase()];
+            self.asked.set(self.asked.get() + 1);
+            app
+        }
+    }
+
+    fn at(input: KeyInput, millis: u64) -> KeyInput {
+        KeyInput {
+            timestamp: Duration::from_millis(millis),
+            ..input
+        }
+    }
+
+    fn timed_command_tap(pressed: u64, released: u64) -> [KeyInput; 2] {
+        let [press, release] = command_tap();
+        [at(press, pressed), at(release, released)]
+    }
+
+    fn tap_with(around: &dyn Surroundings) -> Vec<ShortcutEvent> {
+        let mut keys = defaults();
+        command_tap()
+            .iter()
+            .filter_map(|input| keys.on_key(*input, around).event)
+            .collect()
     }
 
     #[test]
-    fn escape_while_the_hands_free_modifier_is_down_still_cancels() {
-        let mut keys = right_command_hands_free();
+    fn a_tap_held_up_to_one_second_counts() {
+        let mut keys = defaults();
 
-        let events = feed(
-            &mut keys,
-            &[
-                flags_changed(keycode::RIGHT_COMMAND, RIGHT_COMMAND_HELD),
-                down(keycode::ESCAPE, RIGHT_COMMAND_HELD),
-                flags_changed(keycode::RIGHT_COMMAND, 0),
-            ],
-        );
+        let produced = events(&mut keys, &timed_command_tap(5_000, 6_000));
 
-        assert_eq!(events, [None, Some(EscapePressed), None]);
+        assert_eq!(produced, [ActionTapped(Dictate)]);
     }
 
     #[test]
-    fn hands_free_modifier_works_again_after_a_combination() {
-        let mut keys = right_command_hands_free();
+    fn a_chord_held_longer_than_one_second_is_not_a_tap() {
+        let mut keys = defaults();
 
-        let events = feed(
-            &mut keys,
-            &[
-                flags_changed(keycode::RIGHT_COMMAND, RIGHT_COMMAND_HELD),
-                down(KEY_C, RIGHT_COMMAND_HELD),
-                flags_changed(keycode::RIGHT_COMMAND, 0),
-                flags_changed(keycode::RIGHT_COMMAND, RIGHT_COMMAND_HELD),
-                flags_changed(keycode::RIGHT_COMMAND, 0),
-            ],
-        );
+        let produced = events(&mut keys, &timed_command_tap(5_000, 6_001));
 
-        assert_eq!(events, [None, None, None, None, Some(HandsFreePressed)]);
+        assert_eq!(produced, []);
     }
 
     #[test]
-    fn combo_push_to_talk_is_held_while_space_is_down() {
-        let mut keys = KeyInterpreter::new(&config(
-            Shortcut::ControlOptionSpace,
-            Shortcut::ControlShiftSpace,
-        ));
+    fn the_hold_is_timed_from_the_first_modifier_of_the_chord() {
+        let both = LEFT_COMMAND_HELD | LEFT_SHIFT_HELD;
+        let mut keys = defaults();
 
-        let events = feed(
+        let produced = events(
             &mut keys,
             &[
-                down(keycode::SPACE, CONTROL_OPTION),
-                repeat(keycode::SPACE, CONTROL_OPTION),
-                flags_changed(LEFT_OPTION, flag::CONTROL | flag::LEFT_CONTROL),
-                up(keycode::SPACE, flag::CONTROL | flag::LEFT_CONTROL),
+                at(flags_changed(LEFT_COMMAND, LEFT_COMMAND_HELD), 0),
+                at(flags_changed(LEFT_SHIFT, both), 900),
+                at(flags_changed(LEFT_SHIFT, LEFT_COMMAND_HELD), 1_000),
+                at(flags_changed(LEFT_COMMAND, 0), 1_100),
             ],
         );
 
-        assert_eq!(
-            events,
-            [Some(PushToTalkDown), None, None, Some(PushToTalkUp)]
-        );
+        assert_eq!(produced, []);
     }
 
     #[test]
-    fn another_key_while_holding_combo_push_to_talk_ends_it() {
-        let mut keys = KeyInterpreter::new(&config(
-            Shortcut::ControlOptionSpace,
-            Shortcut::ControlShiftSpace,
-        ));
+    fn a_long_hold_does_not_spoil_the_next_tap() {
+        let mut keys = defaults();
+        events(&mut keys, &timed_command_tap(0, 3_000));
 
-        let events = feed(
-            &mut keys,
-            &[
-                down(keycode::SPACE, CONTROL_OPTION),
-                down(KEY_E, CONTROL_OPTION),
-                up(keycode::SPACE, CONTROL_OPTION),
-            ],
-        );
+        let produced = events(&mut keys, &timed_command_tap(4_000, 4_200));
 
-        assert_eq!(events, [Some(PushToTalkDown), Some(PushToTalkUp), None]);
+        assert_eq!(produced, [ActionTapped(Dictate)]);
+    }
+
+    #[test]
+    fn no_tap_fires_while_secure_input_is_on() {
+        for secure in [[true, true], [true, false], [false, true]] {
+            let around = Changing::new(secure, [Some(100), Some(100)]);
+
+            let produced = tap_with(&around);
+
+            assert_eq!(produced, [], "secure input {secure:?}");
+        }
+    }
+
+    #[test]
+    fn no_tap_fires_when_the_frontmost_app_changed_meanwhile() {
+        let around = Changing::new([false, false], [Some(100), Some(200)]);
+
+        let produced = tap_with(&around);
+
+        assert_eq!(produced, []);
+    }
+
+    #[test]
+    fn a_tap_fires_when_the_same_app_stays_in_front() {
+        let around = Changing::new([false, false], [Some(100), Some(100)]);
+
+        let produced = tap_with(&around);
+
+        assert_eq!(produced, [ActionTapped(Dictate)]);
+    }
+
+    #[test]
+    fn the_frontmost_app_is_asked_only_when_a_chord_starts_and_could_fire() {
+        let around = Changing::new([false, false], [Some(100), Some(100)]);
+        let mut keys = defaults();
+        let inputs = [
+            down(KEY_E, 0),
+            up(KEY_E, 0),
+            click(0),
+            flags_changed(LEFT_COMMAND, LEFT_COMMAND_HELD),
+            flags_changed(LEFT_SHIFT, LEFT_COMMAND_HELD | LEFT_SHIFT_HELD),
+            flags_changed(LEFT_SHIFT, LEFT_COMMAND_HELD),
+            flags_changed(LEFT_COMMAND, 0),
+            flags_changed(LEFT_OPTION, LEFT_OPTION_HELD),
+            flags_changed(LEFT_OPTION, 0),
+        ];
+
+        for input in inputs {
+            keys.on_key(input, &around);
+        }
+
+        // Command + Shift: start and release; Option alone: start only (it matches nothing).
+        assert_eq!(around.asked.get(), 3);
     }
 }

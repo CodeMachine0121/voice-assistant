@@ -11,3 +11,5 @@ pub const ASSISTANT_TIMEOUT: Duration = Duration::from_secs(20);
 pub const HISTORY_LIMIT: usize = 200;
 /// Sample rate every `Recording` is delivered in (what the speech model expects).
 pub const SAMPLE_RATE: u32 = 16_000;
+/// Edit selection accepts a selection of at most this many characters (inclusive).
+pub const MAX_SELECTION_CHARS: usize = 10_000;

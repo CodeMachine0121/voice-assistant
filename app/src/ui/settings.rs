@@ -1,13 +1,19 @@
 //! The Settings window.
 use crate::model::{Notice, SettingsSession};
 use crate::permissions_view::{self, Access};
-use crate::shortcut_names::{friendly_name, ALL_SHORTCUTS};
+use crate::settings_form::{
+    assistant_choices, assistant_label, speech_choices, speech_label, BUILT_IN_SPEECH,
+};
+use crate::shortcut_names::{caps_text, friendly_name, key_caps, ALL_SHORTCUTS};
+use crate::tasks::ModelsState;
+use crate::ui::{OK_COLOUR, PROBLEM_COLOUR};
 use crate::wiring::Services;
 use eframe::egui::{
-    self, Color32, ComboBox, Grid, ProgressBar, RichText, ScrollArea, TextEdit, ViewportBuilder,
-    ViewportCommand, ViewportId,
+    self, ComboBox, CornerRadius, Frame, Grid, Margin, ProgressBar, RichText, ScrollArea, TextEdit,
+    ViewportBuilder, ViewportCommand, ViewportId,
 };
 use std::time::{Duration, Instant};
+use voice_core::{Action, Shortcut};
 
 pub fn id() -> ViewportId {
     ViewportId::from_hash_of("settings")
@@ -42,12 +48,9 @@ fn draw(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             section(ui, "Shortcuts", |ui| shortcuts(ui, session));
+            section(ui, "AI models", |ui| ai_models(ui, session, services));
             section(ui, "Microphone", |ui| microphone(ui, session));
-            section(ui, "Writing assistant", |ui| {
-                assistant(ui, session, services)
-            });
             section(ui, "Dictionary", |ui| dictionary(ui, session));
-            section(ui, "Speech model", |ui| speech_model(ui, session, services));
             section(ui, "Permissions", |ui| permissions(ui, session, services));
         });
 }
@@ -62,30 +65,54 @@ fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
 }
 
 fn shortcuts(ui: &mut egui::Ui, session: &mut SettingsSession) {
-    Grid::new("shortcuts")
-        .num_columns(2)
-        .spacing([12.0, 8.0])
-        .show(ui, |ui| {
-            ui.label("Hold to talk");
-            shortcut_picker(ui, "push_to_talk", &mut session.form.push_to_talk);
-            ui.end_row();
-            ui.label("Hands-free");
-            shortcut_picker(ui, "hands_free", &mut session.form.hands_free);
-            ui.end_row();
+    for action in Action::ALL {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(action.label()).strong());
+                ui.label(RichText::new(action.description()).weak().small());
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut value = *session.form.shortcuts.for_action(action);
+                shortcut_picker(ui, action, &mut value);
+                session.form.shortcuts.set(action, value);
+            });
         });
-    if let Some(problem) = session.form.problem().filter(|p| p.contains("shortcuts")) {
-        ui.colored_label(Color32::from_rgb(255, 99, 88), problem);
+        if let Some(conflict) = session.form.shortcut_conflict(action) {
+            ui.colored_label(PROBLEM_COLOUR, conflict);
+        }
+        ui.add_space(4.0);
     }
 }
 
-fn shortcut_picker(ui: &mut egui::Ui, salt: &str, value: &mut voice_core::Shortcut) {
-    ComboBox::from_id_salt(salt)
-        .width(220.0)
-        .selected_text(friendly_name(value))
+/// A key cap: one key of a shortcut drawn as a small rounded box.
+fn key_cap(ui: &mut egui::Ui, key: &str) {
+    Frame::NONE
+        .fill(ui.visuals().widgets.inactive.bg_fill)
+        .stroke(ui.visuals().widgets.inactive.bg_stroke)
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(Margin::symmetric(5, 0))
+        .show(ui, |ui| {
+            ui.label(RichText::new(key).monospace().small());
+        });
+}
+
+fn shortcut_picker(ui: &mut egui::Ui, action: Action, value: &mut Shortcut) {
+    ComboBox::from_id_salt(("shortcut", action.label()))
+        .width(200.0)
+        .selected_text(caps_text(value))
         .show_ui(ui, |ui| {
             for shortcut in ALL_SHORTCUTS {
-                let name = friendly_name(&shortcut);
-                ui.selectable_value(value, shortcut, name);
+                ui.horizontal(|ui| {
+                    for key in key_caps(&shortcut) {
+                        key_cap(ui, key);
+                    }
+                    if ui
+                        .selectable_label(*value == shortcut, friendly_name(&shortcut))
+                        .clicked()
+                    {
+                        *value = shortcut;
+                    }
+                });
             }
         });
 }
@@ -108,52 +135,116 @@ fn microphone(ui: &mut egui::Ui, session: &mut SettingsSession) {
         });
 }
 
-fn assistant(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
-    ui.checkbox(&mut session.form.cleanup_enabled, "AI cleanup");
-    ui.add_enabled_ui(session.form.cleanup_enabled, |ui| {
-        Grid::new("assistant")
-            .num_columns(2)
-            .spacing([12.0, 8.0])
-            .show(ui, |ui| {
-                ui.label("Address");
-                ui.add(
-                    TextEdit::singleline(&mut session.form.assistant_url)
-                        .hint_text("http://localhost:1234/v1")
-                        .desired_width(300.0),
-                );
-                ui.end_row();
-                ui.label("Model");
-                ui.horizontal(|ui| {
-                    ui.add(
-                        TextEdit::singleline(&mut session.form.assistant_model)
-                            .hint_text("whatever is loaded")
-                            .desired_width(220.0),
-                    );
-                    if ui.button("Refresh").clicked() {
-                        session.refresh_models(services);
-                    }
-                });
-                ui.end_row();
-            });
-        let models = session.tasks.models.models().to_vec();
-        if !models.is_empty() {
-            ComboBox::from_id_salt("models")
-                .width(300.0)
-                .selected_text("Pick a listed model")
-                .show_ui(ui, |ui| {
-                    for model in models {
-                        ui.selectable_value(
-                            &mut session.form.assistant_model,
-                            model.clone(),
-                            model,
-                        );
-                    }
-                });
-        }
-        if let Some(message) = session.tasks.models.message() {
-            ui.label(RichText::new(message).weak().small());
+fn ai_models(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
+    ui.horizontal(|ui| {
+        ui.label("Local AI app address");
+        ui.add(
+            TextEdit::singleline(&mut session.form.assistant_url)
+                .hint_text("http://localhost:1234/v1")
+                .desired_width(260.0),
+        );
+        let checking = session.tasks.models == ModelsState::Loading;
+        if ui
+            .add_enabled(!checking, egui::Button::new("Check connection"))
+            .clicked()
+        {
+            session.refresh_models(services);
         }
     });
+    let address = session.form.assistant_url.trim().to_string();
+    if let Some(line) = session.tasks.models.connection_line(&address) {
+        let colour = match session.tasks.models {
+            ModelsState::Failed(_) => PROBLEM_COLOUR,
+            ModelsState::Loaded(_) => OK_COLOUR,
+            _ => ui.visuals().weak_text_color(),
+        };
+        ui.colored_label(colour, line);
+    }
+    if let Some(warning) = session.form.address_warning() {
+        ui.colored_label(PROBLEM_COLOUR, warning);
+    }
+    ui.add_space(8.0);
+
+    speech_row(ui, session, services);
+    ui.add_space(8.0);
+    assistant_row(ui, session, services);
+    ui.add_space(8.0);
+
+    ui.checkbox(&mut session.form.cleanup_enabled, "AI cleanup");
+    ui.label(RichText::new("Applies to Dictate only").weak().small());
+}
+
+/// Label, description and a right-aligned choice with a refresh button.
+fn model_row(
+    ui: &mut egui::Ui,
+    title: &str,
+    description: &str,
+    add_choice: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let mut refresh = false;
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(RichText::new(title).strong());
+            ui.label(RichText::new(description).weak().small());
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            refresh = ui.button("⟳").on_hover_text("Refresh").clicked();
+            add_choice(ui);
+        });
+    });
+    refresh
+}
+
+fn speech_row(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
+    let listed = session.tasks.models.models().to_vec();
+    let choices = speech_choices(&listed, &session.form.speech_source);
+    let refresh = model_row(ui, "Speech model", "turns your voice into words", |ui| {
+        ComboBox::from_id_salt("speech_model")
+            .width(220.0)
+            .selected_text(speech_label(&session.form.speech_source))
+            .show_ui(ui, |ui| {
+                for choice in choices {
+                    let label = speech_label(&choice);
+                    ui.selectable_value(&mut session.form.speech_source, choice, label);
+                }
+            });
+    });
+    if refresh {
+        session.refresh_models(services);
+    }
+    if let Some(note) = session.tasks.models.list_note() {
+        ui.label(RichText::new(note).weak().small());
+    }
+    if session.form.shows_built_in_speech_controls() {
+        built_in_speech(ui, session, services);
+    }
+}
+
+fn assistant_row(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
+    let listed = session.tasks.models.models().to_vec();
+    let choices = assistant_choices(&listed, &session.form.assistant_model);
+    let refresh = model_row(
+        ui,
+        "Writing assistant model",
+        "cleans up, translates and edits",
+        |ui| {
+            ComboBox::from_id_salt("assistant_model")
+                .width(220.0)
+                .selected_text(assistant_label(&session.form.assistant_model))
+                .show_ui(ui, |ui| {
+                    for choice in choices {
+                        let label = assistant_label(&choice);
+                        ui.selectable_value(&mut session.form.assistant_model, choice, label);
+                    }
+                });
+        },
+    );
+    if refresh {
+        session.refresh_models(services);
+    }
+    if let Some(note) = session.tasks.models.list_note() {
+        ui.label(RichText::new(note).weak().small());
+    }
 }
 
 fn dictionary(ui: &mut egui::Ui, session: &mut SettingsSession) {
@@ -194,7 +285,14 @@ fn dictionary(ui: &mut egui::Ui, session: &mut SettingsSession) {
     }
 }
 
-fn speech_model(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
+/// Where the built-in speech model lives, and downloading it.
+fn built_in_speech(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(format!("{BUILT_IN_SPEECH} model file"))
+            .weak()
+            .small(),
+    );
     let default_path = (services.default_model_path)();
     ui.add(
         TextEdit::singleline(&mut session.form.speech_model_path)
@@ -240,8 +338,8 @@ fn permissions(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Serv
                     ui.label(RichText::new(row.why).weak().small());
                 });
                 let colour = match row.access {
-                    Access::Granted => Color32::from_rgb(52, 199, 89),
-                    Access::Denied => Color32::from_rgb(255, 99, 88),
+                    Access::Granted => OK_COLOUR,
+                    Access::Denied => PROBLEM_COLOUR,
                     Access::NotAsked | Access::Unknown => ui.visuals().weak_text_color(),
                 };
                 ui.colored_label(colour, row.status_text());
@@ -262,14 +360,15 @@ fn footer(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services)
         }
         match &session.notice {
             Some(Notice::Saved) if !session.is_dirty() => {
-                ui.colored_label(Color32::from_rgb(52, 199, 89), "Saved");
+                ui.colored_label(OK_COLOUR, "Saved");
             }
             Some(Notice::Problem(message)) => {
-                ui.colored_label(Color32::from_rgb(255, 99, 88), message);
+                ui.colored_label(PROBLEM_COLOUR, message);
             }
+            // A shortcut clash is already shown under its row.
             _ => {
-                if let Some(problem) = session.form.problem() {
-                    ui.colored_label(Color32::from_rgb(255, 99, 88), problem);
+                if let Some(problem) = session.form.address_problem() {
+                    ui.colored_label(PROBLEM_COLOUR, problem);
                 }
             }
         }

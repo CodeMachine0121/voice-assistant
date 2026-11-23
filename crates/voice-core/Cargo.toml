@@ -9,6 +9,7 @@ serde.workspace = true
 chrono.workspace = true
 crossbeam-channel.workspace = true
 log.workspace = true
+zhconv = "0.4.2"
 
 [dev-dependencies]
 serde_json.workspace = true

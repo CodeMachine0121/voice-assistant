@@ -20,8 +20,16 @@ pub struct TrayAppearance {
 pub fn tray_appearance(status: &Status) -> TrayAppearance {
     let (state, title, rgb): (String, &str, [u8; 3]) = match status {
         Status::Idle => ("idle".into(), "", [140, 140, 146]),
-        Status::Listening { .. } => ("listening".into(), "Listening", [235, 64, 52]),
-        Status::Working => ("working".into(), "Working", [245, 166, 35]),
+        Status::Listening { action, .. } => (
+            format!("listening ({})", action.label()),
+            "Listening",
+            [235, 64, 52],
+        ),
+        Status::Working(action) => (
+            format!("working ({})", action.label()),
+            "Working",
+            [245, 166, 35],
+        ),
         Status::Done => ("done".into(), "Done", [52, 199, 89]),
         Status::Cancelled => ("cancelled".into(), "Cancelled", [140, 140, 146]),
         Status::Problem(problem) => (problem.to_string(), "Problem", [255, 59, 48]),
@@ -149,17 +157,24 @@ fn icon_for(appearance: &TrayAppearance) -> Result<Icon, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voice_core::Problem;
+    use voice_core::{Action, Problem};
+
+    fn listening(level: f32) -> Status {
+        Status::Listening {
+            action: Action::Dictate,
+            level,
+        }
+    }
 
     #[test]
     fn tooltip_names_the_status() {
         let tip = |s: Status| tray_appearance(&s).tooltip;
         assert_eq!(tip(Status::Idle), "Voice Assistant – idle");
+        assert_eq!(tip(listening(0.9)), "Voice Assistant – listening (Dictate)");
         assert_eq!(
-            tip(Status::Listening { level: 0.9 }),
-            "Voice Assistant – listening"
+            tip(Status::Working(Action::DictateInEnglish)),
+            "Voice Assistant – working (English)"
         );
-        assert_eq!(tip(Status::Working), "Voice Assistant – working");
         assert_eq!(tip(Status::Done), "Voice Assistant – done");
         assert_eq!(tip(Status::Cancelled), "Voice Assistant – cancelled");
     }
@@ -174,11 +189,11 @@ mod tests {
     #[test]
     fn idle_shows_no_title_and_others_do() {
         assert_eq!(tray_appearance(&Status::Idle).title, "");
+        assert_eq!(tray_appearance(&listening(0.0)).title, "Listening");
         assert_eq!(
-            tray_appearance(&Status::Listening { level: 0.0 }).title,
-            "Listening"
+            tray_appearance(&Status::Working(Action::EditSelection)).title,
+            "Working"
         );
-        assert_eq!(tray_appearance(&Status::Working).title, "Working");
         assert_eq!(tray_appearance(&Status::Done).title, "Done");
         assert_eq!(tray_appearance(&Status::Cancelled).title, "Cancelled");
     }
@@ -186,9 +201,10 @@ mod tests {
     #[test]
     fn colors_tell_statuses_apart() {
         let rgb = |s: Status| tray_appearance(&s).rgb;
-        assert_ne!(rgb(Status::Idle), rgb(Status::Listening { level: 0.0 }));
-        assert_ne!(rgb(Status::Listening { level: 0.0 }), rgb(Status::Working));
-        assert_ne!(rgb(Status::Working), rgb(Status::Done));
+        let working = || Status::Working(Action::Dictate);
+        assert_ne!(rgb(Status::Idle), rgb(listening(0.0)));
+        assert_ne!(rgb(listening(0.0)), rgb(working()));
+        assert_ne!(rgb(working()), rgb(Status::Done));
         assert_ne!(rgb(Status::Done), rgb(Status::Problem(Problem::NoSpeech)));
         assert_eq!(rgb(Status::Idle), rgb(Status::Cancelled));
     }
@@ -196,8 +212,8 @@ mod tests {
     #[test]
     fn level_does_not_change_the_appearance() {
         assert_eq!(
-            tray_appearance(&Status::Listening { level: 0.1 }),
-            tray_appearance(&Status::Listening { level: 0.9 })
+            tray_appearance(&listening(0.1)),
+            tray_appearance(&listening(0.9))
         );
     }
 
