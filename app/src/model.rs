@@ -150,6 +150,8 @@ pub struct AppModel {
     /// The History window should come to the front.
     pub history_focus: FocusRequest,
     pub quit_requested: bool,
+    /// Focus was handed back by hiding the app; its windows stay hidden until shown.
+    handed_back: bool,
 }
 
 impl AppModel {
@@ -162,6 +164,7 @@ impl AppModel {
             settings_focus: FocusRequest::default(),
             history_focus: FocusRequest::default(),
             quit_requested: false,
+            handed_back: false,
         }
     }
 
@@ -170,6 +173,12 @@ impl AppModel {
     /// such as cleanup being skipped).
     pub fn drain_statuses(&mut self, services: &Services, now: Instant) {
         for status in services.engine.status.try_iter() {
+            if self.handed_back {
+                // The indicator must be seen, but without taking focus from the
+                // app being dictated into.
+                (services.app_focus.show_without_focus)();
+                self.handed_back = false;
+            }
             if matches!(status, Status::Done | Status::Problem(_)) {
                 self.history = services.history_store.load();
             }
@@ -185,34 +194,50 @@ impl AppModel {
                 if self.settings.is_none() {
                     self.settings = Some(SettingsSession::open(services));
                 }
-                (services.bring_to_front)();
+                self.bring_to_front(services);
                 self.settings_focus.request(now);
             }
             TrayCommand::History => {
                 self.history = services.history_store.load();
                 self.history_open = true;
-                (services.bring_to_front)();
+                self.bring_to_front(services);
                 self.history_focus.request(now);
             }
             TrayCommand::Quit => self.quit_requested = true,
         }
     }
 
-    pub fn close_settings(&mut self) {
+    pub fn close_settings(&mut self, services: &Services) {
         self.settings = None;
         self.settings_focus.cancel();
+        self.hand_back_after_last_window(services);
     }
 
-    pub fn close_history(&mut self) {
+    pub fn close_history(&mut self, services: &Services) {
         self.history_open = false;
         self.history_focus.cancel();
+        self.hand_back_after_last_window(services);
+    }
+
+    fn bring_to_front(&mut self, services: &Services) {
+        (services.app_focus.bring_to_front)();
+        self.handed_back = false;
+    }
+
+    /// Once no window is left, the app the user was in gets focus back, so the next
+    /// dictation pastes there and not into this app.
+    fn hand_back_after_last_window(&mut self, services: &Services) {
+        if self.settings.is_none() && !self.history_open {
+            (services.app_focus.hand_back)();
+            self.handed_back = true;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wiring::testing::{test_services, Probe};
+    use crate::wiring::testing::{test_services, FocusMove, Probe};
     use chrono::Local;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -345,7 +370,7 @@ mod tests {
         model.handle_command(TrayCommand::History, &services, Instant::now());
         assert!(model.history_open);
         assert_eq!(model.history.entries().len(), 2);
-        model.close_history();
+        model.close_history(&services);
         assert!(!model.history_open);
     }
 
@@ -360,7 +385,7 @@ mod tests {
             model.settings.as_ref().unwrap().form.assistant_model,
             "edited"
         );
-        model.close_settings();
+        model.close_settings(&services);
         assert!(model.settings.is_none());
     }
 
@@ -415,8 +440,8 @@ mod tests {
         let mut model = AppModel::new(now);
         model.handle_command(TrayCommand::Settings, &services, now);
         model.handle_command(TrayCommand::History, &services, now);
-        model.close_settings();
-        model.close_history();
+        model.close_settings(&services);
+        model.close_history(&services);
         assert!(!model.settings_focus.poll(false, now));
         assert!(!model.history_focus.poll(false, now));
     }
@@ -427,6 +452,104 @@ mod tests {
         let mut model = AppModel::new(Instant::now());
         model.handle_command(TrayCommand::Quit, &services, Instant::now());
         assert_eq!(probe.times_brought_to_front(), 0);
+    }
+
+    #[test]
+    fn closing_settings_while_history_is_open_keeps_focus() {
+        let (services, probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+        model.handle_command(TrayCommand::Settings, &services, now);
+        model.handle_command(TrayCommand::History, &services, now);
+
+        model.close_settings(&services);
+
+        assert!(!probe.focus_moves().contains(&FocusMove::HandBack));
+    }
+
+    #[test]
+    fn closing_the_last_window_hands_focus_back() {
+        let (services, probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+        model.handle_command(TrayCommand::Settings, &services, now);
+        model.handle_command(TrayCommand::History, &services, now);
+        model.close_settings(&services);
+
+        model.close_history(&services);
+
+        assert_eq!(
+            probe.focus_moves(),
+            [
+                FocusMove::BringToFront,
+                FocusMove::BringToFront,
+                FocusMove::HandBack
+            ]
+        );
+    }
+
+    #[test]
+    fn closing_history_alone_hands_focus_back() {
+        let (services, probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+        model.handle_command(TrayCommand::History, &services, now);
+
+        model.close_history(&services);
+
+        assert_eq!(probe.focus_moves().last(), Some(&FocusMove::HandBack));
+    }
+
+    #[test]
+    fn after_handing_back_the_next_status_shows_the_app_without_focus() {
+        let (services, probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+        model.handle_command(TrayCommand::Settings, &services, now);
+        model.close_settings(&services);
+
+        publish(
+            &probe,
+            &[Status::Working(Action::Dictate), Status::Cancelled],
+        );
+        model.drain_statuses(&services, now);
+
+        assert_eq!(
+            probe.focus_moves(),
+            [
+                FocusMove::BringToFront,
+                FocusMove::HandBack,
+                FocusMove::ShowWithoutFocus
+            ],
+            "shown once, and only after handing back"
+        );
+    }
+
+    #[test]
+    fn without_handing_back_statuses_leave_focus_alone() {
+        let (services, probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+
+        publish(&probe, &[Status::Working(Action::Dictate)]);
+        model.drain_statuses(&services, now);
+
+        assert!(probe.focus_moves().is_empty());
+    }
+
+    #[test]
+    fn opening_a_window_again_after_handing_back_needs_no_extra_show() {
+        let (services, probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+        model.handle_command(TrayCommand::History, &services, now);
+        model.close_history(&services);
+        model.handle_command(TrayCommand::History, &services, now);
+
+        publish(&probe, &[Status::Working(Action::Dictate)]);
+        model.drain_statuses(&services, now);
+
+        assert!(!probe.focus_moves().contains(&FocusMove::ShowWithoutFocus));
     }
 
     #[test]

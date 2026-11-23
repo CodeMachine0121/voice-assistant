@@ -228,7 +228,7 @@ pub fn build() -> Services {
         speech_key,
         permissions: fake_permissions(),
         // The demo still shows real windows, which must come to the front too.
-        bring_to_front: Arc::new(voice_macos::activate_app),
+        app_focus: super::AppFocus::macos(),
     }
 }
 

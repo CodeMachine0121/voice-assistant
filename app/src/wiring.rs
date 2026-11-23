@@ -102,10 +102,31 @@ pub struct Services {
     pub speech_key: Arc<OpenAiKey>,
     pub permissions: Permissions,
     pub save_settings: SettingsSaveFn,
-    /// Makes the app the active app so its windows can come to the front. The app
-    /// lives in the menu bar only, and macOS does not activate such an app by itself.
-    /// Called on the UI thread.
+    pub app_focus: AppFocus,
+}
+
+/// Moves keyboard focus between this app and the app the user works in. The app
+/// lives in the menu bar only, and macOS does neither by itself. Called on the UI
+/// thread.
+#[derive(Clone)]
+pub struct AppFocus {
+    /// Makes the app the active app so its windows can come to the front.
     pub bring_to_front: Arc<dyn Fn() + Send + Sync>,
+    /// Hides the app, so the app the user was in becomes active again.
+    pub hand_back: Arc<dyn Fn() + Send + Sync>,
+    /// Lets the app show windows again after `hand_back`, without taking focus.
+    pub show_without_focus: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl AppFocus {
+    /// The real thing, through AppKit.
+    pub fn macos() -> Self {
+        Self {
+            bring_to_front: Arc::new(voice_macos::activate_app),
+            hand_back: Arc::new(voice_macos::hide_app),
+            show_without_focus: Arc::new(voice_macos::unhide_app_without_activation),
+        }
+    }
 }
 
 /// Environment variable that switches the app to demo mode.

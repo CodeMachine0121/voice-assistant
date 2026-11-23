@@ -74,7 +74,7 @@ impl eframe::App for VoiceApp {
         if let Some(session) = &mut self.model.settings {
             let focus = &mut self.model.settings_focus;
             if ui::settings::show(&ctx, session, &self.services, focus, now) {
-                self.model.close_settings();
+                self.model.close_settings(&self.services);
             }
         }
         if self.model.history_open
@@ -85,7 +85,7 @@ impl eframe::App for VoiceApp {
                 now,
             )
         {
-            self.model.close_history();
+            self.model.close_history(&self.services);
         }
     }
 
