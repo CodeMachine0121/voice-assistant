@@ -14,9 +14,7 @@ mod surroundings;
 
 pub use activation::{activate_app, return_focus, track_focus};
 pub use keychain::{KeychainSecret, KEYCHAIN_SERVICE, OPENAI_KEY_ACCOUNT};
-pub use keys::{
-    KeyDecision, KeyInput, KeyInterpreter, KeyKind, ShortcutConfig, Surroundings, MAX_TAP_HOLD,
-};
+pub use keys::{KeyDecision, KeyInput, KeyInterpreter, KeyKind, Surroundings, MAX_TAP_HOLD};
 pub use paste::PasteInserter;
 pub use permissions::{MacPermissions, PrivacyPane};
 pub use selection::ClipboardSelectionReader;

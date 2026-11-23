@@ -6,7 +6,7 @@
 //!
 //! The tap is created through the C API directly: it also listens to trackpad
 //! gesture events, whose type numbers the `core-graphics` event-type enum cannot hold.
-use crate::keys::{KeyDecision, KeyInput, KeyInterpreter, KeyKind, ShortcutConfig, Surroundings};
+use crate::keys::{KeyDecision, KeyInput, KeyInterpreter, KeyKind, Surroundings};
 use crate::surroundings::SystemSurroundings;
 use core_foundation::base::TCFType;
 use core_foundation::mach_port::{CFMachPort, CFMachPortRef};
@@ -238,12 +238,9 @@ pub struct EventTapShortcuts;
 impl EventTapShortcuts {
     /// Fails with `Problem::AccessibilityPermission` when macOS refuses the tap
     /// (Input Monitoring / Accessibility not granted).
-    pub fn start(
-        config: ShortcutConfig,
-        sink: Sender<ShortcutEvent>,
-    ) -> Result<ShortcutListener, Problem> {
+    pub fn start(sink: Sender<ShortcutEvent>) -> Result<ShortcutListener, Problem> {
         let shared = Arc::new(Shared {
-            interpreter: Mutex::new(KeyInterpreter::new(&config)),
+            interpreter: Mutex::new(KeyInterpreter::new()),
             around: Box::new(SystemSurroundings),
             sink,
             stopped: AtomicBool::new(false),
@@ -369,13 +366,6 @@ pub struct ShortcutListener {
     shared: Arc<Shared>,
     run_loop: CFRunLoop,
     thread: Option<JoinHandle<()>>,
-}
-
-impl ShortcutListener {
-    /// Switches to new shortcuts without restarting the tap.
-    pub fn update(&self, config: ShortcutConfig) {
-        self.shared.interpreter().reconfigure(&config);
-    }
 }
 
 impl Drop for ShortcutListener {
@@ -551,7 +541,7 @@ mod tests {
     fn shared_in(world: Arc<World>) -> (Shared, crossbeam_channel::Receiver<ShortcutEvent>) {
         let (sink, events) = crossbeam_channel::unbounded();
         let shared = Shared {
-            interpreter: Mutex::new(KeyInterpreter::new(&ShortcutConfig::default())),
+            interpreter: Mutex::new(KeyInterpreter::new()),
             around: Box::new(world),
             sink,
             stopped: AtomicBool::new(false),
@@ -571,9 +561,9 @@ mod tests {
     fn interpreted_key_events_reach_the_shortcut_channel() {
         let (shared, events) = shared();
 
-        shared.handle(decode(FLAGS_CHANGED, 55, 0x0010_0008, 0, at(0)));
+        shared.handle(decode(FLAGS_CHANGED, 54, 0x0010_0010, 0, at(0)));
         shared.handle(decode(5, 0, 0, 0, at(100)));
-        shared.handle(decode(FLAGS_CHANGED, 55, 0, 0, at(200)));
+        shared.handle(decode(FLAGS_CHANGED, 54, 0, 0, at(200)));
 
         assert_eq!(
             events.try_iter().collect::<Vec<_>>(),
@@ -585,9 +575,9 @@ mod tests {
     fn command_click_reaches_the_interpreter_and_cancels_the_tap() {
         let (shared, events) = shared();
 
-        shared.handle(decode(FLAGS_CHANGED, 55, 0x0010_0008, 0, at(0)));
+        shared.handle(decode(FLAGS_CHANGED, 54, 0x0010_0010, 0, at(0)));
         shared.handle(decode(LEFT_MOUSE_DOWN, 0, 0x0010_0008, 0, at(100)));
-        shared.handle(decode(FLAGS_CHANGED, 55, 0, 0, at(200)));
+        shared.handle(decode(FLAGS_CHANGED, 54, 0, 0, at(200)));
 
         assert_eq!(events.try_iter().count(), 0);
     }
@@ -596,9 +586,9 @@ mod tests {
     fn command_scroll_cancels_the_tap() {
         let (shared, events) = shared();
 
-        shared.handle(decode(FLAGS_CHANGED, 55, 0x0010_0008, 0, at(0)));
+        shared.handle(decode(FLAGS_CHANGED, 54, 0x0010_0010, 0, at(0)));
         shared.handle(decode(SCROLL_WHEEL, 0, 0x0010_0008, 0, at(100)));
-        shared.handle(decode(FLAGS_CHANGED, 55, 0, 0, at(200)));
+        shared.handle(decode(FLAGS_CHANGED, 54, 0, 0, at(200)));
 
         assert_eq!(events.try_iter().count(), 0);
     }
@@ -607,9 +597,9 @@ mod tests {
     fn command_pinch_cancels_the_tap() {
         let (shared, events) = shared();
 
-        shared.handle(decode(FLAGS_CHANGED, 55, 0x0010_0008, 0, at(0)));
+        shared.handle(decode(FLAGS_CHANGED, 54, 0x0010_0010, 0, at(0)));
         shared.handle(decode(MAGNIFY, 0, 0x0010_0008, 0, at(100)));
-        shared.handle(decode(FLAGS_CHANGED, 55, 0, 0, at(200)));
+        shared.handle(decode(FLAGS_CHANGED, 54, 0, 0, at(200)));
 
         assert_eq!(events.try_iter().count(), 0);
     }
@@ -618,8 +608,8 @@ mod tests {
     fn command_held_over_a_second_is_not_a_tap() {
         let (shared, events) = shared();
 
-        shared.handle(decode(FLAGS_CHANGED, 55, 0x0010_0008, 0, at(0)));
-        shared.handle(decode(FLAGS_CHANGED, 55, 0, 0, at(1_500)));
+        shared.handle(decode(FLAGS_CHANGED, 54, 0x0010_0010, 0, at(0)));
+        shared.handle(decode(FLAGS_CHANGED, 54, 0, 0, at(1_500)));
 
         assert_eq!(events.try_iter().count(), 0);
     }
@@ -629,10 +619,10 @@ mod tests {
         let world = Arc::new(World { app: 1.into() });
         let (shared, events) = shared_in(Arc::clone(&world));
 
-        shared.handle(decode(FLAGS_CHANGED, 55, 0x0010_0008, 0, at(0)));
+        shared.handle(decode(FLAGS_CHANGED, 54, 0x0010_0010, 0, at(0)));
         // Tab itself never reaches the session tap; only the app switch is visible.
         world.app.store(2, Ordering::SeqCst);
-        shared.handle(decode(FLAGS_CHANGED, 55, 0, 0, at(300)));
+        shared.handle(decode(FLAGS_CHANGED, 54, 0, 0, at(300)));
 
         assert_eq!(events.try_iter().count(), 0);
     }
@@ -642,10 +632,10 @@ mod tests {
         let (shared, events) = shared();
 
         let dropped = [
-            shared.handle(decode(FLAGS_CHANGED, 58, 0x0008_0020, 0, at(0))),
-            shared.handle(decode(KEY_DOWN, 49, 0x0008_0020, 0, at(10))),
-            shared.handle(decode(KEY_UP, 49, 0x0008_0020, 0, at(20))),
-            shared.handle(decode(FLAGS_CHANGED, 58, 0, 0, at(30))),
+            shared.handle(decode(FLAGS_CHANGED, 61, 0x0008_0040, 0, at(0))),
+            shared.handle(decode(KEY_DOWN, 49, 0x0008_0040, 0, at(10))),
+            shared.handle(decode(KEY_UP, 49, 0x0008_0040, 0, at(20))),
+            shared.handle(decode(FLAGS_CHANGED, 61, 0, 0, at(30))),
             shared.handle(decode(KEY_DOWN, 53, 0, 0, T)),
             shared.handle(decode(5, 0, 0, 0, at(100))),
         ];
@@ -660,18 +650,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn left_command_left_shift_and_left_option_never_fire() {
+        let (shared, events) = shared();
+
+        // Left Command alone (keycode 55, flags Command + left-Command bit).
+        shared.handle(decode(FLAGS_CHANGED, 55, 0x0010_0008, 0, at(0)));
+        shared.handle(decode(FLAGS_CHANGED, 55, 0, 0, at(100)));
+        // Left Command + left Shift.
+        shared.handle(decode(FLAGS_CHANGED, 55, 0x0010_0008, 0, at(200)));
+        shared.handle(decode(FLAGS_CHANGED, 56, 0x0012_000a, 0, at(250)));
+        shared.handle(decode(FLAGS_CHANGED, 56, 0x0010_0008, 0, at(300)));
+        shared.handle(decode(FLAGS_CHANGED, 55, 0, 0, at(350)));
+        // Left Option + Space: typed as usual.
+        let space = [
+            shared.handle(decode(FLAGS_CHANGED, 58, 0x0008_0020, 0, at(400))),
+            shared.handle(decode(KEY_DOWN, 49, 0x0008_0020, 0, at(410))),
+            shared.handle(decode(KEY_UP, 49, 0x0008_0020, 0, at(420))),
+            shared.handle(decode(FLAGS_CHANGED, 58, 0, 0, at(430))),
+        ];
+
+        assert_eq!(events.try_iter().count(), 0);
+        assert_eq!(space, [false; 4], "nothing is dropped");
+    }
+
+    #[test]
+    fn right_command_becoming_right_command_shift_fires_english_only() {
+        let (shared, events) = shared();
+
+        shared.handle(decode(FLAGS_CHANGED, 54, 0x0010_0010, 0, at(0)));
+        shared.handle(decode(FLAGS_CHANGED, 60, 0x0012_0014, 0, at(80)));
+        shared.handle(decode(FLAGS_CHANGED, 60, 0x0010_0010, 0, at(160)));
+        shared.handle(decode(FLAGS_CHANGED, 54, 0, 0, at(240)));
+
+        assert_eq!(
+            events.try_iter().collect::<Vec<_>>(),
+            [ShortcutEvent::ActionTapped(Action::DictateInEnglish)]
+        );
+    }
+
     /// Talks to the real window server: whether the tap may be created depends on
     /// the Input Monitoring permission of the process running the tests.
     #[test]
     fn starting_either_listens_or_reports_missing_permission() {
         let (sink, events) = crossbeam_channel::unbounded();
-        let config = ShortcutConfig::default();
-
-        let started = EventTapShortcuts::start(config.clone(), sink);
+        let started = EventTapShortcuts::start(sink);
 
         match started {
             Ok(listener) => {
-                listener.update(config);
                 drop(listener);
                 assert!(events.try_recv().is_err());
             }
