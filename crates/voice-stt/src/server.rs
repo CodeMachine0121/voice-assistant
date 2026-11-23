@@ -1,11 +1,10 @@
 //! `Transcriber` backed by a speech model served by the local AI app through the
 //! OpenAI-compatible `/audio/transcriptions` endpoint.
+use crate::multipart::Multipart;
 use crate::text::{clean_transcript, initial_prompt};
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
+use crate::wav::wav;
 use std::io::Read;
 use std::time::Duration;
-use voice_core::rules::SAMPLE_RATE;
 use voice_core::{PersonalDictionary, Recording, TranscribeError, Transcriber};
 
 /// How long one transcription may take before the server counts as unreachable.
@@ -93,201 +92,14 @@ fn request_error(e: ureq::Error) -> TranscribeError {
     }
 }
 
-/// Encodes mono samples in [-1.0, 1.0] as a 16-bit PCM WAV file at `SAMPLE_RATE`.
-fn wav(samples: &[f32]) -> Vec<u8> {
-    const CHANNELS: u16 = 1;
-    const BITS: u16 = 16;
-    let block_align = CHANNELS * BITS / 8;
-    let data_len = (samples.len() * usize::from(block_align)) as u32;
-    let mut out = Vec::with_capacity(44 + data_len as usize);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(36 + data_len).to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-    out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    out.extend_from_slice(&CHANNELS.to_le_bytes());
-    out.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
-    out.extend_from_slice(&(SAMPLE_RATE * u32::from(block_align)).to_le_bytes());
-    out.extend_from_slice(&block_align.to_le_bytes());
-    out.extend_from_slice(&BITS.to_le_bytes());
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&data_len.to_le_bytes());
-    for sample in samples {
-        let value = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
-        out.extend_from_slice(&value.to_le_bytes());
-    }
-    out
-}
-
-/// A `multipart/form-data` body built by hand (the HTTP client has no helper for it).
-struct Multipart {
-    boundary: String,
-    body: Vec<u8>,
-}
-
-impl Multipart {
-    /// The boundary carries 128 random bits, so it practically never occurs in the audio.
-    fn new() -> Self {
-        let random = || RandomState::new().build_hasher().finish();
-        Self {
-            boundary: format!("----voice-assistant-{:016x}{:016x}", random(), random()),
-            body: Vec::new(),
-        }
-    }
-
-    fn content_type(&self) -> String {
-        format!("multipart/form-data; boundary={}", self.boundary)
-    }
-
-    fn text(&mut self, name: &str, value: &str) {
-        self.part(
-            &format!("Content-Disposition: form-data; name=\"{name}\""),
-            value.as_bytes(),
-        );
-    }
-
-    fn file(&mut self, name: &str, filename: &str, content_type: &str, data: &[u8]) {
-        self.part(
-            &format!(
-                "Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n\
-                 Content-Type: {content_type}"
-            ),
-            data,
-        );
-    }
-
-    fn part(&mut self, headers: &str, data: &[u8]) {
-        self.body
-            .extend_from_slice(format!("--{}\r\n{headers}\r\n\r\n", self.boundary).as_bytes());
-        self.body.extend_from_slice(data);
-        self.body.extend_from_slice(b"\r\n");
-    }
-
-    fn finish(mut self) -> Vec<u8> {
-        self.body
-            .extend_from_slice(format!("--{}--\r\n", self.boundary).as_bytes());
-        self.body
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fake_server::*;
     use std::io::Cursor;
-    use std::net::TcpListener;
-    use std::sync::{Arc, Mutex};
-    use std::thread;
-    use tiny_http::{Response, Server};
-
-    /// One request as the fake server saw it.
-    #[derive(Debug, Clone)]
-    struct Seen {
-        path: String,
-        content_type: String,
-        body: Vec<u8>,
-    }
-
-    struct Fake {
-        base: String,
-        seen: Arc<Mutex<Vec<Seen>>>,
-    }
-
-    fn serve(status: u16, body: &'static str, delay: Duration) -> Fake {
-        let server = Server::http("127.0.0.1:0").expect("bind test server");
-        let base = format!(
-            "http://127.0.0.1:{}/v1",
-            server.server_addr().to_ip().expect("ip").port()
-        );
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let log = seen.clone();
-        thread::spawn(move || {
-            for mut req in server.incoming_requests() {
-                let mut received = Vec::new();
-                let _ = req.as_reader().read_to_end(&mut received);
-                let content_type = req
-                    .headers()
-                    .iter()
-                    .find(|h| h.field.equiv("Content-Type"))
-                    .map(|h| h.value.to_string())
-                    .unwrap_or_default();
-                log.lock().expect("lock").push(Seen {
-                    path: req.url().to_string(),
-                    content_type,
-                    body: received,
-                });
-                thread::sleep(delay);
-                let _ = req.respond(Response::from_string(body).with_status_code(status));
-            }
-        });
-        Fake { base, seen }
-    }
-
-    fn first(fake: &Fake) -> Seen {
-        fake.seen.lock().expect("lock")[0].clone()
-    }
-
-    /// Splits a multipart body into (headers, content) per part.
-    fn parts(seen: &Seen) -> Vec<(String, Vec<u8>)> {
-        let boundary = seen
-            .content_type
-            .split("boundary=")
-            .nth(1)
-            .expect("boundary in content type");
-        let delimiter = format!("--{boundary}");
-        let mut out = Vec::new();
-        let body = &seen.body;
-        let starts: Vec<usize> = body
-            .windows(delimiter.len())
-            .enumerate()
-            .filter(|(_, w)| *w == delimiter.as_bytes())
-            .map(|(i, _)| i)
-            .collect();
-        for pair in starts.windows(2) {
-            let chunk = &body[pair[0] + delimiter.len() + 2..pair[1] - 2];
-            let split = chunk
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .expect("part headers end");
-            out.push((
-                String::from_utf8_lossy(&chunk[..split]).to_string(),
-                chunk[split + 4..].to_vec(),
-            ));
-        }
-        let last = *starts.last().expect("closing boundary");
-        assert_eq!(&body[last + delimiter.len()..], b"--\r\n");
-        out
-    }
-
-    fn field(seen: &Seen, name: &str) -> Option<Vec<u8>> {
-        parts(seen)
-            .into_iter()
-            .find(|(headers, _)| headers.contains(&format!("name=\"{name}\"")))
-            .map(|(_, content)| content)
-    }
-
-    fn text_field(seen: &Seen, name: &str) -> Option<String> {
-        field(seen, name).map(|c| String::from_utf8(c).expect("utf8 field"))
-    }
 
     fn transcriber(fake: &Fake) -> ServerTranscriber {
         ServerTranscriber::new(fake.base.clone(), "breeze-asr-25".into())
-    }
-
-    fn half_second() -> Recording {
-        Recording::new(vec![0.25; 8_000])
-    }
-
-    fn no_dict() -> PersonalDictionary {
-        PersonalDictionary::default()
-    }
-
-    fn unused_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0")
-            .expect("bind")
-            .local_addr()
-            .expect("addr")
-            .port()
     }
 
     #[test]
@@ -456,10 +268,5 @@ mod tests {
     fn transcriber_is_shareable_between_threads() {
         fn assert_port<T: Transcriber>() {}
         assert_port::<ServerTranscriber>();
-    }
-
-    #[test]
-    fn boundaries_differ_between_requests() {
-        assert_ne!(Multipart::new().boundary, Multipart::new().boundary);
     }
 }
