@@ -4,8 +4,7 @@ use crate::script::to_traditional;
 use crate::speech::contains_speech;
 use crate::{
     Action, History, HistoryEntry, HistoryStore, PersonalDictionary, PolishError, Polisher,
-    PreparedAction, Problem, Recording, Settings, SpeechProvider, Status, TextInserter,
-    TranscribeError, Transcriber, WritingTask,
+    PreparedAction, Problem, Recording, Settings, Status, TextInserter, Transcriber, WritingTask,
 };
 use chrono::Local;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -77,10 +76,10 @@ impl DictationPipeline {
             Ok(transcript) => to_traditional(transcript.trim()),
             Err(error) => {
                 log::warn!("speech not turned into words: {error}");
-                return Outcome::problem_without_entry(speech_problem(
-                    error,
-                    settings.speech.provider,
-                ));
+                return Outcome::problem_without_entry(Problem::Speech {
+                    provider: settings.speech.provider,
+                    failure: (&error).into(),
+                });
             }
         };
         if heard.is_empty() {
@@ -162,17 +161,6 @@ impl DictationPipeline {
     }
 }
 
-/// What the user is told when the speech provider could not turn a recording into words.
-fn speech_problem(error: TranscribeError, provider: SpeechProvider) -> Problem {
-    match error {
-        TranscribeError::Unreachable(_) => Problem::SpeechUnreachable(provider),
-        TranscribeError::KeyMissing => Problem::SpeechKeyMissing(provider),
-        TranscribeError::KeyRejected => Problem::SpeechKeyRejected(provider),
-        TranscribeError::LimitReached => Problem::SpeechLimitReached(provider),
-        TranscribeError::Failed(_) => Problem::SpeechNotTranscribed(provider),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +168,7 @@ mod tests {
         silence, speech, FakeInserter, FakePolisher, FakeStore, FakeTranscriber, Task,
     };
     use crate::rules::HISTORY_LIMIT;
+    use crate::{SpeechFailure, TranscribeError};
     use chrono::TimeZone;
 
     struct Rig {
@@ -616,31 +605,34 @@ mod tests {
 
     /// Every way the speech provider can fail, with the message the user must see.
     fn speech_failures() -> [(TranscribeError, Problem, &'static str); 5] {
-        let openai = SpeechProvider::OpenAi;
+        let openai = |failure| Problem::Speech {
+            provider: crate::SpeechProvider::OpenAi,
+            failure,
+        };
         [
             (
                 TranscribeError::KeyMissing,
-                Problem::SpeechKeyMissing(openai),
+                openai(SpeechFailure::KeyMissing),
                 "OpenAI key missing — add it in Settings › AI models",
             ),
             (
                 TranscribeError::KeyRejected,
-                Problem::SpeechKeyRejected(openai),
+                openai(SpeechFailure::KeyRejected),
                 "OpenAI rejected the key — check it in Settings › AI models",
             ),
             (
                 TranscribeError::LimitReached,
-                Problem::SpeechLimitReached(openai),
+                openai(SpeechFailure::LimitReached),
                 "OpenAI limit reached — try again later or check your OpenAI account",
             ),
             (
                 TranscribeError::Unreachable("connection refused".into()),
-                Problem::SpeechUnreachable(openai),
+                openai(SpeechFailure::Unreachable),
                 "OpenAI not reachable — check your internet connection",
             ),
             (
                 TranscribeError::Failed("unknown model".into()),
-                Problem::SpeechNotTranscribed(openai),
+                openai(SpeechFailure::NotTranscribed),
                 "OpenAI couldn't turn the recording into words",
             ),
         ]

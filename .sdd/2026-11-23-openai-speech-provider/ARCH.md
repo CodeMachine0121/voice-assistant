@@ -20,7 +20,7 @@
 | :--- | :--- | :--- |
 | `voice-core` settings | **Modify (public API)** | Remove `SpeechSource` and `Settings::speech_model_path`/`speech_source`; add `SpeechProvider`, `SpeechSettings`, `Settings::speech`. Old JSON keeps loading because `Settings` is `#[serde(default)]` without `deny_unknown_fields`: the old keys are ignored and `speech` takes its default (OpenAI, `gpt-4o-transcribe`). |
 | `voice-core` ports | **Modify (public API)** | `TranscribeError` gains `KeyMissing`, `KeyRejected`, `LimitReached`; `Unreachable`/`Failed` keep their meaning. `Transcriber` trait signature unchanged. |
-| `voice-core` status/pipeline | **Modify (public API)** | `Problem::SpeechModelUnreachable` replaced by provider-tagged speech problems (below); pipeline maps every `TranscribeError` to one of them (`Failed` no longer leaks its raw reason to the user — it is logged instead). |
+| `voice-core` status/pipeline | **Modify (public API)** | `Problem::SpeechModelUnreachable` replaced by one `Problem::Speech { provider, failure: SpeechFailure }` (below); pipeline turns every `TranscribeError` into a `SpeechFailure` via `From` (`Failed` no longer leaks its raw reason to the user — it is logged instead). |
 | `voice-stt` | **Rewrite** | Add `OpenAiTranscriber`, `OpenAiKey`, `SecretStore`, `MemorySecretStore`, `KeyStatus`. Remove `WhisperTranscriber`, `whisper` module, `model` (download/default path), `ServerTranscriber`; keep `text` (prompt + transcript cleaning). Drop `whisper-rs` and `dirs` dependencies. WAV + multipart encoding move into private modules reused by the new adapter. |
 | `voice-macos` | **Add** | `KeychainSecret` — generic-password item (service `VoiceAssistant`, account `openai-api-key`) via `security-framework`. |
 | `app` wiring | **Modify** | `SpeechModelSwitch`/`BuiltInSpeech` replaced by `SpeechProviderSwitch` (builds the provider's transcriber from `SpeechSettings` on start and on save). `Services` loses `default_model_path`/`download_model`, gains `speech_key: Arc<OpenAiKey>`. Real wiring: `OpenAiKey(KeychainSecret, env OPENAI_API_KEY)`; demo/test wiring: `MemorySecretStore`. |
@@ -59,13 +59,17 @@ pub enum TranscribeError {
 }
 
 // voice-core::status — replaces Problem::SpeechModelUnreachable
-pub enum Problem { /* … */
-    SpeechUnreachable(SpeechProvider),   // "OpenAI not reachable — check your internet connection"
-    SpeechKeyMissing(SpeechProvider),    // "OpenAI key missing — add it in Settings › AI models"
-    SpeechKeyRejected(SpeechProvider),   // "OpenAI rejected the key — check it in Settings › AI models"
-    SpeechLimitReached(SpeechProvider),  // "OpenAI limit reached — try again later or check your OpenAI account"
-    SpeechNotTranscribed(SpeechProvider),// "OpenAI couldn't turn the recording into words"
+pub enum Problem { /* … */ Speech { provider: SpeechProvider, failure: SpeechFailure } }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeechFailure {
+    Unreachable,    // "OpenAI not reachable — check your internet connection"
+    KeyMissing,     // "OpenAI key missing — add it in Settings › AI models"
+    KeyRejected,    // "OpenAI rejected the key — check it in Settings › AI models"
+    LimitReached,   // "OpenAI limit reached — try again later or check your OpenAI account"
+    NotTranscribed, // "OpenAI couldn't turn the recording into words"
 }
+impl From<&TranscribeError> for SpeechFailure { /* one arm per TranscribeError variant */ }
+// The messages are written once, in SpeechFailure, naming provider.label().
 ```
 
 ---
@@ -92,8 +96,8 @@ pub enum Problem { /* … */
 | Component | Current role | Change needed |
 | :--- | :--- | :--- |
 | `voice_core::Settings` | Shortcuts, mic, assistant, dictionary, speech source + model path | Replace the two speech fields with `speech: SpeechSettings` |
-| `voice_core::DictationPipeline::process` | Maps `Unreachable`→`SpeechModelUnreachable`, `Failed(r)`→`Other(r)` | Map each `TranscribeError` to the provider-tagged `Problem` (provider from `settings.speech.provider`); log reasons with `warn!` |
-| `voice_core::Problem` | User-facing messages | New speech variants + messages; `SpeechModelUnreachable` removed |
+| `voice_core::DictationPipeline::process` | Maps `Unreachable`→`SpeechModelUnreachable`, `Failed(r)`→`Other(r)` | `Problem::Speech { provider: settings.speech.provider, failure: (&error).into() }`; log reasons with `warn!` |
+| `voice_core::Problem` | User-facing messages | One `Speech { provider, failure }` variant; messages live in `SpeechFailure`; `SpeechModelUnreachable` removed |
 | `app::wiring::real::build` | Whisper loader + LM Studio speech factory | `OpenAiKey(KeychainSecret, OPENAI_API_KEY)` + `SpeechProviderSwitch` factory |
 | `app::wiring::{Services, fakes, testing}` | Model path/download fns | `speech_key: Arc<OpenAiKey>` with `MemorySecretStore` in demo/tests |
 | `app::settings_form::SettingsForm` | `speech_source`, `speech_model_path` | `speech`, `new_key`; `speech_model_choices(provider, current)`; key field counts toward dirty |
@@ -126,7 +130,7 @@ flowchart TD
 
 - **Most likely next requirement:** a second speech provider (e.g. Azure, Groq, a self-hosted OpenAI-compatible server) or a new OpenAI speech model.
 - **Where it lands:** `SpeechProvider` (label, models, default) + the factory closure in `app::wiring::real::build` + a new adapter type in `voice-stt`. A new OpenAI model is one string in `SpeechProvider::models`.
-- **How to add it:** add the enum variant and its arms in the three `SpeechProvider` methods (compiler-enforced), add `XxxTranscriber: Transcriber` returning the same `TranscribeError` variants, add the factory arm. The UI iterates `SpeechProvider::ALL` / `models()`, problems carry the provider so messages name it automatically. A provider needing its own key gets its own `OpenAiKey`-style instance (the type is generic over `SecretStore` + env var name).
+- **How to add it:** add the enum variant and its arms in the three `SpeechProvider` methods (compiler-enforced), add `XxxTranscriber: Transcriber` returning the same `TranscribeError` variants, add the factory arm. The UI iterates `SpeechProvider::ALL` / `models()`; `Problem::Speech` carries the provider, so `SpeechFailure`'s messages name it automatically, and a new kind of failure is one `SpeechFailure` variant plus its `From` arm. A provider needing its own key gets its own `OpenAiKey`-style instance (the type is generic over `SecretStore` + env var name).
 - **Patterns applied & why:** Adapter (provider HTTP behind `Transcriber`), Strategy via factory (provider switch), deep module (`OpenAiKey` hides precedence, trimming, storage errors and secrecy behind `current/status/save/remove`).
 - **Do not hardcode:** base URL (overridable for tests and future compatible servers), timeout, model id (from settings), env var name, Keychain service/account (constants in one place).
 - **Known debt / deferred:** no "test key" button; `OpenAiKey` is OpenAI-specific by name; the per-call Keychain read is cheap but could be cached if it ever prompts the user too often (revisit if users report repeated Keychain prompts).
@@ -156,14 +160,14 @@ flowchart TD
 | US-03 The key saved in Settings wins | `OpenAiKey::current` precedence |
 | US-03 Removing the saved key | `SettingsSession::remove_key` → `OpenAiKey::remove` |
 | US-03 Leaving the key field empty keeps the saved key | `OpenAiKey::save` blank no-op; `SettingsSession::save` skips blank |
-| US-03 No key anywhere | `OpenAiTranscriber` → `KeyMissing` → `Problem::SpeechKeyMissing` |
-| US-04 Rejected key | 401 → `KeyRejected` → `Problem::SpeechKeyRejected` |
-| US-04 Too many requests or no credit left | 429 → `LimitReached` → `Problem::SpeechLimitReached` |
-| US-04 No internet | transport error → `Unreachable` → `Problem::SpeechUnreachable` |
+| US-03 No key anywhere | `OpenAiTranscriber` → `KeyMissing` → `SpeechFailure::KeyMissing` |
+| US-04 Rejected key | 401 → `KeyRejected` → `SpeechFailure::KeyRejected` |
+| US-04 Too many requests or no credit left | 429 → `LimitReached` → `SpeechFailure::LimitReached` |
+| US-04 No internet | transport error → `Unreachable` → `SpeechFailure::Unreachable` |
 | US-04 A slow answer within one minute is accepted | `OpenAiTranscriber` timeout = 60 s |
-| US-04 No answer within one minute | timeout → `Unreachable` → `Problem::SpeechUnreachable` |
-| US-04 OpenAI is having trouble | 5xx → `Unreachable` → `Problem::SpeechUnreachable` |
-| US-04 OpenAI refuses the recording for another reason | other 4xx / bad JSON → `Failed` → `Problem::SpeechNotTranscribed` |
+| US-04 No answer within one minute | timeout → `Unreachable` → `SpeechFailure::Unreachable` |
+| US-04 OpenAI is having trouble | 5xx → `Unreachable` → `SpeechFailure::Unreachable` |
+| US-04 OpenAI refuses the recording for another reason | other 4xx / bad JSON → `Failed` → `SpeechFailure::NotTranscribed` |
 | US-05 The built-in speech choice moves to OpenAI | `Settings` serde default (unknown keys ignored) |
 | US-05 A local AI app speech model moves to OpenAI | same |
 | US-05 No speech choice saved | `SpeechSettings::default` |
