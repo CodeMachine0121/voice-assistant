@@ -254,6 +254,39 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_or_removed_key_is_used_from_the_next_recording_on() {
+        let fake = serve(200, r#"{"text":"hi"}"#, Duration::ZERO);
+        let store = Arc::new(MemorySecretStore::holding("sk-first"));
+        let key = Arc::new(OpenAiKey::with_environment(store, || {
+            Some("sk-env".to_string())
+        }));
+        let t = OpenAiTranscriber::new("gpt-4o-transcribe".into(), key.clone())
+            .with_base_url(&fake.base);
+
+        t.transcribe(&half_second(), &no_dict()).expect("first");
+        key.save("sk-second").unwrap();
+        t.transcribe(&half_second(), &no_dict()).expect("second");
+        key.remove().unwrap();
+        t.transcribe(&half_second(), &no_dict()).expect("third");
+
+        let sent: Vec<_> = fake
+            .seen
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|s| s.authorization.clone())
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                Some("Bearer sk-first".to_string()),
+                Some("Bearer sk-second".to_string()),
+                Some("Bearer sk-env".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn a_rejected_key_is_reported_as_such() {
         let fake = serve(
             401,

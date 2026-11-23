@@ -449,6 +449,35 @@ mod tests {
     }
 
     #[test]
+    fn the_settings_window_no_longer_offers_a_built_in_speech_model() {
+        let (services, _probe) = test_services();
+        let mut session = SettingsSession::open(&services);
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(560.0, 4_000.0),
+            )),
+            ..Default::default()
+        };
+
+        let mut output = ctx.run_ui(input, |ui| draw(ui, &mut session, &services));
+        output.textures_delta.clear();
+        let mut drawn = Vec::new();
+        for clipped in &output.shapes {
+            texts(&clipped.shape, &mut drawn);
+        }
+
+        // The whole window was drawn, from the speech rows down to the permissions.
+        for expected in ["OpenAI", "Writing assistant model", "Permissions", "Save"] {
+            assert!(drawn.iter().any(|t| t == expected), "{expected}: {drawn:?}");
+        }
+        for gone in ["Built-in", "Download", "model file", "default location"] {
+            assert!(!drawn.iter().any(|t| t.contains(gone)), "{gone}: {drawn:?}");
+        }
+    }
+
+    #[test]
     fn drawing_frames_does_not_read_the_key_store_again() {
         let (services, probe) = test_services();
         let mut session = SettingsSession::open(&services);
