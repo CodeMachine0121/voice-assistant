@@ -8,9 +8,8 @@
 //!
 //! AppKit may only be used from the main thread (where the UI runs). Called from
 //! any other thread these functions do nothing and log a warning.
-use objc2::{sel, MainThreadMarker};
+use objc2::MainThreadMarker;
 use objc2_app_kit::NSApplication;
-use objc2_foundation::NSObjectProtocol;
 
 fn shared_app(purpose: &str) -> Option<objc2::rc::Retained<NSApplication>> {
     match MainThreadMarker::new() {
@@ -22,17 +21,15 @@ fn shared_app(purpose: &str) -> Option<objc2::rc::Retained<NSApplication>> {
     }
 }
 
-/// Makes this app the active app, so its windows can come to the front.
+/// Makes this app the active app, even while another app is active, so its windows
+/// can come to the front.
 pub fn activate_app() {
     if let Some(app) = shared_app("bring the app to the front") {
-        if app.respondsToSelector(sel!(activate)) {
-            // macOS 14 and later.
-            app.activate();
-        } else {
-            // macOS 13 has no `activate` yet.
-            #[allow(deprecated)]
-            app.activateIgnoringOtherApps(true);
-        }
+        // The cooperative `activate` of macOS 14+ may be ignored here: the menu
+        // command is handled on a later frame, outside the click that asked for it.
+        // `activateIgnoringOtherApps` still works on every supported version.
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
     }
 }
 

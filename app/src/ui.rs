@@ -9,10 +9,30 @@ use eframe::egui::{self, Color32, ViewportCommand};
 use std::time::Instant;
 use voice_core::Action;
 
+/// Inside a window's viewport, once per frame: keeps asking for focus, unless the
+/// window is closing (asking then would bring it forward once more).
+pub fn follow_focus(ctx: &egui::Context, closing: bool, focus: &mut FocusRequest, now: Instant) {
+    if closing {
+        focus.cancel();
+    } else {
+        keep_focusing(ctx, focus, now);
+    }
+}
+
 /// Inside a window's viewport: asks for keyboard focus while `focus` is pending.
+/// A window minimized to the Dock is restored first; macOS cannot focus it otherwise.
 pub fn keep_focusing(ctx: &egui::Context, focus: &mut FocusRequest, now: Instant) {
-    let focused = ctx.input(|i| i.viewport().focused == Some(true));
+    let (focused, minimized) = ctx.input(|i| {
+        let viewport = i.viewport();
+        (
+            viewport.focused == Some(true),
+            viewport.minimized == Some(true),
+        )
+    });
     if focus.poll(focused, now) {
+        if minimized {
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+        }
         ctx.send_viewport_cmd(ViewportCommand::Focus);
         // Look again next frame: a new window is only shown after its first frame.
         ctx.request_repaint();
@@ -41,15 +61,24 @@ mod tests {
     /// Runs one frame of a window that has (or lacks) keyboard focus and returns the
     /// commands it sent to its own viewport.
     fn frame(focused: bool, focus: &mut FocusRequest, now: Instant) -> Vec<ViewportCommand> {
-        let ctx = egui::Context::default();
-        let mut input = RawInput::default();
-        input.viewports.insert(
-            ViewportId::ROOT,
+        frame_of(
             ViewportInfo {
                 focused: Some(focused),
                 ..Default::default()
             },
-        );
+            focus,
+            now,
+        )
+    }
+
+    fn frame_of(
+        info: ViewportInfo,
+        focus: &mut FocusRequest,
+        now: Instant,
+    ) -> Vec<ViewportCommand> {
+        let ctx = egui::Context::default();
+        let mut input = RawInput::default();
+        input.viewports.insert(ViewportId::ROOT, info);
         let mut output = ctx.run_ui(input, |ui| keep_focusing(ui.ctx(), focus, now));
         output.textures_delta.clear();
         output
@@ -57,6 +86,10 @@ mod tests {
             .remove(&ViewportId::ROOT)
             .map(|v| v.commands)
             .unwrap_or_default()
+            .into_iter()
+            // egui adds its own theme command; only window commands matter here.
+            .filter(|c| matches!(c, ViewportCommand::Focus | ViewportCommand::Minimized(_)))
+            .collect()
     }
 
     #[test]
@@ -68,12 +101,80 @@ mod tests {
     }
 
     #[test]
+    fn a_minimized_window_is_restored_before_it_is_focused() {
+        let now = Instant::now();
+        let mut focus = FocusRequest::default();
+        focus.request(now);
+        let info = ViewportInfo {
+            focused: Some(false),
+            minimized: Some(true),
+            ..Default::default()
+        };
+
+        let commands = frame_of(info, &mut focus, now);
+
+        assert_eq!(
+            commands,
+            [ViewportCommand::Minimized(false), ViewportCommand::Focus]
+        );
+    }
+
+    #[test]
+    fn a_window_that_is_not_minimized_is_only_focused() {
+        let now = Instant::now();
+        let mut focus = FocusRequest::default();
+        focus.request(now);
+        assert_eq!(frame(false, &mut focus, now), [ViewportCommand::Focus]);
+    }
+
+    #[test]
     fn a_focused_window_is_left_alone() {
         let now = Instant::now();
         let mut focus = FocusRequest::default();
         focus.request(now);
         assert!(!frame(true, &mut focus, now).contains(&ViewportCommand::Focus));
         assert!(!frame(false, &mut focus, now).contains(&ViewportCommand::Focus));
+    }
+
+    #[test]
+    fn a_closing_window_is_not_focused_and_stops_asking() {
+        let now = Instant::now();
+        let mut focus = FocusRequest::default();
+        focus.request(now);
+        let ctx = egui::Context::default();
+
+        let mut output = ctx.run_ui(RawInput::default(), |ui| {
+            follow_focus(ui.ctx(), true, &mut focus, now)
+        });
+        output.textures_delta.clear();
+
+        let commands = output
+            .viewport_output
+            .remove(&ViewportId::ROOT)
+            .map(|v| v.commands)
+            .unwrap_or_default();
+        assert!(!commands.contains(&ViewportCommand::Focus));
+        assert!(!focus.poll(false, now), "the request was cancelled");
+    }
+
+    #[test]
+    fn an_open_window_keeps_asking_for_focus() {
+        let now = Instant::now();
+        let mut focus = FocusRequest::default();
+        focus.request(now);
+        let ctx = egui::Context::default();
+
+        let mut output = ctx.run_ui(RawInput::default(), |ui| {
+            follow_focus(ui.ctx(), false, &mut focus, now)
+        });
+        output.textures_delta.clear();
+
+        let commands = output
+            .viewport_output
+            .remove(&ViewportId::ROOT)
+            .map(|v| v.commands)
+            .unwrap_or_default();
+        assert!(commands.contains(&ViewportCommand::Focus));
     }
 
     #[test]

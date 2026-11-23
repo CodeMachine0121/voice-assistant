@@ -9,7 +9,7 @@ use crate::settings_form::{
 };
 use crate::shortcut_names::{caps_text, friendly_name, key_caps, ALL_SHORTCUTS};
 use crate::tasks::ModelsState;
-use crate::ui::{keep_focusing, OK_COLOUR, PROBLEM_COLOUR};
+use crate::ui::{follow_focus, OK_COLOUR, PROBLEM_COLOUR};
 use crate::wiring::Services;
 use eframe::egui::{
     self, ComboBox, CornerRadius, Frame, Grid, Margin, RichText, ScrollArea, TextEdit,
@@ -40,7 +40,7 @@ pub fn show(
         if ui.ctx().input(|i| i.viewport().close_requested()) {
             closed = true;
         }
-        keep_focusing(ui.ctx(), focus, now);
+        follow_focus(ui.ctx(), closed, focus, now);
         session.drain_tasks();
         egui::CentralPanel::default().show(ui, |ui| draw(ui, session, services));
         // Permission status changes outside the app; look again now and then.

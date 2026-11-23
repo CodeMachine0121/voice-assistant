@@ -1,7 +1,7 @@
 //! The History window.
 use crate::focus::FocusRequest;
 use crate::history_view::{rows, EMPTY_TEXT};
-use crate::ui::{action_colour, keep_focusing};
+use crate::ui::{action_colour, follow_focus};
 use eframe::egui::{
     self, Color32, CornerRadius, Frame, Margin, RichText, ScrollArea, ViewportBuilder, ViewportId,
 };
@@ -28,7 +28,7 @@ pub fn show(
         if ui.ctx().input(|i| i.viewport().close_requested()) {
             closed = true;
         }
-        keep_focusing(ui.ctx(), focus, now);
+        follow_focus(ui.ctx(), closed, focus, now);
         egui::CentralPanel::default().show(ui, |ui| draw(ui, history));
     });
     closed
