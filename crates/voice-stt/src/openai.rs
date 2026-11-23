@@ -11,8 +11,24 @@ use voice_core::{PersonalDictionary, Recording, TranscribeError, Transcriber};
 
 /// Where OpenAI's API lives.
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-/// How long one transcription may take before OpenAI counts as unreachable.
-pub const OPENAI_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long each phase of one transcription request may take before OpenAI counts as
+/// unreachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenAiTimeouts {
+    /// Reaching OpenAI (connection and TLS).
+    pub connect: Duration,
+    /// Uploading the recording; a 5-minute recording is about 10 MB.
+    pub send_body: Duration,
+    /// OpenAI's answer, counted from the moment the recording has been sent.
+    pub answer: Duration,
+}
+
+/// Defaults: 10 s to connect, 2 minutes to upload, then 1 minute for OpenAI to answer.
+pub const OPENAI_TIMEOUTS: OpenAiTimeouts = OpenAiTimeouts {
+    connect: Duration::from_secs(10),
+    send_body: Duration::from_secs(120),
+    answer: Duration::from_secs(60),
+};
 
 /// Speech recognition by an OpenAI speech model.
 #[derive(Debug, Clone)]
@@ -20,7 +36,7 @@ pub struct OpenAiTranscriber {
     base_url: String,
     model: String,
     key: Arc<OpenAiKey>,
-    timeout: Duration,
+    timeouts: OpenAiTimeouts,
 }
 
 impl OpenAiTranscriber {
@@ -31,7 +47,7 @@ impl OpenAiTranscriber {
             base_url: OPENAI_BASE_URL.to_string(),
             model,
             key,
-            timeout: OPENAI_TIMEOUT,
+            timeouts: OPENAI_TIMEOUTS,
         }
     }
 
@@ -41,9 +57,9 @@ impl OpenAiTranscriber {
         self
     }
 
-    /// Overrides the overall request timeout (default [`OPENAI_TIMEOUT`]).
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+    /// Overrides the time limits (default [`OPENAI_TIMEOUTS`]).
+    pub fn with_timeouts(mut self, timeouts: OpenAiTimeouts) -> Self {
+        self.timeouts = timeouts;
         self
     }
 
@@ -72,7 +88,10 @@ impl Transcriber for OpenAiTranscriber {
         let key = self.key.current().ok_or(TranscribeError::KeyMissing)?;
         let form = self.form(recording, dictionary);
         let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(self.timeout))
+            .timeout_connect(Some(self.timeouts.connect))
+            .timeout_send_body(Some(self.timeouts.send_body))
+            .timeout_recv_response(Some(self.timeouts.answer))
+            .timeout_recv_body(Some(self.timeouts.answer))
             .build()
             .into();
         let mut response = agent
@@ -287,12 +306,21 @@ mod tests {
         }
     }
 
+    /// Generous limits for connecting and uploading, and `answer` for the answer.
+    fn answer_within(answer: Duration) -> OpenAiTimeouts {
+        OpenAiTimeouts {
+            connect: Duration::from_secs(5),
+            send_body: Duration::from_secs(5),
+            answer,
+        }
+    }
+
     #[test]
     fn an_answer_within_the_time_limit_is_accepted() {
         let fake = serve(200, r#"{"text":"我們開會"}"#, Duration::from_millis(100));
 
         let out = transcriber(&fake)
-            .with_timeout(Duration::from_millis(1_000))
+            .with_timeouts(answer_within(Duration::from_millis(1_000)))
             .transcribe(&half_second(), &no_dict());
 
         assert_eq!(out, Ok("我們開會".to_string()));
@@ -304,7 +332,7 @@ mod tests {
         let started = std::time::Instant::now();
 
         let out = transcriber(&fake)
-            .with_timeout(Duration::from_millis(200))
+            .with_timeouts(answer_within(Duration::from_millis(200)))
             .transcribe(&half_second(), &no_dict());
 
         assert!(
@@ -315,10 +343,54 @@ mod tests {
     }
 
     #[test]
-    fn the_time_limit_is_one_minute_and_the_address_is_openai() {
+    fn a_slow_upload_does_not_count_against_the_answer_time() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        // Two minutes of audio are ~3.8 MB: far more than socket buffers hold, so the
+        // upload lasts as long as the server takes to read it (~2.4 s here), then it
+        // answers at once.
+        let two_minutes = Recording::new(vec![0.1; 16_000 * 120]);
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut chunk = vec![0u8; 64 * 1024];
+                let mut received = Vec::new();
+                while !received.ends_with(b"--\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => received.extend_from_slice(&chunk[..n]),
+                    }
+                    std::thread::sleep(Duration::from_millis(40));
+                }
+                let body = r#"{"text":"long talk"}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let started = std::time::Instant::now();
+
+        let out = OpenAiTranscriber::new("m".into(), key("sk-test"))
+            .with_base_url(&format!("http://127.0.0.1:{port}/v1"))
+            .with_timeouts(answer_within(Duration::from_millis(1_500)))
+            .transcribe(&two_minutes, &no_dict());
+
+        assert_eq!(out, Ok("long talk".to_string()));
+        assert!(
+            started.elapsed() > Duration::from_millis(1_500),
+            "the upload must outlast the answer limit for this test to mean anything"
+        );
+    }
+
+    #[test]
+    fn openai_gets_one_minute_to_answer_after_the_upload_and_lives_at_its_address() {
         let t = OpenAiTranscriber::new("m".into(), key("sk-test"));
 
-        assert_eq!(t.timeout, Duration::from_secs(60));
+        assert_eq!(t.timeouts.answer, Duration::from_secs(60));
+        assert_eq!(t.timeouts.send_body, Duration::from_secs(120));
+        assert_eq!(t.timeouts.connect, Duration::from_secs(10));
         assert_eq!(t.base_url, "https://api.openai.com/v1");
     }
 

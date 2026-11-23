@@ -13,4 +13,4 @@ pub mod text;
 mod wav;
 
 pub use key::{KeyStatus, MemorySecretStore, OpenAiKey, SecretStore, OPENAI_KEY_VARIABLE};
-pub use openai::{OpenAiTranscriber, OPENAI_BASE_URL, OPENAI_TIMEOUT};
+pub use openai::{OpenAiTimeouts, OpenAiTranscriber, OPENAI_BASE_URL, OPENAI_TIMEOUTS};
