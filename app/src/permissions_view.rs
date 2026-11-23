@@ -63,7 +63,7 @@ pub fn rows(permissions: &Permissions) -> Vec<PermissionRow> {
         },
         PermissionRow {
             name: "Accessibility",
-            why: "to type the text into other apps",
+            why: "to catch your shortcuts, read the selected text and type into other apps",
             access: granted((permissions.accessibility_granted)()),
             pane: PrivacyPane::Accessibility,
         },

@@ -34,6 +34,17 @@ impl Shortcut {
         Shortcut::TapFn,
         Shortcut::ControlShiftSpace,
     ];
+
+    /// Whether one key press can trigger both shortcuts. Tapping the right Command key
+    /// is also a tap of "a Command key", so those two collide like equal shortcuts.
+    pub fn collides_with(self, other: Shortcut) -> bool {
+        use Shortcut::{TapCommand, TapRightCommand};
+        self == other
+            || matches!(
+                (self, other),
+                (TapCommand, TapRightCommand) | (TapRightCommand, TapCommand)
+            )
+    }
 }
 
 /// The shortcut of each action. No two actions may share one (see `conflict`).
@@ -72,13 +83,16 @@ impl ActionShortcuts {
         }
     }
 
-    /// The first two actions sharing a shortcut, as `(earlier, later)` in `Action::ALL`
-    /// order; `None` when every action has its own.
+    /// The first two actions whose shortcuts collide (see `Shortcut::collides_with`), as
+    /// `(earlier, later)` in `Action::ALL` order; `None` when every action has its own.
     pub fn conflict(&self) -> Option<(Action, Action)> {
         Action::ALL.iter().enumerate().find_map(|(i, &earlier)| {
             Action::ALL[i + 1..]
                 .iter()
-                .find(|&&later| self.for_action(earlier) == self.for_action(later))
+                .find(|&&later| {
+                    self.for_action(earlier)
+                        .collides_with(*self.for_action(later))
+                })
                 .map(|&later| (earlier, later))
         })
     }
@@ -198,6 +212,35 @@ mod tests {
             shortcuts.conflict(),
             Some((Action::Dictate, Action::EditSelection))
         );
+    }
+
+    #[test]
+    fn tapping_any_command_collides_with_tapping_the_right_command() {
+        let mut shortcuts = ActionShortcuts::default();
+        shortcuts.set(Action::EditSelection, Shortcut::TapRightCommand);
+
+        assert_eq!(
+            shortcuts.conflict(),
+            Some((Action::Dictate, Action::EditSelection))
+        );
+    }
+
+    #[test]
+    fn distinct_shortcuts_do_not_collide() {
+        for a in Shortcut::ALL {
+            for b in Shortcut::ALL {
+                let overlapping_command = matches!(
+                    (a, b),
+                    (Shortcut::TapCommand, Shortcut::TapRightCommand)
+                        | (Shortcut::TapRightCommand, Shortcut::TapCommand)
+                );
+                assert_eq!(
+                    a.collides_with(b),
+                    a == b || overlapping_command,
+                    "{a:?} {b:?}"
+                );
+            }
+        }
     }
 
     #[test]
