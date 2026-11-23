@@ -119,8 +119,9 @@ pub fn build_services() -> Services {
 
 /// The one way settings change: keep the new key, persist the settings, then hand them
 /// to the engine and to the adapters that depend on them (`apply`). The key goes first;
-/// when it cannot be kept nothing else is saved, and when the settings cannot be kept
-/// the key is put back the way it was, so a change is never half applied.
+/// when it cannot be kept nothing else is saved. When the settings cannot be persisted,
+/// or the engine cannot take them, the settings on disk and the key are put back the way
+/// they were, so a change is never half applied.
 fn settings_saver(
     store: Arc<dyn SettingsStore>,
     key: Arc<OpenAiKey>,
@@ -132,10 +133,14 @@ fn settings_saver(
             Some(new_key) => key.replace(new_key).map_err(SaveError::Key)?,
             None => PreviousKey::Unchanged,
         };
+        let before = store.load();
         let kept = store.save(&change.settings).and_then(|()| {
-            engine
-                .send(change.settings.clone())
-                .map_err(|_| "The dictation engine is not running.".to_string())
+            engine.send(change.settings.clone()).map_err(|_| {
+                if let Err(undo) = store.save(&before) {
+                    log::warn!("cannot put the previous settings back: {undo}");
+                }
+                "The dictation engine is not running.".to_string()
+            })
         });
         if let Err(e) = kept {
             if let Err(undo) = previous.restore(&key) {
@@ -250,15 +255,20 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_engine_is_reported_and_the_key_is_put_back() {
+    fn a_stopped_engine_is_reported_and_the_settings_and_key_are_put_back() {
         let store: Arc<dyn SettingsStore> = Arc::new(fakes::InMemorySettings::default());
+        let earlier = Settings {
+            cleanup_enabled: false,
+            ..Settings::default()
+        };
+        store.save(&earlier).unwrap();
         let secrets = Arc::new(voice_stt::MemorySecretStore::holding("sk-old"));
         let key = Arc::new(OpenAiKey::with_environment(secrets.clone(), || None));
         let (tx, rx) = crossbeam_channel::unbounded();
         drop(rx);
         let applied = Arc::new(std::sync::Mutex::new(0));
         let count = applied.clone();
-        let save = settings_saver(store, key, tx, move |_| *count.lock().unwrap() += 1);
+        let save = settings_saver(store.clone(), key, tx, move |_| *count.lock().unwrap() += 1);
 
         let err = save(&change(Some("sk-new"))).unwrap_err();
 
@@ -267,6 +277,7 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(*applied.lock().unwrap(), 0);
+        assert_eq!(store.load(), earlier, "the settings on disk are put back");
         use voice_stt::SecretStore;
         assert_eq!(secrets.read().unwrap().as_deref(), Some("sk-old"));
     }
