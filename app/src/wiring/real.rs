@@ -29,17 +29,28 @@ type TranscriberFactory = dyn Fn(&SpeechSettings) -> Arc<dyn Transcriber> + Send
 pub struct SpeechProviderSwitch {
     factory: Box<TranscriberFactory>,
     chosen: Swappable<dyn Transcriber>,
+    /// What `chosen` was built for.
+    built_for: Mutex<SpeechSettings>,
 }
 
 impl SpeechProviderSwitch {
     pub fn new(settings: &SpeechSettings, factory: Box<TranscriberFactory>) -> Self {
         let chosen = Swappable::new(factory(settings));
-        Self { factory, chosen }
+        Self {
+            factory,
+            chosen,
+            built_for: Mutex::new(settings.clone()),
+        }
     }
 
     /// Uses the provider and speech model of `settings` from the next dictation on.
+    /// Unchanged speech settings keep the transcriber, and with it its open connection.
     pub fn apply(&self, settings: &SpeechSettings) {
-        self.chosen.replace((self.factory)(settings));
+        let mut built_for = lock(&self.built_for);
+        if *built_for != *settings {
+            self.chosen.replace((self.factory)(settings));
+            *built_for = settings.clone();
+        }
     }
 }
 
@@ -375,6 +386,27 @@ mod tests {
         s.apply(&speech("gpt-4o-mini-transcribe"));
 
         assert_eq!(heard(&s).unwrap(), "gpt-4o-mini-transcribe");
+    }
+
+    #[test]
+    fn saving_unchanged_speech_settings_keeps_the_transcriber() {
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = builds.clone();
+        let s = SpeechProviderSwitch::new(
+            &SpeechSettings::default(),
+            Box::new(move |_| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Arc::new(Echo("heard")) as Arc<dyn Transcriber>
+            }),
+        );
+
+        s.apply(&SpeechSettings::default());
+        s.apply(&SpeechSettings::default());
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        s.apply(&speech("whisper-1"));
+        s.apply(&speech("whisper-1"));
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
