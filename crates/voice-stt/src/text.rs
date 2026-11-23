@@ -11,9 +11,10 @@ pub fn initial_prompt(dictionary: &PersonalDictionary) -> Option<String> {
     }
 }
 
-/// Joins the model's segments into the transcript, dropping segments that only describe
-/// non-speech — `[BLANK_AUDIO]`, `(music)`, `*applause*`, `♪ ... ♪` — or hold nothing.
-/// Silence therefore comes out as an empty string.
+/// Joins the model's segments into the transcript, dropping segments that are exactly one
+/// non-speech marker — `[BLANK_AUDIO]`, `(music)`, `*applause*`, `♪ ... ♪` — or hold
+/// nothing. Silence therefore comes out as an empty string, while speech that merely starts
+/// and ends with brackets, such as `(笑) 好啊 (笑)`, is kept.
 pub fn clean_transcript<S: AsRef<str>>(segments: &[S]) -> String {
     let joined: String = segments
         .iter()
@@ -28,7 +29,13 @@ fn is_non_speech(segment: &str) -> bool {
     if s.is_empty() {
         return true;
     }
-    let wrapped = |open: char, close: char| s.starts_with(open) && s.ends_with(close);
+    // One marker: a single bracket pair around the whole segment, with no other bracket of
+    // that kind inside (so no text can sit outside the pair).
+    let wrapped = |open: char, close: char| {
+        s.strip_prefix(open)
+            .and_then(|rest| rest.strip_suffix(close))
+            .is_some_and(|inside| !inside.contains(open) && !inside.contains(close))
+    };
     wrapped('[', ']')
         || wrapped('(', ')')
         || wrapped('（', '）')
@@ -113,6 +120,27 @@ mod tests {
             clean_transcript(&[" Call me (maybe) tomorrow."]),
             "Call me (maybe) tomorrow."
         );
+    }
+
+    #[test]
+    fn speech_that_starts_and_ends_with_markers_is_kept() {
+        assert_eq!(clean_transcript(&["(笑) 好啊 (笑)"]), "(笑) 好啊 (笑)");
+        assert_eq!(
+            clean_transcript(&["[laughs] okay [laughs]"]),
+            "[laughs] okay [laughs]"
+        );
+        assert_eq!(
+            clean_transcript(&["*sigh* fine then *sigh*"]),
+            "*sigh* fine then *sigh*"
+        );
+        assert_eq!(clean_transcript(&["♪ la ♪ hi ♪ la ♪"]), "♪ la ♪ hi ♪ la ♪");
+    }
+
+    #[test]
+    fn a_whole_transcript_that_is_one_marker_is_silence() {
+        for marker in ["[BLANK_AUDIO]", " (music) ", "（笑）", "*applause*"] {
+            assert_eq!(clean_transcript(&[marker]), "", "{marker}");
+        }
     }
 
     #[test]
