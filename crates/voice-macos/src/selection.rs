@@ -1,11 +1,16 @@
 //! Reading the text selected in the front app.
 //!
 //! Accessibility is asked first: most native apps expose the selected text of the
-//! focused element directly. Apps that do not (many browsers and Electron apps)
-//! are sent ⌘C; the copied text is read and the clipboard is put back as it was.
+//! focused element directly, and an empty selection reported there means nothing
+//! is selected. Apps that do not expose it (many browsers and Electron apps) are
+//! sent ⌘C; the copied text is read and the clipboard is put back as it was.
+//! VS Code copies the whole line when nothing is selected; it marks such a copy,
+//! and it then counts as nothing selected.
 //! The order of operations lives in [`SelectionCopy`], tested with fakes; the
 //! system implementations are thin wrappers.
-use crate::paste::{AccessCheck, Clipboard, Keyboard, SystemClipboard, SystemKeyboard};
+use crate::paste::{
+    AccessCheck, Clipboard, ClipboardSnapshot, Keyboard, SystemClipboard, SystemKeyboard,
+};
 use crate::permissions::MacPermissions;
 use core_foundation::base::{CFType, CFTypeRef, TCFType};
 use core_foundation::string::{CFString, CFStringRef};
@@ -21,10 +26,23 @@ const COPY_POLL: Duration = Duration::from_millis(10);
 /// fallback is needed; an app too slow for it just takes the fallback.
 const AX_TIMEOUT_SECONDS: f32 = 0.1;
 
+/// The pasteboard type VS Code adds to its copies, with JSON describing them.
+const VSCODE_EDITOR_DATA: &str = "vscode-editor-data";
+
 /// The selected text of the focused element, as Accessibility reports it.
 pub(crate) trait FocusedSelection {
-    /// `None` when there is no focused element or it does not expose its selection.
+    /// `None` when there is no focused element or it does not expose its selection;
+    /// `Some("")` when it exposes it and nothing is selected.
     fn selected_text(&self) -> Option<String>;
+}
+
+/// VS Code copied the line under the cursor because nothing was selected.
+fn copied_from_empty_selection(copied: &ClipboardSnapshot) -> bool {
+    copied
+        .data(VSCODE_EDITOR_DATA)
+        .and_then(|json| serde_json::from_slice::<serde_json::Value>(json).ok())
+        .and_then(|data| data.get("isFromEmptySelection")?.as_bool())
+        .unwrap_or(false)
 }
 
 struct SelectionCopy<F, C, K, A> {
@@ -40,8 +58,9 @@ impl<F: FocusedSelection, C: Clipboard, K: Keyboard, A: AccessCheck> SelectionCo
         if !self.access.accessibility_granted() {
             return Err(Problem::AccessibilityPermission);
         }
-        if let Some(text) = self.focused.selected_text().filter(|t| !t.is_empty()) {
-            return Ok(Some(text));
+        if let Some(text) = self.focused.selected_text() {
+            // The app exposes its selection: an empty one means nothing is selected.
+            return Ok(Some(text).filter(|t| !t.is_empty()));
         }
         self.copy_selection()
     }
@@ -57,11 +76,14 @@ impl<F: FocusedSelection, C: Clipboard, K: Keyboard, A: AccessCheck> SelectionCo
             // Nothing was copied, so nothing selected; the clipboard was not touched.
             return Ok(None);
         }
-        let copied = self.clipboard.snapshot().text();
+        let copied = self.clipboard.snapshot();
         if let Err(e) = self.clipboard.restore(previous) {
             log::warn!("could not restore the clipboard after copying the selection: {e}");
         }
-        Ok(copied.filter(|t| !t.is_empty()))
+        if copied_from_empty_selection(&copied) {
+            return Ok(None);
+        }
+        Ok(copied.text().filter(|t| !t.is_empty()))
     }
 
     /// Whether the clipboard changed within the copy wait.
@@ -168,7 +190,7 @@ impl SelectionReader for ClipboardSelectionReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paste::{ClipboardItem, ClipboardSnapshot};
+    use crate::paste::ClipboardItem;
     use std::cell::{Cell, RefCell};
 
     const TEXT: &str = "public.utf8-plain-text";
@@ -311,12 +333,76 @@ mod tests {
         assert_eq!((app.copies.get(), clipboard.changes.get()), (0, 0));
     }
 
+    fn vscode_copy(line: &str, from_empty_selection: &str) -> ClipboardSnapshot {
+        let json = format!(
+            r#"{{"version":1,"isFromEmptySelection":{from_empty_selection},"multicursorText":null,"mode":"rust"}}"#
+        );
+        ClipboardSnapshot {
+            items: vec![vec![
+                (TEXT.to_string(), line.as_bytes().to_vec()),
+                (VSCODE_EDITOR_DATA.to_string(), json.into_bytes()),
+            ]],
+        }
+    }
+
+    #[test]
+    fn empty_selection_exposed_by_accessibility_means_nothing_selected_without_copying() {
+        let clipboard = FakeClipboard::holding(text("abc"));
+        let app = FrontApp::selecting(&clipboard, Some(text("let x = 1;\n")));
+
+        let read = reader(Some(""), &clipboard, &app, true).selected_text();
+
+        assert_eq!(read, Ok(None));
+        assert_eq!(
+            (
+                app.copies.get(),
+                clipboard.changes.get(),
+                clipboard.current()
+            ),
+            (0, 0, text("abc"))
+        );
+    }
+
+    #[test]
+    fn vscode_copy_of_the_line_under_the_cursor_counts_as_nothing_selected() {
+        let clipboard = FakeClipboard::holding(text("abc"));
+        let app = FrontApp::selecting(&clipboard, Some(vscode_copy("let x = 1;\n", "true")));
+
+        let read = reader(None, &clipboard, &app, true).selected_text();
+
+        assert_eq!(read, Ok(None));
+        assert_eq!((app.copies.get(), clipboard.current()), (1, text("abc")));
+    }
+
+    #[test]
+    fn vscode_copy_of_a_real_selection_is_read() {
+        let clipboard = FakeClipboard::holding(text("abc"));
+        let app = FrontApp::selecting(&clipboard, Some(vscode_copy("x = 1", "false")));
+
+        let read = reader(None, &clipboard, &app, true).selected_text();
+
+        assert_eq!(read, Ok(Some("x = 1".to_string())));
+        assert_eq!(clipboard.current(), text("abc"));
+    }
+
+    #[test]
+    fn unreadable_vscode_data_does_not_hide_the_copied_text() {
+        let mut copied = text("x = 1");
+        copied.items[0].push((VSCODE_EDITOR_DATA.to_string(), b"{not json".to_vec()));
+        let clipboard = FakeClipboard::holding(text("abc"));
+        let app = FrontApp::selecting(&clipboard, Some(copied));
+
+        let read = reader(None, &clipboard, &app, true).selected_text();
+
+        assert_eq!(read, Ok(Some("x = 1".to_string())));
+    }
+
     #[test]
     fn copied_selection_is_read_and_the_earlier_clipboard_is_put_back() {
         let clipboard = FakeClipboard::holding(text("abc"));
         let app = FrontApp::selecting(&clipboard, Some(text("今天天氣很好")));
 
-        let read = reader(Some(""), &clipboard, &app, true).selected_text();
+        let read = reader(None, &clipboard, &app, true).selected_text();
 
         assert_eq!(read, Ok(Some("今天天氣很好".to_string())));
         assert_eq!(clipboard.current(), text("abc"));
