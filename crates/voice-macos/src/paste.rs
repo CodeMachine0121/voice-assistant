@@ -18,17 +18,21 @@ use voice_core::{Problem, TextInserter};
 const PASTE_SETTLE: Duration = Duration::from_millis(500);
 /// Virtual key code of "V".
 const KEY_V: u16 = 9;
+/// Virtual key code of "C".
+const KEY_C: u16 = 8;
+/// The pasteboard type of plain UTF-8 text (`NSPasteboardTypeString`).
+const PLAIN_TEXT: &str = "public.utf8-plain-text";
 
 /// One clipboard item: every representation it offered, as (type, bytes).
-type ClipboardItem = Vec<(String, Vec<u8>)>;
+pub(crate) type ClipboardItem = Vec<(String, Vec<u8>)>;
 
 /// Everything the clipboard held at one moment. No items means an empty clipboard.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct ClipboardSnapshot {
-    items: Vec<ClipboardItem>,
+pub(crate) struct ClipboardSnapshot {
+    pub(crate) items: Vec<ClipboardItem>,
 }
 
-trait Clipboard {
+pub(crate) trait Clipboard {
     fn snapshot(&self) -> ClipboardSnapshot;
     /// Replaces the clipboard content with `text` and returns the change count
     /// the clipboard has right after that write.
@@ -39,12 +43,14 @@ trait Clipboard {
     fn restore(&self, snapshot: ClipboardSnapshot) -> Result<(), String>;
 }
 
-trait Keyboard {
+pub(crate) trait Keyboard {
     /// Sends ⌘V to the front app.
     fn paste(&self) -> Result<(), String>;
+    /// Sends ⌘C to the front app.
+    fn copy(&self) -> Result<(), String>;
 }
 
-trait AccessCheck {
+pub(crate) trait AccessCheck {
     fn accessibility_granted(&self) -> bool;
 }
 
@@ -86,7 +92,7 @@ fn clipboard_problem(e: String) -> Problem {
 }
 
 /// The general pasteboard, through AppKit.
-struct SystemClipboard;
+pub(crate) struct SystemClipboard;
 
 impl Clipboard for SystemClipboard {
     fn snapshot(&self) -> ClipboardSnapshot {
@@ -136,6 +142,15 @@ impl Clipboard for SystemClipboard {
 }
 
 impl ClipboardSnapshot {
+    /// The plain text of the first item that offers some.
+    pub(crate) fn text(&self) -> Option<String> {
+        self.items.iter().find_map(|item| {
+            item.iter()
+                .find(|(kind, _)| kind == PLAIN_TEXT)
+                .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
+        })
+    }
+
     /// Drops items that offered no readable data, so they do not restore as blanks.
     fn without_empty_items(mut self) -> Self {
         self.items.retain(|item| !item.is_empty());
@@ -166,14 +181,17 @@ fn pasteboard_item(
     Ok(ProtocolObject::from_retained(item))
 }
 
-struct SystemKeyboard;
+pub(crate) struct SystemKeyboard;
 
-impl Keyboard for SystemKeyboard {
-    fn paste(&self) -> Result<(), String> {
+impl SystemKeyboard {
+    /// Presses and releases `key` with Command and nothing else. The flags are set
+    /// explicitly: the user may still be holding Option (it starts Edit selection),
+    /// and the front app must see ⌘C / ⌘V, not ⌘⌥C.
+    fn command_key(key: u16) -> Result<(), String> {
         let event = |down| {
             let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                 .map_err(|()| "no event source".to_string())?;
-            let event = CGEvent::new_keyboard_event(source, KEY_V, down)
+            let event = CGEvent::new_keyboard_event(source, key, down)
                 .map_err(|()| "no keyboard event".to_string())?;
             event.set_flags(CGEventFlags::CGEventFlagCommand);
             Ok::<_, String>(event)
@@ -182,6 +200,16 @@ impl Keyboard for SystemKeyboard {
         down.post(CGEventTapLocation::HID);
         up.post(CGEventTapLocation::HID);
         Ok(())
+    }
+}
+
+impl Keyboard for SystemKeyboard {
+    fn paste(&self) -> Result<(), String> {
+        Self::command_key(KEY_V)
+    }
+
+    fn copy(&self) -> Result<(), String> {
+        Self::command_key(KEY_C)
     }
 }
 
@@ -329,6 +357,10 @@ mod tests {
                 self.clipboard.write(other.clone());
             }
             Ok(())
+        }
+
+        fn copy(&self) -> Result<(), String> {
+            Err("not used when pasting".into())
         }
     }
 
@@ -498,6 +530,24 @@ mod tests {
         let result = inserter(&clipboard, &keyboard, true).insert("Hello.");
 
         assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn snapshot_text_is_the_first_plain_text_offered() {
+        let content = snapshot(vec![
+            item(&[(PNG, &[1])]),
+            item(&[(RTF, b"{\\rtf1 x}"), (TEXT, "第一".as_bytes())]),
+            item(&[(TEXT, b"second")]),
+        ]);
+
+        assert_eq!(content.text().as_deref(), Some("第一"));
+    }
+
+    #[test]
+    fn snapshot_without_plain_text_has_no_text() {
+        let content = snapshot(vec![item(&[(PNG, &[1])])]);
+
+        assert_eq!(content.text(), None);
     }
 
     #[test]
