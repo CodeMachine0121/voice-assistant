@@ -137,11 +137,18 @@ Scenario: The key saved in Settings wins
   When the user dictates
   Then the key saved in Settings is used
 
-Scenario: Removing the saved key
+Scenario: Removing the only key
   Given an OpenAI key is saved
+  And no OpenAI key is set up on the Mac for other tools
   When the user clicks "Remove key"
   Then Settings shows "No OpenAI key saved"
-  And from the next dictation on, a key set up on the Mac for other tools is used if there is one
+
+Scenario: Removing the saved key falls back to the key set up on the Mac
+  Given an OpenAI key is saved
+  And an OpenAI key is set up on the Mac for other tools
+  When the user clicks "Remove key"
+  Then Settings shows "Using the OpenAI key set up on this Mac"
+  And from the next dictation on, the key set up on the Mac is used
 
 Scenario: Leaving the key field empty keeps the saved key
   Given an OpenAI key is saved
@@ -179,12 +186,18 @@ Scenario: No internet
   And the status shows "OpenAI not reachable — check your internet connection"
 
 Scenario: A slow answer within one minute is accepted
-  Given OpenAI answers after 59 seconds
+  Given OpenAI answers 59 seconds after the recording has been sent
+  When the user dictates "我們開會"
+  Then "我們開會。" appears at the cursor
+
+Scenario: A slow upload does not use up the minute
+  Given sending the recording to OpenAI takes longer than one minute on a slow connection
+  And OpenAI answers right after it has the recording
   When the user dictates "我們開會"
   Then "我們開會。" appears at the cursor
 
 Scenario: No answer within one minute
-  Given OpenAI has not answered after one minute
+  Given OpenAI has not answered one minute after the recording has been sent
   When the user dictates
   Then nothing is written and nothing is added to History
   And the status shows "OpenAI not reachable — check your internet connection"
@@ -249,14 +262,17 @@ flowchart LR
 - **Core Business Rules:**
   - The speech provider is always OpenAI; the speech model is the one chosen in Settings (default "gpt-4o-transcribe").
   - Key choice: the key saved in Settings; if none, a key set up on the Mac for other tools; if none, the dictation stops with "OpenAI key missing".
+  - The key saved in Settings is the main way to give the app a key. A key "set up on the Mac for other tools" is the one other tools find in the user's terminal; the app only sees it when it was started from a terminal, not when it is opened from Finder or the Dock.
   - The key is looked up at each dictation, so saving or removing it takes effect from the next dictation without a restart.
   - The dictionary words are given to OpenAI as a spelling hint; no spoken language is named, so mixed Chinese and English keep working.
-  - One minute is the longest OpenAI may take to answer.
+  - OpenAI gets one minute to answer, counted from the moment the recording has been sent. Sending the recording may itself take up to two minutes on a slow connection, and reaching OpenAI at all up to ten seconds; neither counts toward the minute.
+  - Saving Settings never half applies: when the key cannot be kept nothing else is saved, and when the other settings cannot be kept the key goes back to what it was before.
   - Whenever speech cannot be turned into words, nothing is written and nothing is added to History.
 - **Edge Cases:**
   - User cancels with Escape while listening: nothing is sent to OpenAI (as today).
   - The secure password storage cannot be read: treated as no saved key (falls back to the key set up on the Mac).
   - Saving the key to secure password storage fails: Settings shows the problem and the other settings are not saved either.
+  - Saving the other settings fails after the key was kept: Settings shows the problem and the saved key goes back to what it was (or is removed again if there was none).
 
 ---
 

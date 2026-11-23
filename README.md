@@ -24,7 +24,7 @@ Run `make help` to list every target.
 
 On first launch:
 
-1. Open **Settings…** from the menu-bar icon and enter your **OpenAI key** under *AI models* (it is kept in your login Keychain, never in the settings file). If you leave it empty, the `OPENAI_API_KEY` environment variable is used. macOS may ask to allow Keychain access, again after rebuilds that are signed ad hoc. A speech model downloaded by an earlier version (`~/Library/Application Support/VoiceAssistant/models/`) is no longer used and can be deleted.
+1. Open **Settings…** from the menu-bar icon and enter your **OpenAI key** under *AI models* (it is kept in your login Keychain, never in the settings file). If no key is saved there, the `OPENAI_API_KEY` environment variable is used — but only when the app is started from a terminal (for example `make run`); an app opened from Finder or the Dock does not see your shell's variables, so saving the key in Settings is the way to go. macOS may ask to allow Keychain access, again after rebuilds that are signed ad hoc. A speech model downloaded by an earlier version (`~/Library/Application Support/VoiceAssistant/models/`) is no longer used and can be deleted.
 2. Grant **Microphone**, **Accessibility** and **Input Monitoring** access when asked. You can also use the buttons in Settings. Builds are signed ad hoc by default, which means permissions must be granted again after every rebuild. To keep them, create a self-signed code-signing certificate in Keychain Access and put `CODESIGN_IDENTITY := <certificate name>` in a git-ignored `.make.local` file (or pass `CODESIGN_IDENTITY="<certificate name>"` to every `make build` / `make install`).
 3. Pick your LM Studio model (or leave it empty to use whichever model is loaded).
 

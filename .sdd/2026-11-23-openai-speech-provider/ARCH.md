@@ -83,7 +83,7 @@ impl From<&TranscribeError> for SpeechFailure { /* one arm per TranscribeError v
 | `SecretStore` | Trait (stt) | Read / save / remove one secret; errors as text | — | US-03 |
 | `MemorySecretStore` | Adapter (stt) | In-memory `SecretStore` for demo mode and tests | — | tests |
 | `OpenAiKey` | Deep module (stt) | Resolve the key to use (saved, else env var, trimmed, blanks ignored), report `KeyStatus {Saved, FromEnvironment, Missing}`, save (blank = no-op) and remove. The key never appears in `Debug` output or errors | `SecretStore`, env lookup fn | US-03 all scenarios |
-| `OpenAiTranscriber` | Adapter (stt) | `Transcriber` over OpenAI: empty recording → `""`; no key → `KeyMissing`; multipart (`file` WAV, `model`, `response_format=json`, optional `prompt` = dictionary words, no `language`); `Authorization: Bearer`; 60 s timeout; status mapping 401→`KeyRejected`, 429→`LimitReached`, 5xx/transport/timeout→`Unreachable`, other 4xx/bad JSON→`Failed`; `text` cleaned by `clean_transcript`. Base URL overridable for tests | `OpenAiKey`, `text`, `wav`, `multipart` | US-01, US-04 |
+| `OpenAiTranscriber` | Adapter (stt) | `Transcriber` over OpenAI: empty recording → `""`; no key → `KeyMissing`; multipart (`file` WAV, `model`, `response_format=json`, optional `prompt` = dictionary words, no `language`); `Authorization: Bearer`; one reused `ureq::Agent` with `OpenAiTimeouts` (connect 10 s, send body 120 s, answer 60 s after the upload); status mapping 401→`KeyRejected`, 429→`LimitReached`, 5xx/transport/timeout→`Unreachable`, other 4xx/bad JSON→`Failed`; `text` cleaned by `clean_transcript`. Base URL overridable for tests | `OpenAiKey`, `text`, `wav`, `multipart` | US-01, US-04 |
 | `KeychainSecret` | Adapter (macos) | `SecretStore`-shaped access to one generic-password Keychain item; "not found" = `Ok(None)` | `security-framework` | US-03 saved in secure storage |
 | `SpeechProviderSwitch` | App wiring | Holds the transcriber for the current `SpeechSettings`; `apply` rebuilds it via a factory on save | factory → `OpenAiTranscriber` | US-01 new model from next dictation |
 
@@ -146,7 +146,7 @@ flowchart TD
 | US-01 Simplified characters from OpenAI are written in Traditional | existing `script::to_traditional` in pipeline (unchanged) |
 | US-01 Dictionary words help OpenAI spell | `OpenAiTranscriber` `prompt` part from `text::initial_prompt` |
 | US-01 Silence is never sent to OpenAI | existing `speech::contains_speech` in pipeline; `OpenAiTranscriber` empty-recording guard |
-| US-01 A full five-minute recording is heard | `OpenAiTranscriber` WAV encoding (size under limit), 60 s timeout |
+| US-01 A full five-minute recording is heard | `OpenAiTranscriber` WAV encoding (size under limit), 120 s upload limit |
 | US-01 A speech model saved earlier stays on offer | `settings_form::speech_model_choices` |
 | US-02 First launch shows OpenAI and its default speech model | `SpeechSettings::default`, Settings window rows |
 | US-02 OpenAI is the only provider on offer | `SpeechProvider::ALL` in provider combo |
@@ -158,14 +158,16 @@ flowchart TD
 | US-03 A saved key is never shown again | `SettingsForm::new_key` starts empty; masked `TextEdit::password`; `OpenAiKey::status` |
 | US-03 A key set up on the Mac for other tools is used when none is saved | `OpenAiKey::current` / `status` = `FromEnvironment` |
 | US-03 The key saved in Settings wins | `OpenAiKey::current` precedence |
-| US-03 Removing the saved key | `SettingsSession::remove_key` → `OpenAiKey::remove` |
-| US-03 Leaving the key field empty keeps the saved key | `OpenAiKey::save` blank no-op; `SettingsSession::save` skips blank |
+| US-03 Removing the only key | `SettingsSession::remove_key` → `OpenAiKey::remove`; cached `SettingsSession::key_status` = `Missing` |
+| US-03 Removing the saved key falls back to the key set up on the Mac | `SettingsSession::remove_key` → `OpenAiKey::remove`; cached `key_status` = `FromEnvironment`; next request uses the env key (`OpenAiKey::current` per request) |
+| US-03 Leaving the key field empty keeps the saved key | `SettingsChange::new_key` = `None`; `settings_saver` leaves the key alone |
 | US-03 No key anywhere | `OpenAiTranscriber` → `KeyMissing` → `SpeechFailure::KeyMissing` |
 | US-04 Rejected key | 401 → `KeyRejected` → `SpeechFailure::KeyRejected` |
 | US-04 Too many requests or no credit left | 429 → `LimitReached` → `SpeechFailure::LimitReached` |
 | US-04 No internet | transport error → `Unreachable` → `SpeechFailure::Unreachable` |
-| US-04 A slow answer within one minute is accepted | `OpenAiTranscriber` timeout = 60 s |
-| US-04 No answer within one minute | timeout → `Unreachable` → `SpeechFailure::Unreachable` |
+| US-04 A slow answer within one minute is accepted | `OpenAiTimeouts::answer` = 60 s (receive-response / receive-body only) |
+| US-04 A slow upload does not use up the minute | `OpenAiTimeouts` split: connect 10 s, send body 120 s, answer 60 s |
+| US-04 No answer within one minute | answer timeout → `Unreachable` → `SpeechFailure::Unreachable` |
 | US-04 OpenAI is having trouble | 5xx → `Unreachable` → `SpeechFailure::Unreachable` |
 | US-04 OpenAI refuses the recording for another reason | other 4xx / bad JSON → `Failed` → `SpeechFailure::NotTranscribed` |
 | US-05 The built-in speech choice moves to OpenAI | `Settings` serde default (unknown keys ignored) |
