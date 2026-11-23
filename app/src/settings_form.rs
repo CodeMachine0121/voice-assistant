@@ -137,8 +137,10 @@ fn is_on_this_mac(address: &str) -> bool {
         Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
         None => authority.split(':').next().unwrap_or_default(),
     };
-    let host = host.to_ascii_lowercase();
-    host == "localhost" || host == "::1" || host.starts_with("127.")
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
 }
 
 /// Row label of a speech source.
@@ -374,6 +376,7 @@ mod tests {
         for address in [
             "http://localhost:1234/v1",
             "http://127.0.0.1:1234/v1",
+            "http://127.1.2.3/v1",
             "http://[::1]:1234/v1",
             "localhost:1234",
             "HTTP://LOCALHOST/v1",
@@ -392,6 +395,8 @@ mod tests {
             "https://api.example.com/v1",
             "http://localhost.example.com/v1",
             "http://localhost@evil.example/v1",
+            "http://127.0.0.1.nip.io:1234/v1",
+            "http://127.example.com/v1",
         ] {
             f.assistant_url = address.to_string();
             assert_eq!(f.address_warning(), Some(ADDRESS_NOT_LOCAL), "{address}");
