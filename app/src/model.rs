@@ -581,6 +581,21 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_key_that_cannot_be_read_can_still_be_replaced() {
+        let (services, probe) = test_services();
+        services.speech_key.save("sk-old").unwrap();
+        probe.fail_key_reading("the Keychain item is not text");
+        let mut session = SettingsSession::open(&services);
+        assert_eq!(session.key_status, KeyStatus::Unreadable);
+        session.form.new_key = "sk-new".into();
+
+        session.save(&services);
+
+        assert_eq!(session.notice, Some(Notice::Saved));
+        assert_eq!(probe.saved_key().as_deref(), Some("sk-new"));
+    }
+
+    #[test]
     fn removing_the_key_forgets_it() {
         let (services, probe) = test_services();
         services.speech_key.save("sk-saved").unwrap();

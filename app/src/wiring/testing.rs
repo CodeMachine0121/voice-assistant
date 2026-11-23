@@ -31,6 +31,7 @@ impl SettingsStore for FlakySettings {
 struct FlakySecret {
     secret: Mutex<Option<String>>,
     failure: Mutex<Option<String>>,
+    read_failure: Mutex<Option<String>>,
     reads: Mutex<usize>,
 }
 
@@ -46,6 +47,9 @@ impl FlakySecret {
 impl SecretStore for FlakySecret {
     fn read(&self) -> Result<Option<String>, String> {
         *self.reads.lock().unwrap() += 1;
+        if let Some(e) = self.read_failure.lock().unwrap().clone() {
+            return Err(e);
+        }
         Ok(self.secret.lock().unwrap().clone())
     }
 
@@ -80,6 +84,11 @@ impl Probe {
     /// How often the secret store has been read so far.
     pub fn key_reads(&self) -> usize {
         *self.secret.reads.lock().unwrap()
+    }
+
+    /// Makes reading the key fail from now on, as when Keychain access is denied.
+    pub fn fail_key_reading(&self, message: &str) {
+        *self.secret.read_failure.lock().unwrap() = Some(message.to_string());
     }
 
     pub fn fail_key_storage(&self, message: &str) {

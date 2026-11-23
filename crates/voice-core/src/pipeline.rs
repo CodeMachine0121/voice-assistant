@@ -604,7 +604,7 @@ mod tests {
     }
 
     /// Every way the speech provider can fail, with the message the user must see.
-    fn speech_failures() -> [(TranscribeError, Problem, &'static str); 5] {
+    fn speech_failures() -> [(TranscribeError, Problem, &'static str); 6] {
         let openai = |failure| Problem::Speech {
             provider: crate::SpeechProvider::OpenAi,
             failure,
@@ -614,6 +614,11 @@ mod tests {
                 TranscribeError::KeyMissing,
                 openai(SpeechFailure::KeyMissing),
                 "OpenAI key missing — add it in Settings › AI models",
+            ),
+            (
+                TranscribeError::KeyUnreadable,
+                openai(SpeechFailure::KeyUnreadable),
+                "Couldn't read the OpenAI key from the Keychain — allow access or save it again in Settings › AI models",
             ),
             (
                 TranscribeError::KeyRejected,

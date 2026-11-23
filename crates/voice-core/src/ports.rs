@@ -22,6 +22,9 @@ pub enum TranscribeError {
     Unreachable(String),
     /// No key for the speech provider is available.
     KeyMissing,
+    /// A key is kept for the speech provider, but it could not be read (e.g. access to
+    /// the Keychain was denied or it is locked).
+    KeyUnreadable,
     /// The speech provider does not accept the key.
     KeyRejected,
     /// The speech provider refuses more requests for now (rate limit or no credit left).
@@ -37,6 +40,9 @@ impl fmt::Display for TranscribeError {
                 write!(f, "speech provider unreachable: {reason}")
             }
             TranscribeError::KeyMissing => write!(f, "no key for the speech provider"),
+            TranscribeError::KeyUnreadable => {
+                write!(f, "the speech provider key could not be read")
+            }
             TranscribeError::KeyRejected => write!(f, "speech provider rejected the key"),
             TranscribeError::LimitReached => write!(f, "speech provider limit reached"),
             TranscribeError::Failed(reason) => write!(f, "{reason}"),
@@ -109,6 +115,10 @@ mod tests {
             (
                 TranscribeError::KeyMissing,
                 "no key for the speech provider",
+            ),
+            (
+                TranscribeError::KeyUnreadable,
+                "the speech provider key could not be read",
             ),
             (
                 TranscribeError::KeyRejected,

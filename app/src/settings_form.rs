@@ -176,6 +176,7 @@ pub fn key_status_text(status: KeyStatus) -> &'static str {
         KeyStatus::Saved => "OpenAI key saved",
         KeyStatus::FromEnvironment => "Using the OpenAI key set up on this Mac",
         KeyStatus::Missing => "No OpenAI key saved",
+        KeyStatus::Unreadable => "Couldn't read the OpenAI key from the Keychain",
     }
 }
 
@@ -525,6 +526,10 @@ mod tests {
             "Using the OpenAI key set up on this Mac"
         );
         assert_eq!(key_status_text(KeyStatus::Missing), "No OpenAI key saved");
+        assert_eq!(
+            key_status_text(KeyStatus::Unreadable),
+            "Couldn't read the OpenAI key from the Keychain"
+        );
     }
 
     #[test]

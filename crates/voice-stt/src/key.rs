@@ -24,6 +24,18 @@ pub enum KeyStatus {
     FromEnvironment,
     /// Neither saved nor in the environment.
     Missing,
+    /// The store holds something that could not be read (access denied, locked, not
+    /// text). The environment's key, if any, is used meanwhile.
+    Unreadable,
+}
+
+/// Why no key can be used for a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyProblem {
+    /// Neither saved nor in the environment.
+    Missing,
+    /// The store could not be read, and the environment has no key either.
+    Unreadable,
 }
 
 type EnvLookup = dyn Fn() -> Option<String> + Send + Sync;
@@ -33,18 +45,25 @@ enum Resolved {
     Saved(String),
     FromEnvironment(String),
     Missing,
+    /// The store could not be read; the environment's key, if any.
+    Unreadable(Option<String>),
 }
 
 /// Resolves, saves and removes the OpenAI key.
 pub struct OpenAiKey {
     store: Arc<dyn SecretStore>,
     environment: Box<EnvLookup>,
+    /// The environment variable `environment` reads; `None` when injected.
+    variable: Option<&'static str>,
 }
 
 impl OpenAiKey {
     /// Falls back to `OPENAI_API_KEY` of this process when the store holds no key.
     pub fn new(store: Arc<dyn SecretStore>) -> Self {
-        Self::with_environment(store, || std::env::var(OPENAI_KEY_VARIABLE).ok())
+        Self {
+            variable: Some(OPENAI_KEY_VARIABLE),
+            ..Self::with_environment(store, || std::env::var(OPENAI_KEY_VARIABLE).ok())
+        }
     }
 
     /// Falls back to whatever `environment` returns when the store holds no key.
@@ -55,14 +74,18 @@ impl OpenAiKey {
         Self {
             store,
             environment: Box::new(environment),
+            variable: None,
         }
     }
 
     /// The key to use now: the saved one, else the environment's.
-    pub fn current(&self) -> Option<String> {
+    pub fn current(&self) -> Result<String, KeyProblem> {
         match self.resolve() {
-            Resolved::Saved(key) | Resolved::FromEnvironment(key) => Some(key),
-            Resolved::Missing => None,
+            Resolved::Saved(key)
+            | Resolved::FromEnvironment(key)
+            | Resolved::Unreadable(Some(key)) => Ok(key),
+            Resolved::Missing => Err(KeyProblem::Missing),
+            Resolved::Unreadable(None) => Err(KeyProblem::Unreadable),
         }
     }
 
@@ -73,19 +96,24 @@ impl OpenAiKey {
             Resolved::Saved(_) => KeyStatus::Saved,
             Resolved::FromEnvironment(_) => KeyStatus::FromEnvironment,
             Resolved::Missing => KeyStatus::Missing,
+            Resolved::Unreadable(_) => KeyStatus::Unreadable,
         }
     }
 
     /// The one place the precedence lives: the saved key wins over the environment's.
-    /// Blank values count as absent, and a store that cannot be read counts as holding
-    /// nothing. The store is read exactly once.
+    /// Blank values count as absent. A store that cannot be read is reported as such,
+    /// with the environment's key as a stand-in. The store is read exactly once.
     fn resolve(&self) -> Resolved {
-        if let Some(key) = self.saved() {
-            Resolved::Saved(key)
-        } else if let Some(key) = non_blank((self.environment)()) {
-            Resolved::FromEnvironment(key)
-        } else {
-            Resolved::Missing
+        let environment = || non_blank((self.environment)());
+        match self.store.read() {
+            Ok(saved) => match non_blank(saved) {
+                Some(key) => Resolved::Saved(key),
+                None => environment().map_or(Resolved::Missing, Resolved::FromEnvironment),
+            },
+            Err(e) => {
+                log::warn!("cannot read the saved OpenAI key: {e}");
+                Resolved::Unreadable(environment())
+            }
         }
     }
 
@@ -98,14 +126,19 @@ impl OpenAiKey {
     }
 
     /// Like [`save`](Self::save), but hands back what was saved before, so a change that
-    /// fails later can be undone with [`PreviousKey::restore`].
+    /// fails later can be undone with [`PreviousKey::restore`]. A saved value that cannot
+    /// be read does not stop the new key from being saved; it just cannot be put back.
     pub fn replace(&self, key: &str) -> Result<PreviousKey, String> {
         let Some(key) = non_blank(Some(key.to_string())) else {
             return Ok(PreviousKey::Unchanged);
         };
-        let previous = match self.store.read()? {
-            Some(saved) => PreviousKey::Saved(saved),
-            None => PreviousKey::Absent,
+        let previous = match self.store.read() {
+            Ok(Some(saved)) => PreviousKey::Saved(saved),
+            Ok(None) => PreviousKey::Absent,
+            Err(e) => {
+                log::warn!("cannot read the OpenAI key being replaced: {e}");
+                PreviousKey::Unknown
+            }
         };
         self.store.save(&key)?;
         Ok(previous)
@@ -115,23 +148,14 @@ impl OpenAiKey {
     pub fn remove(&self) -> Result<(), String> {
         self.store.remove()
     }
-
-    fn saved(&self) -> Option<String> {
-        match self.store.read() {
-            Ok(saved) => non_blank(saved),
-            Err(e) => {
-                log::warn!("cannot read the saved OpenAI key: {e}");
-                None
-            }
-        }
-    }
 }
 
 impl fmt::Debug for OpenAiKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Never resolves the key: that would read the store (and may prompt for access).
         f.debug_struct("OpenAiKey")
-            .field("status", &self.status())
-            .finish()
+            .field("variable", &self.variable)
+            .finish_non_exhaustive()
     }
 }
 
@@ -144,6 +168,8 @@ pub enum PreviousKey {
     Absent,
     /// This key was saved.
     Saved(String),
+    /// Something was saved, but it could not be read, so it cannot be put back.
+    Unknown,
 }
 
 impl PreviousKey {
@@ -153,6 +179,9 @@ impl PreviousKey {
             PreviousKey::Unchanged => Ok(()),
             PreviousKey::Absent => key.store.remove(),
             PreviousKey::Saved(saved) => key.store.save(&saved),
+            PreviousKey::Unknown => {
+                Err("the key saved before could not be read, so it cannot be put back".into())
+            }
         }
     }
 }
@@ -163,6 +192,7 @@ impl fmt::Debug for PreviousKey {
             PreviousKey::Unchanged => "Unchanged",
             PreviousKey::Absent => "Absent",
             PreviousKey::Saved(_) => "Saved(<redacted>)",
+            PreviousKey::Unknown => "Unknown",
         })
     }
 }
@@ -235,7 +265,7 @@ mod tests {
         key.save("sk-test").unwrap();
 
         assert_eq!(store.read().unwrap().as_deref(), Some("sk-test"));
-        assert_eq!(key.current().as_deref(), Some("sk-test"));
+        assert_eq!(key.current().as_deref(), Ok("sk-test"));
         assert_eq!(key.status(), KeyStatus::Saved);
     }
 
@@ -243,7 +273,7 @@ mod tests {
     fn the_environment_key_is_used_when_none_is_saved() {
         let key = key_with(Arc::new(MemorySecretStore::default()), Some("sk-env"));
 
-        assert_eq!(key.current().as_deref(), Some("sk-env"));
+        assert_eq!(key.current().as_deref(), Ok("sk-env"));
         assert_eq!(key.status(), KeyStatus::FromEnvironment);
     }
 
@@ -254,7 +284,7 @@ mod tests {
             Some("sk-env"),
         );
 
-        assert_eq!(key.current().as_deref(), Some("sk-saved"));
+        assert_eq!(key.current().as_deref(), Ok("sk-saved"));
         assert_eq!(key.status(), KeyStatus::Saved);
     }
 
@@ -266,7 +296,7 @@ mod tests {
         key.remove().unwrap();
 
         assert_eq!(store.read().unwrap(), None);
-        assert_eq!(key.current().as_deref(), Some("sk-env"));
+        assert_eq!(key.current().as_deref(), Ok("sk-env"));
         assert_eq!(key.status(), KeyStatus::FromEnvironment);
     }
 
@@ -276,7 +306,7 @@ mod tests {
 
         key.remove().unwrap();
 
-        assert_eq!(key.current(), None);
+        assert_eq!(key.current(), Err(KeyProblem::Missing));
         assert_eq!(key.status(), KeyStatus::Missing);
     }
 
@@ -303,16 +333,59 @@ mod tests {
     fn blank_keys_count_as_missing() {
         let key = key_with(Arc::new(MemorySecretStore::holding("  ")), Some(" "));
 
-        assert_eq!(key.current(), None);
+        assert_eq!(key.current(), Err(KeyProblem::Missing));
         assert_eq!(key.status(), KeyStatus::Missing);
     }
 
     #[test]
-    fn an_unreadable_store_falls_back_to_the_environment() {
+    fn an_unreadable_store_is_reported_but_the_environment_key_still_works() {
         let key = key_with(Arc::new(Broken), Some("sk-env"));
 
-        assert_eq!(key.current().as_deref(), Some("sk-env"));
-        assert_eq!(key.status(), KeyStatus::FromEnvironment);
+        assert_eq!(key.current().as_deref(), Ok("sk-env"));
+        assert_eq!(key.status(), KeyStatus::Unreadable);
+    }
+
+    #[test]
+    fn an_unreadable_store_without_an_environment_key_is_not_a_missing_key() {
+        let key = key_with(Arc::new(Broken), None);
+
+        assert_eq!(key.current(), Err(KeyProblem::Unreadable));
+        assert_eq!(key.status(), KeyStatus::Unreadable);
+    }
+
+    /// A store whose saved value cannot be read, but which accepts new values.
+    #[derive(Default)]
+    struct Unreadable {
+        written: std::sync::Mutex<Option<String>>,
+    }
+    impl SecretStore for Unreadable {
+        fn read(&self) -> Result<Option<String>, String> {
+            Err("the Keychain item is not text".into())
+        }
+        fn save(&self, secret: &str) -> Result<(), String> {
+            *self.written.lock().unwrap() = Some(secret.to_string());
+            Ok(())
+        }
+        fn remove(&self) -> Result<(), String> {
+            *self.written.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_unreadable_saved_key_does_not_stop_a_new_one_from_being_saved() {
+        let store = Arc::new(Unreadable::default());
+        let key = key_with(store.clone(), None);
+
+        let previous = key.replace("sk-new").unwrap();
+
+        assert_eq!(store.written.lock().unwrap().as_deref(), Some("sk-new"));
+        assert_eq!(format!("{previous:?}"), "Unknown");
+        assert_eq!(
+            previous.restore(&key),
+            Err("the key saved before could not be read, so it cannot be put back".into())
+        );
+        assert_eq!(store.written.lock().unwrap().as_deref(), Some("sk-new"));
     }
 
     #[test]
@@ -349,7 +422,7 @@ mod tests {
         key.save("sk-saved").unwrap();
 
         assert_eq!(key.status(), KeyStatus::Saved);
-        assert_eq!(key.current().as_deref(), Some("sk-saved"));
+        assert_eq!(key.current().as_deref(), Ok("sk-saved"));
         key.remove().unwrap();
         assert_eq!(key.status(), KeyStatus::FromEnvironment);
 
@@ -410,24 +483,25 @@ mod tests {
     }
 
     #[test]
-    fn debug_output_never_shows_the_key() {
-        let key = key_with(Arc::new(MemorySecretStore::holding("sk-secret")), None);
+    fn debug_output_never_shows_or_even_reads_the_key() {
+        let store = Arc::new(Counting::default());
+        store.save("sk-secret").unwrap();
+        let key = key_with(store.clone(), Some("sk-env"));
 
         let shown = format!("{key:?}");
 
-        assert!(!shown.contains("sk-secret"), "{shown}");
-        assert!(shown.contains("Saved"), "{shown}");
+        assert_eq!(shown, "OpenAiKey { variable: None, .. }");
+        assert_eq!(store.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
-    fn the_openai_api_key_variable_of_this_process_is_the_fallback() {
-        // Only this test reads the real variable; the others inject their environment.
-        std::env::set_var("OPENAI_API_KEY", "sk-from-process");
-        let key = OpenAiKey::new(Arc::new(MemorySecretStore::default()));
+    fn the_app_falls_back_to_the_openai_api_key_variable() {
+        let store = Arc::new(Counting::default());
 
-        let found = key.current();
-        std::env::remove_var("OPENAI_API_KEY");
+        let shown = format!("{:?}", OpenAiKey::new(store.clone()));
 
-        assert_eq!(found.as_deref(), Some("sk-from-process"));
+        assert_eq!(OPENAI_KEY_VARIABLE, "OPENAI_API_KEY");
+        assert!(shown.contains("Some(\"OPENAI_API_KEY\")"), "{shown}");
+        assert_eq!(store.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

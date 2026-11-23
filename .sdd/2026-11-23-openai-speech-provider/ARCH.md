@@ -53,6 +53,7 @@ pub struct Settings { /* …unchanged fields… */ pub speech: SpeechSettings }
 pub enum TranscribeError {
     Unreachable(String), // no connection, timeout, 5xx
     KeyMissing,          // no key anywhere
+    KeyUnreadable,       // a key is kept but could not be read (Keychain denied / locked)
     KeyRejected,         // 401
     LimitReached,        // 429 (rate limit or quota)
     Failed(String),      // other refusal / unusable answer
@@ -64,6 +65,7 @@ pub enum Problem { /* … */ Speech { provider: SpeechProvider, failure: SpeechF
 pub enum SpeechFailure {
     Unreachable,    // "OpenAI not reachable — check your internet connection"
     KeyMissing,     // "OpenAI key missing — add it in Settings › AI models"
+    KeyUnreadable,  // "Couldn't read the OpenAI key from the Keychain — allow access or save it again in Settings › AI models"
     KeyRejected,    // "OpenAI rejected the key — check it in Settings › AI models"
     LimitReached,   // "OpenAI limit reached — try again later or check your OpenAI account"
     NotTranscribed, // "OpenAI couldn't turn the recording into words"
@@ -82,7 +84,7 @@ impl From<&TranscribeError> for SpeechFailure { /* one arm per TranscribeError v
 | `SpeechSettings` | Value (core, serde) | Chosen provider + model; defaults to OpenAI / `gpt-4o-transcribe` | `SpeechProvider` | US-01, US-02, US-05 |
 | `SecretStore` | Trait (stt) | Read / save / remove one secret; errors as text | — | US-03 |
 | `MemorySecretStore` | Adapter (stt) | In-memory `SecretStore` for demo mode and tests | — | tests |
-| `OpenAiKey` | Deep module (stt) | Resolve the key to use (saved, else env var, trimmed, blanks ignored), report `KeyStatus {Saved, FromEnvironment, Missing}`, save (blank = no-op) and remove. The key never appears in `Debug` output or errors | `SecretStore`, env lookup fn | US-03 all scenarios |
+| `OpenAiKey` | Deep module (stt) | Resolve the key to use (saved, else env var, trimmed, blanks ignored), report `KeyStatus {Saved, FromEnvironment, Missing, Unreadable}` (an unreadable store is reported, never folded into Missing; the env key still serves meanwhile), save (blank = no-op) and remove. The key never appears in `Debug` output or errors | `SecretStore`, env lookup fn | US-03 all scenarios |
 | `OpenAiTranscriber` | Adapter (stt) | `Transcriber` over OpenAI: empty recording → `""`; no key → `KeyMissing`; multipart (`file` WAV, `model`, `response_format=json`, optional `prompt` = dictionary words, no `language`); `Authorization: Bearer`; one reused `ureq::Agent` with `OpenAiTimeouts` (connect 10 s, send body 120 s, answer 60 s after the upload); status mapping 401→`KeyRejected`, 429→`LimitReached`, 5xx/transport/timeout→`Unreachable`, other 4xx/bad JSON→`Failed`; `text` cleaned by `clean_transcript`. Base URL overridable for tests | `OpenAiKey`, `text`, `wav`, `multipart` | US-01, US-04 |
 | `KeychainSecret` | Adapter (macos) | `SecretStore`-shaped access to one generic-password Keychain item; "not found" = `Ok(None)` | `security-framework` | US-03 saved in secure storage |
 | `SpeechProviderSwitch` | App wiring | Holds the transcriber for the current `SpeechSettings`; `apply` rebuilds it via a factory on save | factory → `OpenAiTranscriber` | US-01 new model from next dictation |

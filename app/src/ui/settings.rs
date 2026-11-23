@@ -248,14 +248,15 @@ fn speech_rows(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Serv
     let status = session.key_status;
     let mut remove = false;
     choice_row(ui, "OpenAI key", key_status_text(status), |ui| {
-        if status == KeyStatus::Saved {
+        // A key that cannot be read can still be removed, so the user is never stuck.
+        if matches!(status, KeyStatus::Saved | KeyStatus::Unreadable) {
             remove = ui.button("Remove key").clicked();
         }
         ui.add(
             TextEdit::singleline(&mut session.form.new_key)
                 .password(true)
                 .hint_text(match status {
-                    KeyStatus::Saved => "Type to replace",
+                    KeyStatus::Saved | KeyStatus::Unreadable => "Type to replace",
                     _ => "sk-…",
                 })
                 .desired_width(220.0),
@@ -489,6 +490,24 @@ mod tests {
 
         assert_eq!(reads_on_open, 1);
         assert_eq!(probe.key_reads(), 1);
+    }
+
+    #[test]
+    fn a_key_that_cannot_be_read_is_reported_and_can_be_removed() {
+        let (services, probe) = test_services();
+        services.speech_key.save("sk-secret").unwrap();
+        probe.fail_key_reading("access denied");
+        let mut session = SettingsSession::open(&services);
+
+        let drawn = drawn_speech_rows(&mut session, &services);
+
+        assert!(
+            drawn
+                .iter()
+                .any(|t| t == "Couldn't read the OpenAI key from the Keychain"),
+            "{drawn:?}"
+        );
+        assert!(drawn.iter().any(|t| t == "Remove key"), "{drawn:?}");
     }
 
     #[test]

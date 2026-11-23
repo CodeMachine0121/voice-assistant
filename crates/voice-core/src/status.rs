@@ -65,6 +65,8 @@ pub enum SpeechFailure {
     Unreachable,
     /// No key for the speech provider is saved or set up on this Mac.
     KeyMissing,
+    /// A key is saved, but it could not be read from the Keychain.
+    KeyUnreadable,
     /// The speech provider does not accept the key.
     KeyRejected,
     /// Too many requests, or the provider account has no credit left.
@@ -84,6 +86,10 @@ impl SpeechFailure {
             SpeechFailure::KeyMissing => {
                 write!(f, "{name} key missing — add it in Settings › AI models")
             }
+            SpeechFailure::KeyUnreadable => write!(
+                f,
+                "Couldn't read the {name} key from the Keychain — allow access or save it again in Settings › AI models"
+            ),
             SpeechFailure::KeyRejected => {
                 write!(
                     f,
@@ -106,6 +112,7 @@ impl From<&TranscribeError> for SpeechFailure {
         match error {
             TranscribeError::Unreachable(_) => SpeechFailure::Unreachable,
             TranscribeError::KeyMissing => SpeechFailure::KeyMissing,
+            TranscribeError::KeyUnreadable => SpeechFailure::KeyUnreadable,
             TranscribeError::KeyRejected => SpeechFailure::KeyRejected,
             TranscribeError::LimitReached => SpeechFailure::LimitReached,
             TranscribeError::Failed(_) => SpeechFailure::NotTranscribed,
@@ -149,6 +156,7 @@ mod tests {
                 SpeechFailure::Unreachable,
             ),
             (TranscribeError::KeyMissing, SpeechFailure::KeyMissing),
+            (TranscribeError::KeyUnreadable, SpeechFailure::KeyUnreadable),
             (TranscribeError::KeyRejected, SpeechFailure::KeyRejected),
             (TranscribeError::LimitReached, SpeechFailure::LimitReached),
             (
@@ -185,6 +193,10 @@ mod tests {
             (
                 openai(SpeechFailure::KeyMissing),
                 "OpenAI key missing — add it in Settings › AI models",
+            ),
+            (
+                openai(SpeechFailure::KeyUnreadable),
+                "Couldn't read the OpenAI key from the Keychain — allow access or save it again in Settings › AI models",
             ),
             (
                 openai(SpeechFailure::KeyRejected),

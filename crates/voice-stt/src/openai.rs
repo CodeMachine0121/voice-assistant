@@ -1,6 +1,6 @@
 //! `Transcriber` backed by OpenAI's speech-to-text service
 //! (`POST {base}/audio/transcriptions`).
-use crate::key::OpenAiKey;
+use crate::key::{KeyProblem, OpenAiKey};
 use crate::multipart::Multipart;
 use crate::text::{clean_transcript, initial_prompt};
 use crate::wav::wav;
@@ -89,7 +89,10 @@ impl Transcriber for OpenAiTranscriber {
         if recording.samples.is_empty() {
             return Ok(String::new());
         }
-        let key = self.key.current().ok_or(TranscribeError::KeyMissing)?;
+        let key = self.key.current().map_err(|problem| match problem {
+            KeyProblem::Missing => TranscribeError::KeyMissing,
+            KeyProblem::Unreadable => TranscribeError::KeyUnreadable,
+        })?;
         let form = self.form(recording, dictionary);
         let mut response = self
             .agent
@@ -307,6 +310,31 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert!(seen[0].peer.is_some());
         assert_eq!(seen[0].peer, seen[1].peer, "one connection for both");
+    }
+
+    #[test]
+    fn a_key_that_cannot_be_read_is_reported_as_such_and_nothing_is_sent() {
+        struct Locked;
+        impl crate::key::SecretStore for Locked {
+            fn read(&self) -> Result<Option<String>, String> {
+                Err("keychain locked".into())
+            }
+            fn save(&self, _: &str) -> Result<(), String> {
+                Err("keychain locked".into())
+            }
+            fn remove(&self) -> Result<(), String> {
+                Err("keychain locked".into())
+            }
+        }
+        let fake = serve(200, r#"{"text":"hi"}"#, Duration::ZERO);
+        let locked = Arc::new(OpenAiKey::with_environment(Arc::new(Locked), || None));
+
+        let out = OpenAiTranscriber::new("gpt-4o-transcribe".into(), locked)
+            .with_base_url(&fake.base)
+            .transcribe(&half_second(), &no_dict());
+
+        assert_eq!(out, Err(TranscribeError::KeyUnreadable));
+        assert!(fake.seen.lock().expect("lock").is_empty());
     }
 
     #[test]
