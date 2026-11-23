@@ -1,6 +1,5 @@
 use crate::{Action, PersonalDictionary};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 /// A global shortcut. Every shortcut starts its action when tapped and stops it when
 /// tapped again. A "tap" shortcut counts only when its keys are pressed and released
@@ -128,16 +127,6 @@ impl SpeechProvider {
     }
 }
 
-/// Where speech is turned into words.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum SpeechSource {
-    /// The speech model built into the app, on this Mac.
-    #[default]
-    BuiltIn,
-    /// A speech model served by the local AI app at `Settings::assistant_url`.
-    LocalAiApp { model: String },
-}
-
 /// Which provider and speech model turn recordings into words.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -174,9 +163,6 @@ pub struct Settings {
     pub cleanup_enabled: bool,
     pub dictionary: PersonalDictionary,
     pub speech: SpeechSettings,
-    /// `None` = default location chosen by the speech adapter.
-    pub speech_model_path: Option<PathBuf>,
-    pub speech_source: SpeechSource,
 }
 
 impl Default for Settings {
@@ -189,8 +175,6 @@ impl Default for Settings {
             cleanup_enabled: true,
             dictionary: PersonalDictionary::default(),
             speech: SpeechSettings::default(),
-            speech_model_path: None,
-            speech_source: SpeechSource::BuiltIn,
         }
     }
 }

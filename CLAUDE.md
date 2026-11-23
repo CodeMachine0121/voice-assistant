@@ -1,6 +1,6 @@
 # Voice Assistant — working rules
 
-Mac voice dictation (Typeless-like). Rust workspace, egui/eframe UI, whisper.cpp on-device speech, LM Studio for text polishing.
+Mac voice dictation (Typeless-like). Rust workspace, egui/eframe UI, OpenAI speech-to-text (key in the Keychain), LM Studio for text polishing.
 Design: `.sdd/2026-11-22-voice-dictation/ARCH.md` (ports & adapters). Requirements: `PRD.md` in the same folder.
 
 ## Layout

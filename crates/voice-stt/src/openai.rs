@@ -205,7 +205,13 @@ mod tests {
         let out = transcriber(&fake).transcribe(&five_minutes, &no_dict());
 
         assert_eq!(out, Ok("long talk".to_string()));
-        let audio = field(&first(&fake), "file").expect("file part");
+        let seen = first(&fake);
+        let (headers, audio) = parts(&seen)
+            .into_iter()
+            .find(|(h, _)| h.contains("name=\"file\""))
+            .expect("file part");
+        assert!(headers.contains("filename=\"audio.wav\""), "{headers}");
+        assert!(headers.contains("Content-Type: audio/wav"), "{headers}");
         assert_eq!(audio.len(), 44 + 9_600_000);
         let reader = hound::WavReader::new(Cursor::new(audio)).expect("valid wav");
         assert_eq!(reader.spec().sample_rate, 16_000);

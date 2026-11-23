@@ -14,8 +14,8 @@ INSTALL_DIR ?= /Applications
 # command line, in the environment, or once in .make.local.
 CODESIGN_IDENTITY ?=
 export CODESIGN_IDENTITY
-# Same target for every build so cargo never rebuilds whisper.cpp when switching
-# between `make run` and `make build`.
+# Same target for every build so cargo never rebuilds native dependencies when
+# switching between `make run` and `make build`.
 export MACOSX_DEPLOYMENT_TARGET := 13.0
 
 .DEFAULT_GOAL := help
@@ -24,9 +24,8 @@ export MACOSX_DEPLOYMENT_TARGET := 13.0
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-deps: ## Check build prerequisites (Xcode CLT, CMake, Rust)
+deps: ## Check build prerequisites (Xcode CLT, Rust)
 	@xcode-select -p >/dev/null 2>&1 || { echo "Missing Xcode Command Line Tools: run 'xcode-select --install'"; exit 1; }
-	@command -v cmake >/dev/null || { echo "Missing CMake: run 'brew install cmake'"; exit 1; }
 	@command -v cargo >/dev/null || { echo "Missing Rust: see https://rustup.rs"; exit 1; }
 	@echo "All prerequisites found."
 

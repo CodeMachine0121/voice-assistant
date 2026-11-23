@@ -58,7 +58,6 @@ impl SettingsForm {
                 provider: self.speech.provider,
                 model: self.speech.model.trim().to_string(),
             },
-            ..Settings::default()
         }
     }
 
@@ -109,8 +108,8 @@ impl SettingsForm {
             .then_some(ADDRESS_MISSING)
     }
 
-    /// A warning when the local AI app address is not on this Mac: speech and selected
-    /// text are sent there.
+    /// A warning when the local AI app address is not on this Mac: the heard words and
+    /// selected text are sent there.
     pub fn address_warning(&self) -> Option<&'static str> {
         let address = self.assistant_url.trim();
         (!address.is_empty() && !is_on_this_mac(address)).then_some(ADDRESS_NOT_LOCAL)
@@ -222,7 +221,6 @@ mod tests {
                 model: "whisper-1".into(),
                 ..SpeechSettings::default()
             },
-            ..Settings::default()
         };
         assert_eq!(
             SettingsForm::from_settings(&settings).to_settings(),

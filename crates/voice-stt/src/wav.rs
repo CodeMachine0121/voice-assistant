@@ -27,3 +27,28 @@ pub(crate) fn wav(samples: &[f32]) -> Vec<u8> {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn samples_become_16_bit_mono_wav_at_16_khz_with_clipping() {
+        let bytes = wav(&[0.0, 0.5, -0.5, 1.0, -1.0, 2.0]);
+
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        let reader = hound::WavReader::new(Cursor::new(bytes)).expect("valid wav");
+        let spec = reader.spec();
+        assert_eq!(spec.sample_rate, 16_000);
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.bits_per_sample, 16);
+        assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+        let decoded: Vec<i16> = reader
+            .into_samples::<i16>()
+            .map(|s| s.expect("sample"))
+            .collect();
+        assert_eq!(decoded, vec![0, 16384, -16384, 32767, -32767, 32767]);
+    }
+}
