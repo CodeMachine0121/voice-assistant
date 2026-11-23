@@ -3,26 +3,46 @@
 /// Which of the prompt's tags the model may echo back around its answer.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct EchoedTags {
-    /// Tags that wrapped the content being worked on: only the tag text is removed.
+    /// Tags that wrapped the content being worked on: a pair wrapping the whole answer
+    /// is removed, keeping its content.
     pub(crate) unwrap: &'static [&'static str],
-    /// Tags that held input only: the whole block is removed.
+    /// Tags that held input only: a block of one leading the answer is removed whole.
     pub(crate) drop: &'static [&'static str],
 }
 
 /// Removes reasoning blocks, echoed prompt tags, code fences and surrounding quotes,
-/// then trims.
+/// then trims. Tags inside the answer's content are kept: they may be part of the text.
 pub(crate) fn clean_answer(answer: &str, echoed: EchoedTags) -> String {
-    let mut text = strip_block(answer, "think");
+    let thought_free = strip_block(answer, "think");
+    let mut text = thought_free.trim();
     for name in echoed.drop {
-        text = strip_block(&text, name);
+        text = strip_leading_block(text, name).trim();
     }
     for name in echoed.unwrap {
-        text = text
-            .replace(&format!("<{name}>"), "")
-            .replace(&format!("</{name}>"), "");
+        text = strip_wrapping_pair(text, name).trim();
     }
-    let text = strip_fence(text.trim());
+    let text = strip_fence(text);
     strip_quotes(text.trim()).trim().to_string()
+}
+
+/// Removes a `<name>…</name>` block that starts the text.
+fn strip_leading_block<'a>(text: &'a str, name: &str) -> &'a str {
+    let close = format!("</{name}>");
+    match text.strip_prefix(&format!("<{name}>")) {
+        Some(rest) => rest
+            .find(&close)
+            .map_or(text, |end| &rest[end + close.len()..]),
+        None => text,
+    }
+}
+
+/// Returns the content of a single `<name>…</name>` pair that wraps the whole text.
+fn strip_wrapping_pair<'a>(text: &'a str, name: &str) -> &'a str {
+    let close = format!("</{name}>");
+    text.strip_prefix(&format!("<{name}>"))
+        .and_then(|rest| rest.strip_suffix(&close))
+        .filter(|inner| !inner.contains(&close))
+        .unwrap_or(text)
 }
 
 /// Removes every `<name>…</name>` block; an unterminated block swallows the rest.
@@ -141,6 +161,51 @@ mod tests {
                 "<instruction>translate</instruction>\n<selection>We meet.</selection>",
                 echoed
             ),
+            "We meet."
+        );
+    }
+
+    const EDIT: EchoedTags = EchoedTags {
+        unwrap: &["selection"],
+        drop: &["instruction"],
+    };
+
+    #[test]
+    fn tags_inside_the_content_are_kept() {
+        for answer in [
+            "Wrap it in <selection> tags.",
+            "Use <selection>x</selection> here.",
+            "Write <instruction>be brief</instruction> at the top.",
+            "<selection>a</selection> and <selection>b</selection>",
+        ] {
+            assert_eq!(super::clean_answer(answer, EDIT), answer);
+        }
+    }
+
+    #[test]
+    fn instruction_block_is_dropped_only_when_it_leads() {
+        assert_eq!(
+            super::clean_answer("Done. <instruction>x</instruction>", EDIT),
+            "Done. <instruction>x</instruction>"
+        );
+        assert_eq!(
+            super::clean_answer("<instruction>x</instruction> Done.", EDIT),
+            "Done."
+        );
+        assert_eq!(
+            super::clean_answer("<instruction>unterminated Done.", EDIT),
+            "<instruction>unterminated Done."
+        );
+    }
+
+    #[test]
+    fn wrapping_pair_keeps_tags_inside_the_edited_text() {
+        assert_eq!(
+            super::clean_answer("<selection>Put <selection> in the docs.</selection>", EDIT),
+            "Put <selection> in the docs."
+        );
+        assert_eq!(
+            super::clean_answer("  <selection>We meet.</selection>\n", EDIT),
             "We meet."
         );
     }
