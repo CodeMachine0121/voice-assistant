@@ -97,6 +97,20 @@ impl OpenAiKey {
         }
     }
 
+    /// Like [`save`](Self::save), but hands back what was saved before, so a change that
+    /// fails later can be undone with [`PreviousKey::restore`].
+    pub fn replace(&self, key: &str) -> Result<PreviousKey, String> {
+        let Some(key) = non_blank(Some(key.to_string())) else {
+            return Ok(PreviousKey::Unchanged);
+        };
+        let previous = match self.store.read()? {
+            Some(saved) => PreviousKey::Saved(saved),
+            None => PreviousKey::Absent,
+        };
+        self.store.save(&key)?;
+        Ok(previous)
+    }
+
     /// Forgets the saved key; the environment's key (if any) is used from then on.
     pub fn remove(&self) -> Result<(), String> {
         self.store.remove()
@@ -118,6 +132,38 @@ impl fmt::Debug for OpenAiKey {
         f.debug_struct("OpenAiKey")
             .field("status", &self.status())
             .finish()
+    }
+}
+
+/// What the store held before [`OpenAiKey::replace`]. Its `Debug` never shows the key.
+#[must_use = "a key change that is not kept must be restored"]
+pub enum PreviousKey {
+    /// Nothing was replaced (the new key was blank).
+    Unchanged,
+    /// No key was saved.
+    Absent,
+    /// This key was saved.
+    Saved(String),
+}
+
+impl PreviousKey {
+    /// Puts the store back the way it was before the replacement.
+    pub fn restore(self, key: &OpenAiKey) -> Result<(), String> {
+        match self {
+            PreviousKey::Unchanged => Ok(()),
+            PreviousKey::Absent => key.store.remove(),
+            PreviousKey::Saved(saved) => key.store.save(&saved),
+        }
+    }
+}
+
+impl fmt::Debug for PreviousKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            PreviousKey::Unchanged => "Unchanged",
+            PreviousKey::Absent => "Absent",
+            PreviousKey::Saved(_) => "Saved(<redacted>)",
+        })
     }
 }
 
@@ -308,6 +354,59 @@ mod tests {
         assert_eq!(key.status(), KeyStatus::FromEnvironment);
 
         assert_eq!(store.reads.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_replaced_key_can_be_restored() {
+        let store = Arc::new(MemorySecretStore::holding("sk-old"));
+        let key = key_with(store.clone(), None);
+
+        let previous = key.replace(" sk-new ").unwrap();
+        assert_eq!(store.read().unwrap().as_deref(), Some("sk-new"));
+        previous.restore(&key).unwrap();
+
+        assert_eq!(store.read().unwrap().as_deref(), Some("sk-old"));
+    }
+
+    #[test]
+    fn restoring_a_first_key_removes_it() {
+        let store = Arc::new(MemorySecretStore::default());
+        let key = key_with(store.clone(), None);
+
+        key.replace("sk-new").unwrap().restore(&key).unwrap();
+
+        assert_eq!(store.read().unwrap(), None);
+    }
+
+    #[test]
+    fn replacing_with_a_blank_key_changes_and_restores_nothing() {
+        let store = Arc::new(MemorySecretStore::holding("sk-old"));
+        let key = key_with(store.clone(), None);
+
+        let previous = key.replace("  ").unwrap();
+        store.save("sk-other").unwrap();
+        previous.restore(&key).unwrap();
+
+        assert_eq!(store.read().unwrap().as_deref(), Some("sk-other"));
+    }
+
+    #[test]
+    fn replacing_fails_when_the_store_does() {
+        let key = key_with(Arc::new(Broken), None);
+
+        assert_eq!(
+            key.replace("sk-new").map(|_| ()),
+            Err("keychain locked".to_string())
+        );
+    }
+
+    #[test]
+    fn the_previous_key_is_never_shown() {
+        let shown = format!("{:?}", PreviousKey::Saved("sk-old".into()));
+
+        assert_eq!(shown, "Saved(<redacted>)");
+        assert_eq!(format!("{:?}", PreviousKey::Absent), "Absent");
+        assert_eq!(format!("{:?}", PreviousKey::Unchanged), "Unchanged");
     }
 
     #[test]

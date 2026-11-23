@@ -114,6 +114,7 @@ pub fn test_services() -> (Services, Probe) {
     let updates = Arc::new(Mutex::new(Vec::new()));
     let recorded = updates.clone();
     let secret = Arc::new(FlakySecret::default());
+    let speech_key = Arc::new(OpenAiKey::with_environment(secret.clone(), || None));
     let services = Services {
         settings_store: settings.clone(),
         history_store: history,
@@ -125,7 +126,7 @@ pub fn test_services() -> (Services, Probe) {
         repaint: RepaintHandle::default(),
         list_input_devices: Arc::new(|| vec!["Mic A".to_string()]),
         list_models: Arc::new(|_| Ok(vec!["model-a".to_string()])),
-        speech_key: Arc::new(OpenAiKey::with_environment(secret.clone(), || None)),
+        speech_key: speech_key.clone(),
         permissions: Permissions {
             microphone_granted: Arc::new(|| Some(true)),
             request_microphone: Arc::new(|| {}),
@@ -134,9 +135,12 @@ pub fn test_services() -> (Services, Probe) {
             shortcuts_listening: Arc::new(|| true),
             open_privacy_settings: Arc::new(|_| {}),
         },
-        save_settings: settings_saver(settings.clone(), settings_tx, move |s: &Settings| {
-            recorded.lock().unwrap().push(s.clone())
-        }),
+        save_settings: settings_saver(
+            settings.clone(),
+            speech_key.clone(),
+            settings_tx,
+            move |s: &Settings| recorded.lock().unwrap().push(s.clone()),
+        ),
     };
     (
         services,

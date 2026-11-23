@@ -195,9 +195,15 @@ pub fn build() -> Services {
     let history_store: Arc<dyn HistoryStore> = Arc::new(InMemoryHistory::default());
     let repaint = RepaintHandle::default();
     let engine = spawn_engine(history_store.clone(), repaint.clone());
+    // Demo mode never talks to OpenAI, so the key is only kept in memory.
+    let speech_key = Arc::new(OpenAiKey::with_environment(
+        Arc::new(MemorySecretStore::default()),
+        || None,
+    ));
     Services {
         save_settings: super::settings_saver(
             settings_store.clone(),
+            speech_key.clone(),
             engine.settings.clone(),
             |s| {
                 log::info!("demo: shortcuts now {:?}", s.shortcuts);
@@ -219,11 +225,7 @@ pub fn build() -> Services {
                 "llama-3.2-3b-instruct".to_string(),
             ])
         }),
-        // Demo mode never talks to OpenAI, so the key is only kept in memory.
-        speech_key: Arc::new(OpenAiKey::with_environment(
-            Arc::new(MemorySecretStore::default()),
-            || None,
-        )),
+        speech_key,
         permissions: fake_permissions(),
     }
 }
@@ -361,7 +363,11 @@ mod tests {
         assert_eq!((s.list_input_devices)().len(), 2);
         assert_eq!((s.list_models)("http://x").unwrap().len(), 2);
         assert_eq!(s.settings_store.load(), Settings::default());
-        (s.save_settings)(&Settings::default()).unwrap();
+        (s.save_settings)(&super::super::SettingsChange {
+            settings: Settings::default(),
+            new_key: None,
+        })
+        .unwrap();
         assert_eq!(s.speech_key.status(), voice_stt::KeyStatus::Missing);
     }
 }

@@ -4,7 +4,7 @@ use crate::permissions_view::PermissionSnapshot;
 use crate::settings_form::SettingsForm;
 use crate::tasks::{spawn_list_models, ModelsState, TaskEvent, TaskState};
 use crate::tray::TrayCommand;
-use crate::wiring::Services;
+use crate::wiring::{SaveError, Services, SettingsChange};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::time::Instant;
 use voice_core::{History, Settings, Status};
@@ -99,24 +99,26 @@ impl SettingsSession {
         }
         // A word typed but not yet added would otherwise be silently dropped.
         self.form.add_word();
-        // The key goes first: when it cannot be kept, nothing else is saved either.
-        if let Some(key) = self.form.typed_key() {
-            if let Err(e) = services.speech_key.save(key) {
-                self.notice = Some(Notice::Problem(format!(
-                    "Could not save the OpenAI key: {e}"
-                )));
-                return;
-            }
-        }
         let settings = self.form.to_settings();
-        match (services.save_settings)(&settings) {
+        let change = SettingsChange {
+            settings: settings.clone(),
+            new_key: self.form.typed_key().map(str::to_string),
+        };
+        match (services.save_settings)(&change) {
             Ok(()) => {
                 self.key_status = services.speech_key.status();
                 self.form = SettingsForm::from_settings(&settings);
                 self.stored = settings;
                 self.notice = Some(Notice::Saved);
             }
-            Err(e) => self.notice = Some(Notice::Problem(format!("Could not save: {e}"))),
+            Err(SaveError::Key(e)) => {
+                self.notice = Some(Notice::Problem(format!(
+                    "Could not save the OpenAI key: {e}"
+                )))
+            }
+            Err(SaveError::Settings(e)) => {
+                self.notice = Some(Notice::Problem(format!("Could not save: {e}")))
+            }
         }
     }
 }
@@ -558,6 +560,24 @@ mod tests {
         assert!(services.settings_store.load().cleanup_enabled);
         assert!(probe.applied_settings().is_empty());
         assert_eq!(session.form.new_key, "sk-test", "typed key kept for retry");
+    }
+
+    #[test]
+    fn settings_that_cannot_be_kept_leave_the_saved_key_as_it_was() {
+        let (services, probe) = test_services();
+        services.speech_key.save("sk-old").unwrap();
+        probe.fail_saving("disk full");
+        let mut session = SettingsSession::open(&services);
+        session.form.new_key = "sk-new".into();
+
+        session.save(&services);
+
+        assert_eq!(
+            session.notice,
+            Some(Notice::Problem("Could not save: disk full".into()))
+        );
+        assert_eq!(probe.saved_key().as_deref(), Some("sk-old"));
+        assert_eq!(session.form.new_key, "sk-new", "typed key kept for retry");
     }
 
     #[test]

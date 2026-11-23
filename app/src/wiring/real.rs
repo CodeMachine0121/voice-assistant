@@ -322,6 +322,7 @@ pub fn build() -> Services {
 
     let save_settings = settings_saver(
         settings_store.clone(),
+        speech_key.clone(),
         engine.settings.clone(),
         move |s: &Settings| {
             transcriber.apply(&s.speech);
