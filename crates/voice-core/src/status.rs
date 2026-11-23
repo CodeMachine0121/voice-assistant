@@ -1,4 +1,4 @@
-use crate::Action;
+use crate::{Action, SpeechProvider};
 use std::fmt;
 
 /// A problem the user must be told about.
@@ -7,7 +7,16 @@ pub enum Problem {
     NoSpeech,
     /// The writing assistant could not be reached while running this action.
     AssistantUnreachable(Action),
-    SpeechModelUnreachable,
+    /// No connection, no answer within the time limit, or trouble on the provider's side.
+    SpeechUnreachable(SpeechProvider),
+    /// No key for the speech provider is saved or set up on this Mac.
+    SpeechKeyMissing(SpeechProvider),
+    /// The speech provider does not accept the key.
+    SpeechKeyRejected(SpeechProvider),
+    /// Too many requests, or the provider account has no credit left.
+    SpeechLimitReached(SpeechProvider),
+    /// The speech provider refused the recording or answered with nothing usable.
+    SpeechNotTranscribed(SpeechProvider),
     /// The writing assistant answered an Edit selection with nothing usable.
     InstructionNotCarriedOut,
     /// Edit selection was started with nothing selected.
@@ -34,10 +43,29 @@ impl fmt::Display for Problem {
                 "Couldn't run the instruction — writing assistant not reachable"
             ),
             Problem::InstructionNotCarriedOut => write!(f, "Couldn't run the instruction"),
-            Problem::SpeechModelUnreachable => write!(
+            Problem::SpeechUnreachable(p) => write!(
                 f,
-                "Speech model not reachable — is your local AI app running?"
+                "{} not reachable — check your internet connection",
+                p.label()
             ),
+            Problem::SpeechKeyMissing(p) => write!(
+                f,
+                "{} key missing — add it in Settings › AI models",
+                p.label()
+            ),
+            Problem::SpeechKeyRejected(p) => write!(
+                f,
+                "{} rejected the key — check it in Settings › AI models",
+                p.label()
+            ),
+            Problem::SpeechLimitReached(p) => write!(
+                f,
+                "{0} limit reached — try again later or check your {0} account",
+                p.label()
+            ),
+            Problem::SpeechNotTranscribed(p) => {
+                write!(f, "{} couldn't turn the recording into words", p.label())
+            }
             Problem::NoSelection => {
                 write!(f, "Select text first, then start Edit selection again")
             }
@@ -95,8 +123,24 @@ mod tests {
                 "Couldn't run the instruction — writing assistant not reachable",
             ),
             (
-                Problem::SpeechModelUnreachable,
-                "Speech model not reachable — is your local AI app running?",
+                Problem::SpeechUnreachable(SpeechProvider::OpenAi),
+                "OpenAI not reachable — check your internet connection",
+            ),
+            (
+                Problem::SpeechKeyMissing(SpeechProvider::OpenAi),
+                "OpenAI key missing — add it in Settings › AI models",
+            ),
+            (
+                Problem::SpeechKeyRejected(SpeechProvider::OpenAi),
+                "OpenAI rejected the key — check it in Settings › AI models",
+            ),
+            (
+                Problem::SpeechLimitReached(SpeechProvider::OpenAi),
+                "OpenAI limit reached — try again later or check your OpenAI account",
+            ),
+            (
+                Problem::SpeechNotTranscribed(SpeechProvider::OpenAi),
+                "OpenAI couldn't turn the recording into words",
             ),
             (
                 Problem::NoSelection,

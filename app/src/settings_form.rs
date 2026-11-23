@@ -1,6 +1,8 @@
 //! Editable copy of `Settings` for the Settings window, and the conversion back.
 use std::path::PathBuf;
-use voice_core::{Action, ActionShortcuts, PersonalDictionary, Settings, SpeechSource};
+use voice_core::{
+    Action, ActionShortcuts, PersonalDictionary, Settings, SpeechSettings, SpeechSource,
+};
 
 /// The speech model row's first choice.
 pub const BUILT_IN_SPEECH: &str = "Built-in (on this Mac)";
@@ -26,6 +28,7 @@ pub struct SettingsForm {
     /// Speech model location as typed; blank = default location.
     pub speech_model_path: String,
     pub speech_source: SpeechSource,
+    pub speech: SpeechSettings,
 }
 
 impl SettingsForm {
@@ -44,6 +47,7 @@ impl SettingsForm {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             speech_source: settings.speech_source.clone(),
+            speech: settings.speech.clone(),
         }
     }
 
@@ -58,6 +62,7 @@ impl SettingsForm {
             dictionary: self.dictionary.clone(),
             speech_model_path: (!path.is_empty()).then(|| PathBuf::from(path)),
             speech_source: self.speech_source.clone(),
+            speech: self.speech.clone(),
         }
     }
 
@@ -220,6 +225,10 @@ mod tests {
             speech_model_path: Some(PathBuf::from("/models/small.bin")),
             speech_source: SpeechSource::LocalAiApp {
                 model: "breeze-asr-25".into(),
+            },
+            speech: SpeechSettings {
+                model: "whisper-1".into(),
+                ..SpeechSettings::default()
             },
         };
         assert_eq!(

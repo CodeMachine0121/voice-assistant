@@ -28,5 +28,7 @@ pub use ports::{
 };
 pub use recording::Recording;
 pub use rules::MAX_SELECTION_CHARS;
-pub use settings::{ActionShortcuts, Settings, Shortcut, SpeechSource};
+pub use settings::{
+    ActionShortcuts, Settings, Shortcut, SpeechProvider, SpeechSettings, SpeechSource,
+};
 pub use status::{Problem, Status};

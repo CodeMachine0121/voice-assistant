@@ -251,10 +251,12 @@ mod tests {
         assert_eq!(view.kind, IndicatorKind::Problem);
         assert_eq!(view.text, "No speech heard");
         assert_eq!(view.level, 0.0);
-        let unreachable = view_of(&Status::Problem(Problem::SpeechModelUnreachable));
+        let unreachable = view_of(&Status::Problem(Problem::SpeechUnreachable(
+            voice_core::SpeechProvider::OpenAi,
+        )));
         assert_eq!(
             unreachable.text,
-            "Speech model not reachable — is your local AI app running?"
+            "OpenAI not reachable — check your internet connection"
         );
     }
 

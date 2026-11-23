@@ -98,6 +98,36 @@ impl ActionShortcuts {
     }
 }
 
+/// The online service that turns speech into words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum SpeechProvider {
+    #[default]
+    OpenAi,
+}
+
+impl SpeechProvider {
+    /// Every provider the user may choose from, in the order they are offered.
+    pub const ALL: [SpeechProvider; 1] = [SpeechProvider::OpenAi];
+
+    /// Name shown to the user.
+    pub fn label(self) -> &'static str {
+        match self {
+            SpeechProvider::OpenAi => "OpenAI",
+        }
+    }
+
+    /// Speech models offered for this provider; the first is the default.
+    pub fn models(self) -> &'static [&'static str] {
+        match self {
+            SpeechProvider::OpenAi => &["gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1"],
+        }
+    }
+
+    pub fn default_model(self) -> &'static str {
+        self.models()[0]
+    }
+}
+
 /// Where speech is turned into words.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SpeechSource {
@@ -108,8 +138,28 @@ pub enum SpeechSource {
     LocalAiApp { model: String },
 }
 
+/// Which provider and speech model turn recordings into words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpeechSettings {
+    pub provider: SpeechProvider,
+    /// The provider's identifier of the speech model.
+    pub model: String,
+}
+
+impl Default for SpeechSettings {
+    fn default() -> Self {
+        let provider = SpeechProvider::default();
+        Self {
+            provider,
+            model: provider.default_model().to_string(),
+        }
+    }
+}
+
 /// Settings saved by earlier versions load with every field they still share; fields that
-/// no longer exist (the press-and-hold shortcuts) are ignored and new ones take defaults.
+/// no longer exist (the press-and-hold shortcuts, the on-device and local speech model
+/// choices) are ignored and new ones take defaults.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -123,6 +173,7 @@ pub struct Settings {
     /// AI cleanup of Dictate results (has no effect on the other actions).
     pub cleanup_enabled: bool,
     pub dictionary: PersonalDictionary,
+    pub speech: SpeechSettings,
     /// `None` = default location chosen by the speech adapter.
     pub speech_model_path: Option<PathBuf>,
     pub speech_source: SpeechSource,
@@ -137,6 +188,7 @@ impl Default for Settings {
             assistant_model: String::new(),
             cleanup_enabled: true,
             dictionary: PersonalDictionary::default(),
+            speech: SpeechSettings::default(),
             speech_model_path: None,
             speech_source: SpeechSource::BuiltIn,
         }
@@ -153,13 +205,28 @@ mod tests {
         assert_eq!(s.shortcuts.dictate, Shortcut::TapCommand);
         assert_eq!(s.shortcuts.english, Shortcut::TapCommandShift);
         assert_eq!(s.shortcuts.edit_selection, Shortcut::OptionSpace);
-        assert_eq!(s.speech_source, SpeechSource::BuiltIn);
+        assert_eq!(s.speech.provider, SpeechProvider::OpenAi);
+        assert_eq!(s.speech.provider.label(), "OpenAI");
+        assert_eq!(s.speech.model, "gpt-4o-transcribe");
         assert_eq!(s.assistant_model, "", "whatever is loaded");
         assert_eq!(s.assistant_url, "http://localhost:1234/v1");
         assert_eq!(s.microphone, None, "system default microphone");
         assert!(s.cleanup_enabled);
         assert!(s.dictionary.is_empty());
-        assert_eq!(s.speech_model_path, None);
+    }
+
+    #[test]
+    fn openai_is_the_only_speech_provider() {
+        assert_eq!(SpeechProvider::ALL, [SpeechProvider::OpenAi]);
+    }
+
+    #[test]
+    fn openai_offers_three_speech_models_with_gpt_4o_transcribe_first() {
+        assert_eq!(
+            SpeechProvider::OpenAi.models(),
+            ["gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1"]
+        );
+        assert_eq!(SpeechProvider::OpenAi.default_model(), "gpt-4o-transcribe");
     }
 
     #[test]
@@ -265,8 +332,9 @@ mod tests {
     #[test]
     fn settings_round_trip_through_json() {
         let mut settings = Settings {
-            speech_source: SpeechSource::LocalAiApp {
-                model: "breeze-asr-25".into(),
+            speech: SpeechSettings {
+                provider: SpeechProvider::OpenAi,
+                model: "gpt-4o-mini-transcribe".into(),
             },
             assistant_model: "twil-8b".into(),
             ..Settings::default()
@@ -295,13 +363,64 @@ mod tests {
         let s: Settings = serde_json::from_str(old).unwrap();
 
         assert_eq!(s.shortcuts, ActionShortcuts::default());
-        assert_eq!(s.speech_source, SpeechSource::BuiltIn);
+        assert_eq!(s.speech, SpeechSettings::default());
         assert_eq!(s.dictionary.words(), ["Cafler"]);
         assert_eq!(s.microphone.as_deref(), Some("USB Mic"));
         assert_eq!(s.assistant_url, "http://localhost:4321/v1");
         assert_eq!(s.assistant_model, "twil-8b");
         assert!(!s.cleanup_enabled);
-        assert_eq!(s.speech_model_path, Some(PathBuf::from("/models/ggml.bin")));
+    }
+
+    #[test]
+    fn a_saved_built_in_speech_choice_moves_to_openai_and_keeps_the_rest() {
+        let old = r#"{
+            "shortcuts": { "dictate": "TapFn" },
+            "microphone": "USB Mic",
+            "assistant_model": "twil-8b",
+            "dictionary": ["Cafler"],
+            "speech_model_path": "/models/ggml-small.bin",
+            "speech_source": "BuiltIn"
+        }"#;
+
+        let s: Settings = serde_json::from_str(old).unwrap();
+
+        assert_eq!(s.speech.provider, SpeechProvider::OpenAi);
+        assert_eq!(s.speech.model, "gpt-4o-transcribe");
+        assert_eq!(s.shortcuts.dictate, Shortcut::TapFn);
+        assert_eq!(s.microphone.as_deref(), Some("USB Mic"));
+        assert_eq!(s.dictionary.words(), ["Cafler"]);
+        assert_eq!(s.assistant_model, "twil-8b");
+    }
+
+    #[test]
+    fn a_saved_local_ai_app_speech_model_moves_to_openai() {
+        let old = r#"{
+            "assistant_model": "twil-8b",
+            "speech_source": { "LocalAiApp": { "model": "breeze-asr-25" } }
+        }"#;
+
+        let s: Settings = serde_json::from_str(old).unwrap();
+
+        assert_eq!(s.speech.provider, SpeechProvider::OpenAi);
+        assert_eq!(s.speech.model, "gpt-4o-transcribe");
+        assert_eq!(s.assistant_model, "twil-8b");
+    }
+
+    #[test]
+    fn settings_without_a_speech_choice_use_openai() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+
+        assert_eq!(s.speech.provider, SpeechProvider::OpenAi);
+        assert_eq!(s.speech.model, "gpt-4o-transcribe");
+    }
+
+    #[test]
+    fn a_partially_saved_speech_choice_fills_in_the_provider() {
+        let s: Settings =
+            serde_json::from_str(r#"{ "speech": { "model": "whisper-1" } }"#).unwrap();
+
+        assert_eq!(s.speech.provider, SpeechProvider::OpenAi);
+        assert_eq!(s.speech.model, "whisper-1");
     }
 
     #[test]
