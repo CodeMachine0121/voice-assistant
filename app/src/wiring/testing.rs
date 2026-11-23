@@ -3,6 +3,7 @@ use super::{fakes, settings_saver, Permissions, RepaintHandle, Services};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use voice_core::{EngineHandle, HistoryStore, Settings, SettingsStore, Status};
+use voice_stt::{OpenAiKey, SecretStore};
 
 /// A settings store that can be told to fail.
 #[derive(Default)]
@@ -25,15 +26,75 @@ impl SettingsStore for FlakySettings {
     }
 }
 
+/// A secret store that can be told to fail, standing in for the Keychain.
+#[derive(Default)]
+struct FlakySecret {
+    secret: Mutex<Option<String>>,
+    failure: Mutex<Option<String>>,
+    read_failure: Mutex<Option<String>>,
+    reads: Mutex<usize>,
+}
+
+impl FlakySecret {
+    fn failure(&self) -> Result<(), String> {
+        match self.failure.lock().unwrap().clone() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+impl SecretStore for FlakySecret {
+    fn read(&self) -> Result<Option<String>, String> {
+        *self.reads.lock().unwrap() += 1;
+        if let Some(e) = self.read_failure.lock().unwrap().clone() {
+            return Err(e);
+        }
+        Ok(self.secret.lock().unwrap().clone())
+    }
+
+    fn save(&self, secret: &str) -> Result<(), String> {
+        self.failure()?;
+        *self.secret.lock().unwrap() = Some(secret.to_string());
+        Ok(())
+    }
+
+    fn remove(&self) -> Result<(), String> {
+        self.failure()?;
+        *self.secret.lock().unwrap() = None;
+        Ok(())
+    }
+}
+
 /// Sees what the app asked of the services.
 pub struct Probe {
     settings: Arc<FlakySettings>,
     engine_settings: Receiver<Settings>,
     status_tx: Sender<Status>,
     applied: Arc<Mutex<Vec<Settings>>>,
+    secret: Arc<FlakySecret>,
 }
 
 impl Probe {
+    /// What the secret store (the Keychain in the real app) holds.
+    pub fn saved_key(&self) -> Option<String> {
+        self.secret.secret.lock().unwrap().clone()
+    }
+
+    /// How often the secret store has been read so far.
+    pub fn key_reads(&self) -> usize {
+        *self.secret.reads.lock().unwrap()
+    }
+
+    /// Makes reading the key fail from now on, as when Keychain access is denied.
+    pub fn fail_key_reading(&self, message: &str) {
+        *self.secret.read_failure.lock().unwrap() = Some(message.to_string());
+    }
+
+    pub fn fail_key_storage(&self, message: &str) {
+        *self.secret.failure.lock().unwrap() = Some(message.to_string());
+    }
+
     pub fn fail_saving(&self, message: &str) {
         *self.settings.failure.lock().unwrap() = Some(message.to_string());
     }
@@ -61,6 +122,8 @@ pub fn test_services() -> (Services, Probe) {
     let (status_tx, status_rx) = unbounded::<Status>();
     let updates = Arc::new(Mutex::new(Vec::new()));
     let recorded = updates.clone();
+    let secret = Arc::new(FlakySecret::default());
+    let speech_key = Arc::new(OpenAiKey::with_environment(secret.clone(), || None));
     let services = Services {
         settings_store: settings.clone(),
         history_store: history,
@@ -72,8 +135,7 @@ pub fn test_services() -> (Services, Probe) {
         repaint: RepaintHandle::default(),
         list_input_devices: Arc::new(|| vec!["Mic A".to_string()]),
         list_models: Arc::new(|_| Ok(vec!["model-a".to_string()])),
-        default_model_path: Arc::new(|| "/default/model.bin".into()),
-        download_model: Arc::new(|_, _| Ok(())),
+        speech_key: speech_key.clone(),
         permissions: Permissions {
             microphone_granted: Arc::new(|| Some(true)),
             request_microphone: Arc::new(|| {}),
@@ -82,9 +144,12 @@ pub fn test_services() -> (Services, Probe) {
             shortcuts_listening: Arc::new(|| true),
             open_privacy_settings: Arc::new(|_| {}),
         },
-        save_settings: settings_saver(settings.clone(), settings_tx, move |s: &Settings| {
-            recorded.lock().unwrap().push(s.clone())
-        }),
+        save_settings: settings_saver(
+            settings.clone(),
+            speech_key.clone(),
+            settings_tx,
+            move |s: &Settings| recorded.lock().unwrap().push(s.clone()),
+        ),
     };
     (
         services,
@@ -93,6 +158,7 @@ pub fn test_services() -> (Services, Probe) {
             engine_settings: settings_rx,
             status_tx,
             applied: updates,
+            secret,
         },
     )
 }

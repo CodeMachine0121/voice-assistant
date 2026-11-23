@@ -2,18 +2,19 @@
 use crate::model::{Notice, SettingsSession};
 use crate::permissions_view::{self, Access};
 use crate::settings_form::{
-    assistant_choices, assistant_label, speech_choices, speech_label, BUILT_IN_SPEECH,
+    assistant_choices, assistant_label, key_status_text, speech_model_choices, SPEECH_PRIVACY_NOTE,
 };
 use crate::shortcut_names::{caps_text, friendly_name, key_caps, ALL_SHORTCUTS};
 use crate::tasks::ModelsState;
 use crate::ui::{OK_COLOUR, PROBLEM_COLOUR};
 use crate::wiring::Services;
 use eframe::egui::{
-    self, ComboBox, CornerRadius, Frame, Grid, Margin, ProgressBar, RichText, ScrollArea, TextEdit,
+    self, ComboBox, CornerRadius, Frame, Grid, Margin, RichText, ScrollArea, TextEdit,
     ViewportBuilder, ViewportCommand, ViewportId,
 };
 use std::time::{Duration, Instant};
-use voice_core::{Action, Shortcut};
+use voice_core::{Action, Shortcut, SpeechProvider};
+use voice_stt::KeyStatus;
 
 pub fn id() -> ViewportId {
     ViewportId::from_hash_of("settings")
@@ -136,6 +137,9 @@ fn microphone(ui: &mut egui::Ui, session: &mut SettingsSession) {
 }
 
 fn ai_models(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
+    speech_rows(ui, session, services);
+    ui.add_space(12.0);
+
     ui.horizontal(|ui| {
         ui.label("Local AI app address");
         ui.add(
@@ -165,8 +169,6 @@ fn ai_models(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Servic
     }
     ui.add_space(8.0);
 
-    speech_row(ui, session, services);
-    ui.add_space(8.0);
     assistant_row(ui, session, services);
     ui.add_space(8.0);
 
@@ -195,29 +197,75 @@ fn model_row(
     refresh
 }
 
-fn speech_row(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
-    let listed = session.tasks.models.models().to_vec();
-    let choices = speech_choices(&listed, &session.form.speech_source);
-    let refresh = model_row(ui, "Speech model", "turns your voice into words", |ui| {
-        ComboBox::from_id_salt("speech_model")
+/// Label and description on the left, `add_choice` right-aligned.
+fn choice_row(
+    ui: &mut egui::Ui,
+    title: &str,
+    description: &str,
+    add_choice: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(RichText::new(title).strong());
+            ui.label(RichText::new(description).weak().small());
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add_choice);
+    });
+}
+
+/// Speech provider, its speech model and key, and where recordings go.
+fn speech_rows(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
+    let speech = &mut session.form.speech;
+    choice_row(ui, "Provider", "turns your voice into words", |ui| {
+        ComboBox::from_id_salt("speech_provider")
             .width(220.0)
-            .selected_text(speech_label(&session.form.speech_source))
+            .selected_text(speech.provider.label())
             .show_ui(ui, |ui| {
-                for choice in choices {
-                    let label = speech_label(&choice);
-                    ui.selectable_value(&mut session.form.speech_source, choice, label);
+                for provider in SpeechProvider::ALL {
+                    ui.selectable_value(&mut speech.provider, provider, provider.label());
                 }
             });
     });
-    if refresh {
-        session.refresh_models(services);
+    ui.add_space(4.0);
+    let choices = speech_model_choices(speech.provider, &speech.model);
+    choice_row(
+        ui,
+        "Speech model",
+        "the provider's model that listens",
+        |ui| {
+            ComboBox::from_id_salt("speech_model")
+                .width(220.0)
+                .selected_text(speech.model.clone())
+                .show_ui(ui, |ui| {
+                    for choice in choices {
+                        let label = choice.clone();
+                        ui.selectable_value(&mut speech.model, choice, label);
+                    }
+                });
+        },
+    );
+    ui.add_space(4.0);
+    let status = session.key_status;
+    let mut remove = false;
+    choice_row(ui, "OpenAI key", key_status_text(status), |ui| {
+        // A key that cannot be read can still be removed, so the user is never stuck.
+        if matches!(status, KeyStatus::Saved | KeyStatus::Unreadable) {
+            remove = ui.button("Remove key").clicked();
+        }
+        ui.add(
+            TextEdit::singleline(&mut session.form.new_key)
+                .password(true)
+                .hint_text(match status {
+                    KeyStatus::Saved | KeyStatus::Unreadable => "Type to replace",
+                    _ => "sk-…",
+                })
+                .desired_width(220.0),
+        );
+    });
+    if remove {
+        session.remove_key(services);
     }
-    if let Some(note) = session.tasks.models.list_note() {
-        ui.label(RichText::new(note).weak().small());
-    }
-    if session.form.shows_built_in_speech_controls() {
-        built_in_speech(ui, session, services);
-    }
+    ui.label(RichText::new(SPEECH_PRIVACY_NOTE).weak().small());
 }
 
 fn assistant_row(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
@@ -226,7 +274,7 @@ fn assistant_row(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Se
     let refresh = model_row(
         ui,
         "Writing assistant model",
-        "cleans up, translates and edits",
+        "cleans up, translates and edits, in the local AI app",
         |ui| {
             ComboBox::from_id_salt("assistant_model")
                 .width(220.0)
@@ -285,44 +333,6 @@ fn dictionary(ui: &mut egui::Ui, session: &mut SettingsSession) {
     }
 }
 
-/// Where the built-in speech model lives, and downloading it.
-fn built_in_speech(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
-    ui.add_space(4.0);
-    ui.label(
-        RichText::new(format!("{BUILT_IN_SPEECH} model file"))
-            .weak()
-            .small(),
-    );
-    let default_path = (services.default_model_path)();
-    ui.add(
-        TextEdit::singleline(&mut session.form.speech_model_path)
-            .hint_text(default_path.display().to_string())
-            .desired_width(f32::INFINITY),
-    );
-    ui.label(
-        RichText::new("Leave empty to use the default location.")
-            .weak()
-            .small(),
-    );
-    ui.horizontal(|ui| {
-        let running = session.tasks.download.is_running();
-        if ui
-            .add_enabled(!running, egui::Button::new("Download default model"))
-            .clicked()
-        {
-            session.download_model(services);
-        }
-    });
-    if let Some(fraction) = session.tasks.download.fraction() {
-        ui.add(ProgressBar::new(fraction).show_percentage());
-    } else if session.tasks.download.is_running() {
-        ui.add(ProgressBar::new(0.0).animate(true));
-    }
-    if let Some(message) = session.tasks.download.message() {
-        ui.label(RichText::new(message).weak().small());
-    }
-}
-
 fn permissions(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {
     let rows = session
         .permissions
@@ -374,4 +384,140 @@ fn footer(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services)
         }
     });
     ui.add_space(6.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wiring::testing::test_services;
+    use eframe::egui::epaint::Shape;
+
+    fn texts(shape: &Shape, out: &mut Vec<String>) {
+        match shape {
+            Shape::Text(text) => out.push(text.galley.text().to_string()),
+            Shape::Vec(shapes) => shapes.iter().for_each(|s| texts(s, out)),
+            _ => {}
+        }
+    }
+
+    /// Everything the speech rows draw as text in one frame.
+    fn drawn_speech_rows(session: &mut SettingsSession, services: &Services) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            speech_rows(ui, session, services);
+        });
+        // No renderer takes the font textures in a test.
+        output.textures_delta.clear();
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            texts(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn speech_rows_show_openai_its_model_and_where_recordings_go() {
+        let (services, _probe) = test_services();
+        let mut session = SettingsSession::open(&services);
+
+        let drawn = drawn_speech_rows(&mut session, &services);
+
+        for expected in [
+            "Provider",
+            "OpenAI",
+            "Speech model",
+            "gpt-4o-transcribe",
+            "OpenAI key",
+            "No OpenAI key saved",
+            "Recordings are sent to OpenAI to be turned into words.",
+        ] {
+            assert!(drawn.iter().any(|t| t == expected), "{expected}: {drawn:?}");
+        }
+        assert!(!drawn.iter().any(|t| t == "Remove key"), "{drawn:?}");
+    }
+
+    #[test]
+    fn a_saved_key_can_be_removed_and_is_never_drawn() {
+        let (services, _probe) = test_services();
+        services.speech_key.save("sk-secret").unwrap();
+        let mut session = SettingsSession::open(&services);
+
+        let drawn = drawn_speech_rows(&mut session, &services);
+
+        assert!(drawn.iter().any(|t| t == "OpenAI key saved"), "{drawn:?}");
+        assert!(drawn.iter().any(|t| t == "Remove key"), "{drawn:?}");
+        assert!(!drawn.iter().any(|t| t.contains("sk-secret")), "{drawn:?}");
+    }
+
+    #[test]
+    fn the_settings_window_no_longer_offers_a_built_in_speech_model() {
+        let (services, _probe) = test_services();
+        let mut session = SettingsSession::open(&services);
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(560.0, 4_000.0),
+            )),
+            ..Default::default()
+        };
+
+        let mut output = ctx.run_ui(input, |ui| draw(ui, &mut session, &services));
+        output.textures_delta.clear();
+        let mut drawn = Vec::new();
+        for clipped in &output.shapes {
+            texts(&clipped.shape, &mut drawn);
+        }
+
+        // The whole window was drawn, from the speech rows down to the permissions.
+        for expected in ["OpenAI", "Writing assistant model", "Permissions", "Save"] {
+            assert!(drawn.iter().any(|t| t == expected), "{expected}: {drawn:?}");
+        }
+        for gone in ["Built-in", "Download", "model file", "default location"] {
+            assert!(!drawn.iter().any(|t| t.contains(gone)), "{gone}: {drawn:?}");
+        }
+    }
+
+    #[test]
+    fn drawing_frames_does_not_read_the_key_store_again() {
+        let (services, probe) = test_services();
+        let mut session = SettingsSession::open(&services);
+        let reads_on_open = probe.key_reads();
+
+        for _ in 0..5 {
+            drawn_speech_rows(&mut session, &services);
+        }
+
+        assert_eq!(reads_on_open, 1);
+        assert_eq!(probe.key_reads(), 1);
+    }
+
+    #[test]
+    fn a_key_that_cannot_be_read_is_reported_and_can_be_removed() {
+        let (services, probe) = test_services();
+        services.speech_key.save("sk-secret").unwrap();
+        probe.fail_key_reading("access denied");
+        let mut session = SettingsSession::open(&services);
+
+        let drawn = drawn_speech_rows(&mut session, &services);
+
+        assert!(
+            drawn
+                .iter()
+                .any(|t| t == "Couldn't read the OpenAI key from the Keychain"),
+            "{drawn:?}"
+        );
+        assert!(drawn.iter().any(|t| t == "Remove key"), "{drawn:?}");
+    }
+
+    #[test]
+    fn a_typed_key_is_drawn_hidden() {
+        let (services, _probe) = test_services();
+        let mut session = SettingsSession::open(&services);
+        session.form.new_key = "sk-typed".into();
+
+        let drawn = drawn_speech_rows(&mut session, &services);
+
+        assert!(!drawn.iter().any(|t| t.contains("sk-typed")), "{drawn:?}");
+    }
 }

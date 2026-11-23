@@ -1,4 +1,4 @@
-use crate::Action;
+use crate::{Action, SpeechProvider, TranscribeError};
 use std::fmt;
 
 /// A problem the user must be told about.
@@ -7,7 +7,11 @@ pub enum Problem {
     NoSpeech,
     /// The writing assistant could not be reached while running this action.
     AssistantUnreachable(Action),
-    SpeechModelUnreachable,
+    /// The speech provider could not turn the recording into words.
+    Speech {
+        provider: SpeechProvider,
+        failure: SpeechFailure,
+    },
     /// The writing assistant answered an Edit selection with nothing usable.
     InstructionNotCarriedOut,
     /// Edit selection was started with nothing selected.
@@ -34,10 +38,7 @@ impl fmt::Display for Problem {
                 "Couldn't run the instruction — writing assistant not reachable"
             ),
             Problem::InstructionNotCarriedOut => write!(f, "Couldn't run the instruction"),
-            Problem::SpeechModelUnreachable => write!(
-                f,
-                "Speech model not reachable — is your local AI app running?"
-            ),
+            Problem::Speech { provider, failure } => failure.describe(*provider, f),
             Problem::NoSelection => {
                 write!(f, "Select text first, then start Edit selection again")
             }
@@ -53,6 +54,68 @@ impl fmt::Display for Problem {
                 "Accessibility access needed – System Settings › Privacy & Security › Accessibility"
             ),
             Problem::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+/// Why the speech provider could not turn a recording into words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeechFailure {
+    /// No connection, no answer within the time limit, or trouble on the provider's side.
+    Unreachable,
+    /// No key for the speech provider is saved or set up on this Mac.
+    KeyMissing,
+    /// A key is saved, but it could not be read from the Keychain.
+    KeyUnreadable,
+    /// The speech provider does not accept the key.
+    KeyRejected,
+    /// Too many requests, or the provider account has no credit left.
+    LimitReached,
+    /// The speech provider refused the recording or answered with nothing usable.
+    NotTranscribed,
+}
+
+impl SpeechFailure {
+    /// The message the user sees, naming the provider.
+    fn describe(self, provider: SpeechProvider, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = provider.label();
+        match self {
+            SpeechFailure::Unreachable => {
+                write!(f, "{name} not reachable — check your internet connection")
+            }
+            SpeechFailure::KeyMissing => {
+                write!(f, "{name} key missing — add it in Settings › AI models")
+            }
+            SpeechFailure::KeyUnreadable => write!(
+                f,
+                "Couldn't read the {name} key from the Keychain — allow access or save it again in Settings › AI models"
+            ),
+            SpeechFailure::KeyRejected => {
+                write!(
+                    f,
+                    "{name} rejected the key — check it in Settings › AI models"
+                )
+            }
+            SpeechFailure::LimitReached => write!(
+                f,
+                "{name} limit reached — try again later or check your {name} account"
+            ),
+            SpeechFailure::NotTranscribed => {
+                write!(f, "{name} couldn't turn the recording into words")
+            }
+        }
+    }
+}
+
+impl From<&TranscribeError> for SpeechFailure {
+    fn from(error: &TranscribeError) -> Self {
+        match error {
+            TranscribeError::Unreachable(_) => SpeechFailure::Unreachable,
+            TranscribeError::KeyMissing => SpeechFailure::KeyMissing,
+            TranscribeError::KeyUnreadable => SpeechFailure::KeyUnreadable,
+            TranscribeError::KeyRejected => SpeechFailure::KeyRejected,
+            TranscribeError::LimitReached => SpeechFailure::LimitReached,
+            TranscribeError::Failed(_) => SpeechFailure::NotTranscribed,
         }
     }
 }
@@ -78,6 +141,35 @@ mod tests {
     use super::*;
     use crate::rules::MAX_SELECTION_CHARS;
 
+    fn openai(failure: SpeechFailure) -> Problem {
+        Problem::Speech {
+            provider: SpeechProvider::OpenAi,
+            failure,
+        }
+    }
+
+    #[test]
+    fn transcribe_errors_become_speech_failures() {
+        let cases = [
+            (
+                TranscribeError::Unreachable("x".into()),
+                SpeechFailure::Unreachable,
+            ),
+            (TranscribeError::KeyMissing, SpeechFailure::KeyMissing),
+            (TranscribeError::KeyUnreadable, SpeechFailure::KeyUnreadable),
+            (TranscribeError::KeyRejected, SpeechFailure::KeyRejected),
+            (TranscribeError::LimitReached, SpeechFailure::LimitReached),
+            (
+                TranscribeError::Failed("x".into()),
+                SpeechFailure::NotTranscribed,
+            ),
+        ];
+
+        for (error, failure) in cases {
+            assert_eq!(SpeechFailure::from(&error), failure, "{error}");
+        }
+    }
+
     #[test]
     fn problems_read_as_the_messages_shown_to_the_user() {
         let cases = [
@@ -95,8 +187,28 @@ mod tests {
                 "Couldn't run the instruction — writing assistant not reachable",
             ),
             (
-                Problem::SpeechModelUnreachable,
-                "Speech model not reachable — is your local AI app running?",
+                openai(SpeechFailure::Unreachable),
+                "OpenAI not reachable — check your internet connection",
+            ),
+            (
+                openai(SpeechFailure::KeyMissing),
+                "OpenAI key missing — add it in Settings › AI models",
+            ),
+            (
+                openai(SpeechFailure::KeyUnreadable),
+                "Couldn't read the OpenAI key from the Keychain — allow access or save it again in Settings › AI models",
+            ),
+            (
+                openai(SpeechFailure::KeyRejected),
+                "OpenAI rejected the key — check it in Settings › AI models",
+            ),
+            (
+                openai(SpeechFailure::LimitReached),
+                "OpenAI limit reached — try again later or check your OpenAI account",
+            ),
+            (
+                openai(SpeechFailure::NotTranscribed),
+                "OpenAI couldn't turn the recording into words",
             ),
             (
                 Problem::NoSelection,

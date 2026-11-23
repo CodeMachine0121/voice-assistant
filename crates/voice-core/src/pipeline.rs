@@ -4,8 +4,7 @@ use crate::script::to_traditional;
 use crate::speech::contains_speech;
 use crate::{
     Action, History, HistoryEntry, HistoryStore, PersonalDictionary, PolishError, Polisher,
-    PreparedAction, Problem, Recording, Settings, Status, TextInserter, TranscribeError,
-    Transcriber, WritingTask,
+    PreparedAction, Problem, Recording, Settings, Status, TextInserter, Transcriber, WritingTask,
 };
 use chrono::Local;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -75,12 +74,12 @@ impl DictationPipeline {
             .transcribe(&recording, &settings.dictionary)
         {
             Ok(transcript) => to_traditional(transcript.trim()),
-            Err(TranscribeError::Unreachable(reason)) => {
-                log::warn!("speech model unreachable: {reason}");
-                return Outcome::problem_without_entry(Problem::SpeechModelUnreachable);
-            }
-            Err(TranscribeError::Failed(reason)) => {
-                return Outcome::problem_without_entry(Problem::Other(reason))
+            Err(error) => {
+                log::warn!("speech not turned into words: {error}");
+                return Outcome::problem_without_entry(Problem::Speech {
+                    provider: settings.speech.provider,
+                    failure: (&error).into(),
+                });
             }
         };
         if heard.is_empty() {
@@ -169,6 +168,7 @@ mod tests {
         silence, speech, FakeInserter, FakePolisher, FakeStore, FakeTranscriber, Task,
     };
     use crate::rules::HISTORY_LIMIT;
+    use crate::{SpeechFailure, TranscribeError};
     use chrono::TimeZone;
 
     struct Rig {
@@ -603,47 +603,64 @@ mod tests {
         rig.assert_nothing_written_or_recorded();
     }
 
-    #[test]
-    fn unreachable_speech_model_writes_nothing_in_any_action() {
-        for action in [DICTATE, ENGLISH, edit("我們明天開會")] {
-            let rig = Rig {
-                transcriber: FakeTranscriber::new(Err(TranscribeError::Unreachable(
-                    "connection refused".into(),
-                ))),
-                ..Rig::new("", Ok("x"))
-            };
-
-            let outcome = rig.run(&action, &cleanup_on());
-
-            assert_eq!(
-                outcome.status,
-                Status::Problem(Problem::SpeechModelUnreachable)
-            );
-            assert_eq!(
-                outcome.status_message(),
-                "Speech model not reachable — is your local AI app running?"
-            );
-            assert_eq!(outcome.entry, None);
-            assert!(rig.polisher.calls().is_empty());
-            rig.assert_nothing_written_or_recorded();
-        }
+    /// Every way the speech provider can fail, with the message the user must see.
+    fn speech_failures() -> [(TranscribeError, Problem, &'static str); 6] {
+        let openai = |failure| Problem::Speech {
+            provider: crate::SpeechProvider::OpenAi,
+            failure,
+        };
+        [
+            (
+                TranscribeError::KeyMissing,
+                openai(SpeechFailure::KeyMissing),
+                "OpenAI key missing — add it in Settings › AI models",
+            ),
+            (
+                TranscribeError::KeyUnreadable,
+                openai(SpeechFailure::KeyUnreadable),
+                "Couldn't read the OpenAI key from the Keychain — allow access or save it again in Settings › AI models",
+            ),
+            (
+                TranscribeError::KeyRejected,
+                openai(SpeechFailure::KeyRejected),
+                "OpenAI rejected the key — check it in Settings › AI models",
+            ),
+            (
+                TranscribeError::LimitReached,
+                openai(SpeechFailure::LimitReached),
+                "OpenAI limit reached — try again later or check your OpenAI account",
+            ),
+            (
+                TranscribeError::Unreachable("connection refused".into()),
+                openai(SpeechFailure::Unreachable),
+                "OpenAI not reachable — check your internet connection",
+            ),
+            (
+                TranscribeError::Failed("unknown model".into()),
+                openai(SpeechFailure::NotTranscribed),
+                "OpenAI couldn't turn the recording into words",
+            ),
+        ]
     }
 
     #[test]
-    fn speech_model_failure_is_reported_and_nothing_written() {
-        let rig = Rig {
-            transcriber: FakeTranscriber::new(Err(TranscribeError::Failed("model missing".into()))),
-            ..Rig::new("", Ok("x"))
-        };
+    fn speech_provider_failures_are_explained_and_write_nothing_in_any_action() {
+        for (error, problem, message) in speech_failures() {
+            for action in [DICTATE, ENGLISH, edit("我們明天開會")] {
+                let rig = Rig {
+                    transcriber: FakeTranscriber::new(Err(error.clone())),
+                    ..Rig::new("", Ok("x"))
+                };
 
-        let outcome = rig.run(&DICTATE, &cleanup_on());
+                let outcome = rig.run(&action, &cleanup_on());
 
-        assert_eq!(
-            outcome.status,
-            Status::Problem(Problem::Other("model missing".into()))
-        );
-        assert_eq!(outcome.entry, None);
-        rig.assert_nothing_written_or_recorded();
+                assert_eq!(outcome.status, Status::Problem(problem.clone()), "{error}");
+                assert_eq!(outcome.status_message(), message);
+                assert_eq!(outcome.entry, None);
+                assert!(rig.polisher.calls().is_empty());
+                rig.assert_nothing_written_or_recorded();
+            }
+        }
     }
 
     // ---- accessibility -----------------------------------------------------

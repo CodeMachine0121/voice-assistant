@@ -94,7 +94,7 @@ mod tests {
     use super::*;
     use chrono::{Local, TimeZone};
     use voice_core::{
-        Action, ActionShortcuts, HistoryEntry, PersonalDictionary, Shortcut, SpeechSource,
+        Action, ActionShortcuts, HistoryEntry, PersonalDictionary, Shortcut, SpeechSettings,
     };
 
     fn entry(n: u32) -> HistoryEntry {
@@ -126,13 +126,13 @@ mod tests {
                 dictate: Shortcut::TapFn,
                 ..ActionShortcuts::default()
             },
-            speech_source: SpeechSource::LocalAiApp {
-                model: "breeze-asr-25".into(),
+            speech: SpeechSettings {
+                model: "gpt-4o-mini-transcribe".into(),
+                ..SpeechSettings::default()
             },
             microphone: Some("USB Mic".into()),
             cleanup_enabled: false,
             dictionary: PersonalDictionary::from_words(["Cafler"]),
-            speech_model_path: Some("/models/ggml.bin".into()),
             ..Settings::default()
         };
         store.save(&s).unwrap();
@@ -331,7 +331,29 @@ mod tests {
         assert_eq!(loaded.microphone.as_deref(), Some("USB Mic"));
         assert_eq!(loaded.assistant_model, "qwen2.5-7b-instruct");
         assert!(!loaded.cleanup_enabled);
-        assert_eq!(loaded.speech_source, SpeechSource::BuiltIn);
+        assert_eq!(loaded.speech, SpeechSettings::default());
+    }
+
+    #[test]
+    fn a_saved_local_speech_choice_moves_to_openai_and_is_dropped_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = r#"{
+  "assistant_model": "twil-8b",
+  "speech_model_path": "/models/ggml-small.bin",
+  "speech_source": { "LocalAiApp": { "model": "breeze-asr-25" } }
+}"#;
+        std::fs::write(dir.path().join("settings.json"), old).unwrap();
+        let store = JsonSettingsStore::new(dir.path().into());
+
+        let loaded = store.load();
+        store.save(&loaded).unwrap();
+
+        assert_eq!(loaded.speech, SpeechSettings::default());
+        assert_eq!(loaded.assistant_model, "twil-8b");
+        let text = std::fs::read_to_string(dir.path().join("settings.json")).unwrap();
+        assert!(!text.contains("speech_model_path"), "{text}");
+        assert!(!text.contains("speech_source"), "{text}");
+        assert!(text.contains("gpt-4o-transcribe"), "{text}");
     }
 
     #[test]

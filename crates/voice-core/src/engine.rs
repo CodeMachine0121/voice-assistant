@@ -576,7 +576,11 @@ mod tests {
 
     #[test]
     fn escape_cancels_and_records_nothing() {
-        let rig = Rig::new(Options::default());
+        let transcriber = FakeTranscriber::new(Ok("hello team"));
+        let rig = Rig::new(Options {
+            transcriber: transcriber.clone(),
+            ..Options::default()
+        });
 
         rig.tap(EditSelection);
         rig.expect_listening(EditSelection);
@@ -584,6 +588,11 @@ mod tests {
 
         assert_eq!(rig.next_status(), Status::Cancelled);
         assert_eq!(rig.log(|l| (l.stops, l.cancels)), (0, 1));
+        assert_eq!(
+            transcriber.calls(),
+            0,
+            "nothing reaches the speech provider"
+        );
         assert!(rig.inserter.inserted().is_empty());
         assert!(rig.store.saved().is_empty());
     }

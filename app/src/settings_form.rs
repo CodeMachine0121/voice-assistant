@@ -1,18 +1,22 @@
 //! Editable copy of `Settings` for the Settings window, and the conversion back.
-use std::path::PathBuf;
-use voice_core::{Action, ActionShortcuts, PersonalDictionary, Settings, SpeechSource};
+use std::fmt;
+use voice_core::{
+    Action, ActionShortcuts, PersonalDictionary, Settings, SpeechProvider, SpeechSettings,
+};
+use voice_stt::KeyStatus;
 
-/// The speech model row's first choice.
-pub const BUILT_IN_SPEECH: &str = "Built-in (on this Mac)";
 /// The writing assistant row's first choice.
 pub const ANY_ASSISTANT_MODEL: &str = "Whatever is loaded";
+/// Shown under the speech rows: where recordings go.
+pub const SPEECH_PRIVACY_NOTE: &str = "Recordings are sent to OpenAI to be turned into words.";
+
 /// Shown next to the address when it is empty.
 pub const ADDRESS_MISSING: &str = "Enter the local AI app address.";
 /// Shown when the address points away from this Mac.
 pub const ADDRESS_NOT_LOCAL: &str =
     "This address is not on this Mac — what you say and select will leave the computer.";
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct SettingsForm {
     pub shortcuts: ActionShortcuts,
     /// `None` = system default microphone.
@@ -23,9 +27,31 @@ pub struct SettingsForm {
     dictionary: PersonalDictionary,
     /// Text typed into the "add word" field.
     pub new_word: String,
-    /// Speech model location as typed; blank = default location.
-    pub speech_model_path: String,
-    pub speech_source: SpeechSource,
+    pub speech: SpeechSettings,
+    /// OpenAI key as typed; blank = keep the saved key. Never part of `Settings`.
+    pub new_key: String,
+}
+
+/// Like a derived `Debug`, except that a typed key is never shown.
+impl fmt::Debug for SettingsForm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let new_key = if self.new_key.is_empty() {
+            ""
+        } else {
+            "<redacted>"
+        };
+        f.debug_struct("SettingsForm")
+            .field("shortcuts", &self.shortcuts)
+            .field("microphone", &self.microphone)
+            .field("assistant_url", &self.assistant_url)
+            .field("assistant_model", &self.assistant_model)
+            .field("cleanup_enabled", &self.cleanup_enabled)
+            .field("dictionary", &self.dictionary)
+            .field("new_word", &self.new_word)
+            .field("speech", &self.speech)
+            .field("new_key", &new_key)
+            .finish()
+    }
 }
 
 impl SettingsForm {
@@ -38,17 +64,12 @@ impl SettingsForm {
             cleanup_enabled: settings.cleanup_enabled,
             dictionary: settings.dictionary.clone(),
             new_word: String::new(),
-            speech_model_path: settings
-                .speech_model_path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            speech_source: settings.speech_source.clone(),
+            speech: settings.speech.clone(),
+            new_key: String::new(),
         }
     }
 
     pub fn to_settings(&self) -> Settings {
-        let path = self.speech_model_path.trim();
         Settings {
             shortcuts: self.shortcuts.clone(),
             microphone: self.microphone.clone(),
@@ -56,8 +77,10 @@ impl SettingsForm {
             assistant_model: self.assistant_model.trim().to_string(),
             cleanup_enabled: self.cleanup_enabled,
             dictionary: self.dictionary.clone(),
-            speech_model_path: (!path.is_empty()).then(|| PathBuf::from(path)),
-            speech_source: self.speech_source.clone(),
+            speech: SpeechSettings {
+                provider: self.speech.provider,
+                model: self.speech.model.trim().to_string(),
+            },
         }
     }
 
@@ -108,21 +131,25 @@ impl SettingsForm {
             .then_some(ADDRESS_MISSING)
     }
 
-    /// A warning when the local AI app address is not on this Mac: speech and selected
-    /// text are sent there.
+    /// A warning when the local AI app address is not on this Mac: the heard words and
+    /// selected text are sent there.
     pub fn address_warning(&self) -> Option<&'static str> {
         let address = self.assistant_url.trim();
         (!address.is_empty() && !is_on_this_mac(address)).then_some(ADDRESS_NOT_LOCAL)
     }
 
-    /// Whether the built-in speech model's location and download are relevant.
-    pub fn shows_built_in_speech_controls(&self) -> bool {
-        self.speech_source == SpeechSource::BuiltIn
+    /// The typed OpenAI key, if one was typed.
+    pub fn typed_key(&self) -> Option<&str> {
+        let key = self.new_key.trim();
+        (!key.is_empty()).then_some(key)
     }
 
-    /// Whether the form differs from what is stored (including a half-typed word).
+    /// Whether the form differs from what is stored (including a half-typed word or a
+    /// typed key).
     pub fn is_changed_from(&self, stored: &Settings) -> bool {
-        self.to_settings() != *stored || !self.new_word.trim().is_empty()
+        self.to_settings() != *stored
+            || !self.new_word.trim().is_empty()
+            || self.typed_key().is_some()
     }
 }
 
@@ -143,11 +170,13 @@ fn is_on_this_mac(address: &str) -> bool {
     }
 }
 
-/// Row label of a speech source.
-pub fn speech_label(source: &SpeechSource) -> String {
-    match source {
-        SpeechSource::BuiltIn => BUILT_IN_SPEECH.to_string(),
-        SpeechSource::LocalAiApp { model } => model.clone(),
+/// Where the key for the next dictation comes from, as shown next to the key field.
+pub fn key_status_text(status: KeyStatus) -> &'static str {
+    match status {
+        KeyStatus::Saved => "OpenAI key saved",
+        KeyStatus::FromEnvironment => "Using the OpenAI key set up on this Mac",
+        KeyStatus::Missing => "No OpenAI key saved",
+        KeyStatus::Unreadable => "Couldn't read the OpenAI key from the Keychain",
     }
 }
 
@@ -160,17 +189,12 @@ pub fn assistant_label(model: &str) -> String {
     }
 }
 
-/// Speech model choices: built-in first, then every listed model. A chosen model the
-/// local AI app no longer lists stays on offer.
-pub fn speech_choices(listed: &[String], current: &SpeechSource) -> Vec<SpeechSource> {
-    let mut choices = vec![SpeechSource::BuiltIn];
-    choices.extend(
-        listed
-            .iter()
-            .map(|m| SpeechSource::LocalAiApp { model: m.clone() }),
-    );
-    if !choices.contains(current) {
-        choices.push(current.clone());
+/// Speech model choices: the provider's models, then a model saved earlier that the
+/// provider no longer offers, so it stays on offer.
+pub fn speech_model_choices(provider: SpeechProvider, current: &str) -> Vec<String> {
+    let mut choices: Vec<String> = provider.models().iter().map(|m| m.to_string()).collect();
+    if !current.is_empty() && !choices.iter().any(|c| c == current) {
+        choices.push(current.to_string());
     }
     choices
 }
@@ -217,9 +241,9 @@ mod tests {
             assistant_model: "qwen".into(),
             cleanup_enabled: false,
             dictionary: PersonalDictionary::from_words(["Kubernetes", "Zoë"]),
-            speech_model_path: Some(PathBuf::from("/models/small.bin")),
-            speech_source: SpeechSource::LocalAiApp {
-                model: "breeze-asr-25".into(),
+            speech: SpeechSettings {
+                model: "whisper-1".into(),
+                ..SpeechSettings::default()
             },
         };
         assert_eq!(
@@ -236,9 +260,7 @@ mod tests {
         f.assistant_url = "http://other/v1".into();
         f.assistant_model = "llama".into();
         f.cleanup_enabled = false;
-        f.speech_source = SpeechSource::LocalAiApp {
-            model: "breeze-asr-25".into(),
-        };
+        f.speech.model = "gpt-4o-mini-transcribe".into();
         let s = f.to_settings();
         assert_eq!(s.shortcuts.dictate, Shortcut::TapRightOption);
         assert_eq!(s.shortcuts.english, Shortcut::TapCommandShift);
@@ -246,12 +268,7 @@ mod tests {
         assert_eq!(s.assistant_url, "http://other/v1");
         assert_eq!(s.assistant_model, "llama");
         assert!(!s.cleanup_enabled);
-        assert_eq!(
-            s.speech_source,
-            SpeechSource::LocalAiApp {
-                model: "breeze-asr-25".into()
-            }
-        );
+        assert_eq!(s.speech.model, "gpt-4o-mini-transcribe");
     }
 
     #[test]
@@ -259,38 +276,11 @@ mod tests {
         let mut f = form();
         f.assistant_url = "  http://x/v1 \n".into();
         f.assistant_model = " m ".into();
+        f.speech.model = " whisper-1 ".into();
         let s = f.to_settings();
         assert_eq!(s.assistant_url, "http://x/v1");
         assert_eq!(s.assistant_model, "m");
-    }
-
-    #[test]
-    fn blank_model_path_means_default_location() {
-        let mut f = form();
-        f.speech_model_path = "   ".into();
-        assert_eq!(f.to_settings().speech_model_path, None);
-    }
-
-    #[test]
-    fn typed_model_path_is_kept() {
-        let mut f = form();
-        f.speech_model_path = " /a/b.bin ".into();
-        assert_eq!(
-            f.to_settings().speech_model_path,
-            Some(PathBuf::from("/a/b.bin"))
-        );
-    }
-
-    #[test]
-    fn existing_model_path_is_shown() {
-        let s = Settings {
-            speech_model_path: Some(PathBuf::from("/a/b.bin")),
-            ..Settings::default()
-        };
-        assert_eq!(
-            SettingsForm::from_settings(&s).speech_model_path,
-            "/a/b.bin"
-        );
+        assert_eq!(s.speech.model, "whisper-1");
     }
 
     #[test]
@@ -457,55 +447,52 @@ mod tests {
     }
 
     #[test]
-    fn first_launch_model_choices_are_built_in_and_whatever_is_loaded() {
+    fn first_launch_shows_openai_with_gpt_4o_transcribe_and_whatever_is_loaded() {
         let f = form();
-        assert_eq!(speech_label(&f.speech_source), "Built-in (on this Mac)");
+        assert_eq!(f.speech.provider.label(), "OpenAI");
+        assert_eq!(f.speech.model, "gpt-4o-transcribe");
         assert_eq!(assistant_label(&f.assistant_model), "Whatever is loaded");
     }
 
     #[test]
-    fn model_choices_offer_every_listed_model() {
-        let listed = models(&["breeze-asr-25", "twil-8b"]);
-        let speech: Vec<_> = speech_choices(&listed, &SpeechSource::BuiltIn)
-            .iter()
-            .map(speech_label)
-            .collect();
+    fn speech_model_choices_are_the_three_openai_models() {
         assert_eq!(
-            speech,
-            ["Built-in (on this Mac)", "breeze-asr-25", "twil-8b"]
+            speech_model_choices(SpeechProvider::OpenAi, "gpt-4o-transcribe"),
+            ["gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1"]
         );
-        let assistant: Vec<_> = assistant_choices(&listed, "")
+    }
+
+    #[test]
+    fn a_speech_model_saved_earlier_stays_on_offer_and_is_kept() {
+        let stored = Settings {
+            speech: SpeechSettings {
+                model: "my-custom-model".into(),
+                ..SpeechSettings::default()
+            },
+            ..Settings::default()
+        };
+        let f = SettingsForm::from_settings(&stored);
+
+        assert_eq!(
+            speech_model_choices(f.speech.provider, &f.speech.model),
+            [
+                "gpt-4o-transcribe",
+                "gpt-4o-mini-transcribe",
+                "whisper-1",
+                "my-custom-model"
+            ]
+        );
+        assert_eq!(f.to_settings().speech.model, "my-custom-model");
+    }
+
+    #[test]
+    fn writing_assistant_choices_offer_every_listed_model() {
+        let assistant: Vec<_> = assistant_choices(&models(&["twil-8b", "qwen"]), "")
             .iter()
             .map(|m| assistant_label(m))
             .collect();
-        assert_eq!(
-            assistant,
-            ["Whatever is loaded", "breeze-asr-25", "twil-8b"]
-        );
-    }
-
-    #[test]
-    fn without_a_listing_only_the_defaults_are_offered() {
-        assert_eq!(
-            speech_choices(&[], &SpeechSource::BuiltIn),
-            [SpeechSource::BuiltIn]
-        );
+        assert_eq!(assistant, ["Whatever is loaded", "twil-8b", "qwen"]);
         assert_eq!(assistant_choices(&[], ""), [String::new()]);
-    }
-
-    #[test]
-    fn a_chosen_model_that_is_no_longer_listed_stays_on_offer() {
-        let chosen = SpeechSource::LocalAiApp {
-            model: "gone".into(),
-        };
-        assert_eq!(
-            speech_choices(&models(&["a"]), &chosen),
-            [
-                SpeechSource::BuiltIn,
-                SpeechSource::LocalAiApp { model: "a".into() },
-                chosen,
-            ]
-        );
         assert_eq!(
             assistant_choices(&models(&["a"]), "gone"),
             ["", "a", "gone"]
@@ -513,11 +500,49 @@ mod tests {
     }
 
     #[test]
-    fn built_in_controls_show_only_for_the_built_in_model() {
+    fn debug_output_hides_a_typed_key_but_shows_the_rest() {
         let mut f = form();
-        assert!(f.shows_built_in_speech_controls());
-        f.speech_source = SpeechSource::LocalAiApp { model: "m".into() };
-        assert!(!f.shows_built_in_speech_controls());
+        f.new_key = "sk-secret".into();
+        f.new_word = "Cafler".into();
+
+        let shown = format!("{f:?}");
+
+        assert!(!shown.contains("sk-secret"), "{shown}");
+        assert!(shown.contains("new_key: \"<redacted>\""), "{shown}");
+        assert!(shown.contains("Cafler"), "{shown}");
+        assert!(shown.contains("gpt-4o-transcribe"), "{shown}");
+    }
+
+    #[test]
+    fn debug_output_of_an_empty_key_field_shows_it_empty() {
+        assert!(format!("{:?}", form()).contains("new_key: \"\""));
+    }
+
+    #[test]
+    fn the_key_status_says_where_the_key_comes_from() {
+        assert_eq!(key_status_text(KeyStatus::Saved), "OpenAI key saved");
+        assert_eq!(
+            key_status_text(KeyStatus::FromEnvironment),
+            "Using the OpenAI key set up on this Mac"
+        );
+        assert_eq!(key_status_text(KeyStatus::Missing), "No OpenAI key saved");
+        assert_eq!(
+            key_status_text(KeyStatus::Unreadable),
+            "Couldn't read the OpenAI key from the Keychain"
+        );
+    }
+
+    #[test]
+    fn the_key_field_starts_empty_and_is_never_part_of_settings() {
+        let mut f = form();
+        assert_eq!(f.new_key, "");
+        assert_eq!(f.typed_key(), None);
+
+        f.new_key = "  sk-test ".into();
+
+        assert_eq!(f.typed_key(), Some("sk-test"));
+        let json = serde_json::to_string(&f.to_settings()).unwrap();
+        assert!(!json.contains("sk-test"), "{json}");
     }
 
     #[test]
@@ -532,7 +557,11 @@ mod tests {
         assert!(f.is_changed_from(&stored));
         f.new_word = "  ".into();
         assert!(!f.is_changed_from(&stored));
-        f.speech_source = SpeechSource::LocalAiApp { model: "m".into() };
+        f.new_key = "sk-test".into();
+        assert!(f.is_changed_from(&stored));
+        f.new_key = " ".into();
+        assert!(!f.is_changed_from(&stored));
+        f.speech.model = "whisper-1".into();
         assert!(f.is_changed_from(&stored));
     }
 }

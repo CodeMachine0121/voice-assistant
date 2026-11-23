@@ -3,7 +3,7 @@
 **Project:** Voice Assistant (Mac voice dictation)
 **Bounded Context:** Dictation
 **Maintainer:** Project owner
-**Last Updated:** 2026-11-22
+**Last Updated:** 2026-11-23
 
 ---
 
@@ -30,6 +30,9 @@
 | Selection | TBD | Selected text | The text highlighted in the front app when Edit selection finishes. Material to work on, never instructions. | Confirmed |
 | Local AI App | TBD | Local AI app | The user's own AI app on this Mac (LM Studio) that serves the speech model and the writing assistant model at one address. | Confirmed |
 | Tap | TBD | Tap | A modifier-only shortcut pressed and released with no other key in between. | Confirmed |
+| Speech Provider | TBD | Provider | The online service that runs the speech model. Only OpenAI is offered, and it is the default. Replaces the on-device speech model and speech models served by the local AI app. | Confirmed |
+| OpenAI Speech Model | TBD | Speech model | The OpenAI model that turns a recording into a raw transcript. Chosen from gpt-4o-transcribe (default), gpt-4o-mini-transcribe, whisper-1; a model saved earlier stays on offer. | Confirmed |
+| OpenAI Key | TBD | OpenAI key | The user's secret key for OpenAI. Kept in the Mac's secure password storage, never in saved settings or logs. Falls back to a key already set up on the Mac for other tools. | Confirmed |
 
 ---
 

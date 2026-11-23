@@ -1,15 +1,15 @@
 # Voice Assistant
 
-Private, on-device voice dictation for macOS. Hold a shortcut, speak, and release; cleaned-up text appears at your cursor in any app.
+Voice dictation for macOS. Tap a shortcut, speak, and tap it again; cleaned-up text appears at your cursor in any app.
 
-- Speech recognition runs locally with whisper.cpp (Metal).
-- Cleanup (removing filler words, applying self-corrections, adding punctuation and lists, using your personal dictionary) is done by **your own** model served by [LM Studio](https://lmstudio.ai).
-- Nothing leaves your Mac.
+- Speech recognition runs on OpenAI (`gpt-4o-transcribe` by default; `gpt-4o-mini-transcribe` and `whisper-1` can be chosen in Settings). **Recordings are sent to OpenAI** and billed to your OpenAI account.
+- Cleanup, translation and Edit selection (removing filler words, applying self-corrections, adding punctuation and lists, using your personal dictionary) are done by **your own** model served by [LM Studio](https://lmstudio.ai). Selected text and heard words stay on your Mac.
 
 ## Requirements
 
 - macOS 13+ on Apple silicon
-- Rust (stable), Xcode Command Line Tools, CMake (`brew install cmake`)
+- Rust (stable), Xcode Command Line Tools
+- An OpenAI API key
 - LM Studio with a chat/instruct model loaded and the local server started (default `http://localhost:1234/v1`)
 
 ## Build & run
@@ -24,7 +24,7 @@ Run `make help` to list every target.
 
 On first launch:
 
-1. Open **Settings…** from the menu-bar icon and click **Download default model** (whisper `ggml-small`, about 470 MB, stored in `~/Library/Application Support/VoiceAssistant/models/`).
+1. Open **Settings…** from the menu-bar icon and enter your **OpenAI key** under *AI models* (it is kept in your login Keychain, never in the settings file). If no key is saved there, the `OPENAI_API_KEY` environment variable is used — but only when the app is started from a terminal (for example `make run`); an app opened from Finder or the Dock does not see your shell's variables, so saving the key in Settings is the way to go. macOS may ask to allow Keychain access, again after rebuilds that are signed ad hoc. A speech model downloaded by an earlier version (`~/Library/Application Support/VoiceAssistant/models/`) is no longer used and can be deleted.
 2. Grant **Microphone**, **Accessibility** and **Input Monitoring** access when asked. You can also use the buttons in Settings. Builds are signed ad hoc by default, which means permissions must be granted again after every rebuild. To keep them, create a self-signed code-signing certificate in Keychain Access and put `CODESIGN_IDENTITY := <certificate name>` in a git-ignored `.make.local` file (or pass `CODESIGN_IDENTITY="<certificate name>"` to every `make build` / `make install`).
 3. Pick your LM Studio model (or leave it empty to use whichever model is loaded).
 

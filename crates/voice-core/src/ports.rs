@@ -17,9 +17,19 @@ pub trait Recorder: Send {
 /// Why a recording could not be turned into words.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscribeError {
-    /// The speech model runs elsewhere (the local AI app) and could not be reached.
+    /// The speech provider could not be reached: no connection, no answer in time,
+    /// or the provider reports trouble on its side.
     Unreachable(String),
-    /// The speech model was there but failed (e.g. model file missing or corrupt).
+    /// No key for the speech provider is available.
+    KeyMissing,
+    /// A key is kept for the speech provider, but it could not be read (e.g. access to
+    /// the Keychain was denied or it is locked).
+    KeyUnreadable,
+    /// The speech provider does not accept the key.
+    KeyRejected,
+    /// The speech provider refuses more requests for now (rate limit or no credit left).
+    LimitReached,
+    /// The speech provider answered, but refused the recording or gave nothing usable.
     Failed(String),
 }
 
@@ -27,8 +37,14 @@ impl fmt::Display for TranscribeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TranscribeError::Unreachable(reason) => {
-                write!(f, "speech model unreachable: {reason}")
+                write!(f, "speech provider unreachable: {reason}")
             }
+            TranscribeError::KeyMissing => write!(f, "no key for the speech provider"),
+            TranscribeError::KeyUnreadable => {
+                write!(f, "the speech provider key could not be read")
+            }
+            TranscribeError::KeyRejected => write!(f, "speech provider rejected the key"),
+            TranscribeError::LimitReached => write!(f, "speech provider limit reached"),
             TranscribeError::Failed(reason) => write!(f, "{reason}"),
         }
     }
@@ -83,4 +99,43 @@ pub trait SettingsStore: Send + Sync {
     /// Missing or unreadable storage yields `Settings::default()`.
     fn load(&self) -> Settings;
     fn save(&self, settings: &Settings) -> Result<(), String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcribe_errors_read_as_log_lines() {
+        let cases = [
+            (
+                TranscribeError::Unreachable("timed out".into()),
+                "speech provider unreachable: timed out",
+            ),
+            (
+                TranscribeError::KeyMissing,
+                "no key for the speech provider",
+            ),
+            (
+                TranscribeError::KeyUnreadable,
+                "the speech provider key could not be read",
+            ),
+            (
+                TranscribeError::KeyRejected,
+                "speech provider rejected the key",
+            ),
+            (
+                TranscribeError::LimitReached,
+                "speech provider limit reached",
+            ),
+            (
+                TranscribeError::Failed("unknown model".into()),
+                "unknown model",
+            ),
+        ];
+
+        for (error, line) in cases {
+            assert_eq!(error.to_string(), line);
+        }
+    }
 }
