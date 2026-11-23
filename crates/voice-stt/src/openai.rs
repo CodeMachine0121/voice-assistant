@@ -37,6 +37,8 @@ pub struct OpenAiTranscriber {
     model: String,
     key: Arc<OpenAiKey>,
     timeouts: OpenAiTimeouts,
+    /// Built once per set of time limits, so connections to OpenAI are reused.
+    agent: ureq::Agent,
 }
 
 impl OpenAiTranscriber {
@@ -48,6 +50,7 @@ impl OpenAiTranscriber {
             model,
             key,
             timeouts: OPENAI_TIMEOUTS,
+            agent: agent(OPENAI_TIMEOUTS),
         }
     }
 
@@ -60,6 +63,7 @@ impl OpenAiTranscriber {
     /// Overrides the time limits (default [`OPENAI_TIMEOUTS`]).
     pub fn with_timeouts(mut self, timeouts: OpenAiTimeouts) -> Self {
         self.timeouts = timeouts;
+        self.agent = agent(timeouts);
         self
     }
 
@@ -87,14 +91,8 @@ impl Transcriber for OpenAiTranscriber {
         }
         let key = self.key.current().ok_or(TranscribeError::KeyMissing)?;
         let form = self.form(recording, dictionary);
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_connect(Some(self.timeouts.connect))
-            .timeout_send_body(Some(self.timeouts.send_body))
-            .timeout_recv_response(Some(self.timeouts.answer))
-            .timeout_recv_body(Some(self.timeouts.answer))
-            .build()
-            .into();
-        let mut response = agent
+        let mut response = self
+            .agent
             .post(&format!("{}/audio/transcriptions", self.base_url))
             .header("Authorization", &format!("Bearer {key}"))
             .header("Content-Type", form.content_type())
@@ -113,6 +111,17 @@ impl Transcriber for OpenAiTranscriber {
             .ok_or_else(|| TranscribeError::Failed("OpenAI answer has no text".to_string()))?;
         Ok(clean_transcript(&[text]))
     }
+}
+
+/// An HTTP client that keeps connections open and enforces `timeouts`.
+fn agent(timeouts: OpenAiTimeouts) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(timeouts.connect))
+        .timeout_send_body(Some(timeouts.send_body))
+        .timeout_recv_response(Some(timeouts.answer))
+        .timeout_recv_body(Some(timeouts.answer))
+        .build()
+        .into()
 }
 
 /// 401 = key not accepted, 429 = rate limit or quota, other 4xx = this recording was
@@ -284,6 +293,20 @@ mod tests {
                 Some("Bearer sk-env".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn later_recordings_reuse_the_connection_to_openai() {
+        let fake = serve(200, r#"{"text":"hi"}"#, Duration::ZERO);
+        let t = transcriber(&fake);
+
+        t.transcribe(&half_second(), &no_dict()).expect("first");
+        t.transcribe(&half_second(), &no_dict()).expect("second");
+
+        let seen = fake.seen.lock().expect("lock").clone();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].peer.is_some());
+        assert_eq!(seen[0].peer, seen[1].peer, "one connection for both");
     }
 
     #[test]

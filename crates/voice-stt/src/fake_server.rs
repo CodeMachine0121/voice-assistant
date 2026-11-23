@@ -13,6 +13,8 @@ pub(crate) struct Seen {
     pub(crate) path: String,
     pub(crate) content_type: String,
     pub(crate) authorization: Option<String>,
+    /// The client's end of the connection: equal for requests sent over one connection.
+    pub(crate) peer: Option<std::net::SocketAddr>,
     pub(crate) body: Vec<u8>,
 }
 
@@ -48,6 +50,7 @@ pub(crate) fn serve(status: u16, body: &'static str, delay: Duration) -> Fake {
                 path: req.url().to_string(),
                 content_type,
                 authorization,
+                peer: req.remote_addr().copied(),
                 body: received,
             });
             thread::sleep(delay);
