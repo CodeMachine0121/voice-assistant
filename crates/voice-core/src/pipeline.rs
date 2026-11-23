@@ -87,50 +87,31 @@ impl DictationPipeline {
             return Outcome::problem_without_entry(Problem::NoSpeech);
         }
 
-        let dictionary = &settings.dictionary;
-        let (text, original, assistant_problem) = match action {
-            PreparedAction::Dictate if settings.cleanup_enabled => {
-                match self.ask(&WritingTask::CleanUp { heard: &heard }, dictionary) {
-                    Reply::Text(result) => (to_traditional(&result), None, None),
-                    Reply::Unusable => (heard.clone(), None, None),
-                    Reply::Unreachable => (
-                        heard.clone(),
-                        None,
-                        Some(Problem::AssistantUnreachable(Action::Dictate)),
-                    ),
-                }
+        let reply = action
+            .writing_task(&heard, settings.cleanup_enabled)
+            .map(|task| self.ask(&task, &settings.dictionary));
+        let (text, assistant_problem) = match (action, reply) {
+            (_, None) => (heard.clone(), None),
+            // The selection stays as it was: nothing to write, nothing to record.
+            (PreparedAction::EditSelection { .. }, Some(Reply::Unusable | Reply::Unreachable)) => {
+                return Outcome::problem_without_entry(Problem::AssistantUnreachable(
+                    Action::EditSelection,
+                ))
             }
-            PreparedAction::Dictate => (heard.clone(), None, None),
-            PreparedAction::DictateInEnglish => {
-                match self.ask(
-                    &WritingTask::TranslateToEnglish { heard: &heard },
-                    dictionary,
-                ) {
-                    Reply::Text(result) => (result, None, None),
-                    Reply::Unusable => (heard.clone(), None, None),
-                    Reply::Unreachable => (
-                        heard.clone(),
-                        None,
-                        Some(Problem::AssistantUnreachable(Action::DictateInEnglish)),
-                    ),
-                }
-            }
-            PreparedAction::EditSelection { selection } => {
-                let task = WritingTask::EditSelection {
-                    instruction: &heard,
-                    selection,
-                };
-                match self.ask(&task, dictionary) {
-                    // No Traditional conversion: the instruction may ask for Simplified.
-                    Reply::Text(result) => (result, Some(selection.clone()), None),
-                    // The selection stays as it was: nothing to write, nothing to record.
-                    Reply::Unusable | Reply::Unreachable => {
-                        return Outcome::problem_without_entry(Problem::AssistantUnreachable(
-                            Action::EditSelection,
-                        ))
-                    }
-                }
-            }
+            // Only Dictate keeps the speaker's language, so only it is forced to Traditional;
+            // an Edit instruction may ask for Simplified.
+            (PreparedAction::Dictate, Some(Reply::Text(result))) => (to_traditional(&result), None),
+            (_, Some(Reply::Text(result))) => (result, None),
+            // Writing at the cursor falls back to the heard words.
+            (_, Some(Reply::Unusable)) => (heard.clone(), None),
+            (_, Some(Reply::Unreachable)) => (
+                heard.clone(),
+                Some(Problem::AssistantUnreachable(action.action())),
+            ),
+        };
+        let original = match action {
+            PreparedAction::EditSelection { selection } => Some(selection.clone()),
+            _ => None,
         };
 
         // An accessibility problem matters more than skipped cleanup: the text did not land.

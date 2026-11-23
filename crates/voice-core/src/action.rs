@@ -79,6 +79,24 @@ impl PreparedAction {
             PreparedAction::EditSelection { .. } => Action::EditSelection,
         }
     }
+
+    /// What to ask the writing assistant for, given the `heard` words; `None` when the
+    /// heard words are written as they are (Dictate with AI cleanup turned off).
+    pub fn writing_task<'a>(
+        &'a self,
+        heard: &'a str,
+        cleanup_enabled: bool,
+    ) -> Option<WritingTask<'a>> {
+        match self {
+            PreparedAction::Dictate if !cleanup_enabled => None,
+            PreparedAction::Dictate => Some(WritingTask::CleanUp { heard }),
+            PreparedAction::DictateInEnglish => Some(WritingTask::TranslateToEnglish { heard }),
+            PreparedAction::EditSelection { selection } => Some(WritingTask::EditSelection {
+                instruction: heard,
+                selection,
+            }),
+        }
+    }
 }
 
 /// What the writing assistant must do. Heard words and selected text are material to work
@@ -220,5 +238,47 @@ mod tests {
             Action::DictateInEnglish
         );
         assert_eq!(edit.action(), Action::EditSelection);
+    }
+
+    #[test]
+    fn dictate_asks_for_cleanup_only_when_it_is_on() {
+        let dictate = PreparedAction::Dictate;
+
+        assert_eq!(
+            dictate.writing_task("嗯 我們開會", true),
+            Some(WritingTask::CleanUp {
+                heard: "嗯 我們開會"
+            })
+        );
+        assert_eq!(dictate.writing_task("嗯 我們開會", false), None);
+    }
+
+    #[test]
+    fn english_always_asks_for_a_translation() {
+        for cleanup_enabled in [true, false] {
+            assert_eq!(
+                PreparedAction::DictateInEnglish.writing_task("我們開會", cleanup_enabled),
+                Some(WritingTask::TranslateToEnglish {
+                    heard: "我們開會"
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn edit_selection_always_applies_the_heard_instruction_to_the_selection() {
+        let edit = PreparedAction::EditSelection {
+            selection: "我們明天開會".to_string(),
+        };
+
+        for cleanup_enabled in [true, false] {
+            assert_eq!(
+                edit.writing_task("translate to English", cleanup_enabled),
+                Some(WritingTask::EditSelection {
+                    instruction: "translate to English",
+                    selection: "我們明天開會",
+                })
+            );
+        }
     }
 }
