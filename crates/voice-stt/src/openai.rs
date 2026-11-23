@@ -403,10 +403,11 @@ mod tests {
         use std::io::{Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        // Two minutes of audio are ~3.8 MB: far more than socket buffers hold, so the
-        // upload lasts as long as the server takes to read it (~2.4 s here), then it
-        // answers at once.
-        let two_minutes = Recording::new(vec![0.1; 16_000 * 120]);
+        // Five minutes of audio are ~9.6 MB. The server reads the first megabyte slowly
+        // (~2 s), which holds up the upload, then drains the rest at once and answers right
+        // away. The client therefore waits for the answer only briefly, however much the
+        // socket buffers hold, while the upload as a whole outlasts the answer limit.
+        let five_minutes = Recording::new(vec![0.1; 16_000 * 300]);
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut chunk = vec![0u8; 64 * 1024];
@@ -416,7 +417,9 @@ mod tests {
                         Ok(0) | Err(_) => return,
                         Ok(n) => received.extend_from_slice(&chunk[..n]),
                     }
-                    std::thread::sleep(Duration::from_millis(40));
+                    if received.len() < 1024 * 1024 {
+                        std::thread::sleep(Duration::from_millis(125));
+                    }
                 }
                 let body = r#"{"text":"long talk"}"#;
                 let _ = write!(
@@ -430,12 +433,12 @@ mod tests {
 
         let out = OpenAiTranscriber::new("m".into(), key("sk-test"))
             .with_base_url(&format!("http://127.0.0.1:{port}/v1"))
-            .with_timeouts(answer_within(Duration::from_millis(1_500)))
-            .transcribe(&two_minutes, &no_dict());
+            .with_timeouts(answer_within(Duration::from_millis(1_000)))
+            .transcribe(&five_minutes, &no_dict());
 
         assert_eq!(out, Ok("long talk".to_string()));
         assert!(
-            started.elapsed() > Duration::from_millis(1_500),
+            started.elapsed() > Duration::from_millis(1_000),
             "the upload must outlast the answer limit for this test to mean anything"
         );
     }
