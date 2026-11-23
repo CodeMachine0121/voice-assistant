@@ -102,6 +102,10 @@ pub struct Services {
     pub speech_key: Arc<OpenAiKey>,
     pub permissions: Permissions,
     pub save_settings: SettingsSaveFn,
+    /// Makes the app the active app so its windows can come to the front. The app
+    /// lives in the menu bar only, and macOS does not activate such an app by itself.
+    /// Called on the UI thread.
+    pub bring_to_front: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// Environment variable that switches the app to demo mode.

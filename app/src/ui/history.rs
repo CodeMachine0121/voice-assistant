@@ -1,10 +1,11 @@
 //! The History window.
+use crate::focus::FocusRequest;
 use crate::history_view::{rows, EMPTY_TEXT};
-use crate::ui::action_colour;
+use crate::ui::{action_colour, keep_focusing};
 use eframe::egui::{
-    self, Color32, CornerRadius, Frame, Margin, RichText, ScrollArea, ViewportBuilder,
-    ViewportCommand, ViewportId,
+    self, Color32, CornerRadius, Frame, Margin, RichText, ScrollArea, ViewportBuilder, ViewportId,
 };
+use std::time::Instant;
 use voice_core::{Action, History};
 
 pub fn id() -> ViewportId {
@@ -12,7 +13,12 @@ pub fn id() -> ViewportId {
 }
 
 /// Draws the window; returns `true` when the user closed it.
-pub fn show(ctx: &egui::Context, history: &History) -> bool {
+pub fn show(
+    ctx: &egui::Context,
+    history: &History,
+    focus: &mut FocusRequest,
+    now: Instant,
+) -> bool {
     let builder = ViewportBuilder::default()
         .with_title("Dictation History")
         .with_inner_size([520.0, 560.0])
@@ -22,13 +28,10 @@ pub fn show(ctx: &egui::Context, history: &History) -> bool {
         if ui.ctx().input(|i| i.viewport().close_requested()) {
             closed = true;
         }
+        keep_focusing(ui.ctx(), focus, now);
         egui::CentralPanel::default().show(ui, |ui| draw(ui, history));
     });
     closed
-}
-
-pub fn focus(ctx: &egui::Context) {
-    ctx.send_viewport_cmd_to(id(), ViewportCommand::Focus);
 }
 
 fn draw(ui: &mut egui::Ui, history: &History) {

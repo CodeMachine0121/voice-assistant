@@ -322,6 +322,7 @@ pub fn build() -> Services {
         list_models: Arc::new(voice_polish::list_models),
         speech_key,
         permissions: mac_permissions(shortcuts),
+        bring_to_front: Arc::new(voice_macos::activate_app),
     }
 }
 

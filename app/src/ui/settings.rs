@@ -1,4 +1,5 @@
 //! The Settings window.
+use crate::focus::FocusRequest;
 use crate::model::{Notice, SettingsSession};
 use crate::permissions_view::{self, Access};
 use crate::settings_form::{
@@ -6,11 +7,11 @@ use crate::settings_form::{
 };
 use crate::shortcut_names::{caps_text, friendly_name, key_caps, ALL_SHORTCUTS};
 use crate::tasks::ModelsState;
-use crate::ui::{OK_COLOUR, PROBLEM_COLOUR};
+use crate::ui::{keep_focusing, OK_COLOUR, PROBLEM_COLOUR};
 use crate::wiring::Services;
 use eframe::egui::{
     self, ComboBox, CornerRadius, Frame, Grid, Margin, RichText, ScrollArea, TextEdit,
-    ViewportBuilder, ViewportCommand, ViewportId,
+    ViewportBuilder, ViewportId,
 };
 use std::time::{Duration, Instant};
 use voice_core::{Action, Shortcut, SpeechProvider};
@@ -21,7 +22,13 @@ pub fn id() -> ViewportId {
 }
 
 /// Draws the window; returns `true` when the user closed it.
-pub fn show(ctx: &egui::Context, session: &mut SettingsSession, services: &Services) -> bool {
+pub fn show(
+    ctx: &egui::Context,
+    session: &mut SettingsSession,
+    services: &Services,
+    focus: &mut FocusRequest,
+    now: Instant,
+) -> bool {
     let builder = ViewportBuilder::default()
         .with_title("Voice Assistant Settings")
         .with_inner_size([560.0, 720.0])
@@ -31,16 +38,13 @@ pub fn show(ctx: &egui::Context, session: &mut SettingsSession, services: &Servi
         if ui.ctx().input(|i| i.viewport().close_requested()) {
             closed = true;
         }
+        keep_focusing(ui.ctx(), focus, now);
         session.drain_tasks();
         egui::CentralPanel::default().show(ui, |ui| draw(ui, session, services));
         // Permission status changes outside the app; look again now and then.
         ui.ctx().request_repaint_after(Duration::from_secs(1));
     });
     closed
-}
-
-pub fn focus(ctx: &egui::Context) {
-    ctx.send_viewport_cmd_to(id(), ViewportCommand::Focus);
 }
 
 fn draw(ui: &mut egui::Ui, session: &mut SettingsSession, services: &Services) {

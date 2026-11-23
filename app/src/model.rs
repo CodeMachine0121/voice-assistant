@@ -1,4 +1,5 @@
 //! State of the running app, apart from how it is drawn.
+use crate::focus::FocusRequest;
 use crate::indicator::IndicatorState;
 use crate::permissions_view::PermissionSnapshot;
 use crate::settings_form::SettingsForm;
@@ -144,6 +145,10 @@ pub struct AppModel {
     pub history: History,
     pub history_open: bool,
     pub settings: Option<SettingsSession>,
+    /// The Settings window should come to the front.
+    pub settings_focus: FocusRequest,
+    /// The History window should come to the front.
+    pub history_focus: FocusRequest,
     pub quit_requested: bool,
 }
 
@@ -154,6 +159,8 @@ impl AppModel {
             history: History::default(),
             history_open: false,
             settings: None,
+            settings_focus: FocusRequest::default(),
+            history_focus: FocusRequest::default(),
             quit_requested: false,
         }
     }
@@ -170,16 +177,22 @@ impl AppModel {
         }
     }
 
-    pub fn handle_command(&mut self, command: TrayCommand, services: &Services) {
+    /// Opening a window also brings it to the front with keyboard focus, whether it
+    /// is new or already open behind other apps' windows.
+    pub fn handle_command(&mut self, command: TrayCommand, services: &Services, now: Instant) {
         match command {
             TrayCommand::Settings => {
                 if self.settings.is_none() {
                     self.settings = Some(SettingsSession::open(services));
                 }
+                (services.bring_to_front)();
+                self.settings_focus.request(now);
             }
             TrayCommand::History => {
                 self.history = services.history_store.load();
                 self.history_open = true;
+                (services.bring_to_front)();
+                self.history_focus.request(now);
             }
             TrayCommand::Quit => self.quit_requested = true,
         }
@@ -187,10 +200,12 @@ impl AppModel {
 
     pub fn close_settings(&mut self) {
         self.settings = None;
+        self.settings_focus.cancel();
     }
 
     pub fn close_history(&mut self) {
         self.history_open = false;
+        self.history_focus.cancel();
     }
 }
 
@@ -327,7 +342,7 @@ mod tests {
         let (services, _probe) = test_services();
         let mut model = AppModel::new(Instant::now());
         store_history(&services, &["a", "b"]);
-        model.handle_command(TrayCommand::History, &services);
+        model.handle_command(TrayCommand::History, &services, Instant::now());
         assert!(model.history_open);
         assert_eq!(model.history.entries().len(), 2);
         model.close_history();
@@ -338,9 +353,9 @@ mod tests {
     fn settings_command_opens_once() {
         let (services, _probe) = test_services();
         let mut model = AppModel::new(Instant::now());
-        model.handle_command(TrayCommand::Settings, &services);
+        model.handle_command(TrayCommand::Settings, &services, Instant::now());
         model.settings.as_mut().unwrap().form.assistant_model = "edited".into();
-        model.handle_command(TrayCommand::Settings, &services);
+        model.handle_command(TrayCommand::Settings, &services, Instant::now());
         assert_eq!(
             model.settings.as_ref().unwrap().form.assistant_model,
             "edited"
@@ -350,11 +365,76 @@ mod tests {
     }
 
     #[test]
+    fn opening_settings_brings_it_to_the_front() {
+        let (services, probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+        model.handle_command(TrayCommand::Settings, &services, now);
+        assert_eq!(probe.times_brought_to_front(), 1);
+        assert!(model.settings_focus.poll(false, now));
+        assert!(!model.history_focus.poll(false, now));
+    }
+
+    #[test]
+    fn choosing_settings_again_brings_the_open_window_back_to_the_front() {
+        let (services, probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+        model.handle_command(TrayCommand::Settings, &services, now);
+        assert!(
+            !model.settings_focus.poll(true, now),
+            "focused: request done"
+        );
+
+        model.handle_command(TrayCommand::Settings, &services, now);
+
+        assert_eq!(probe.times_brought_to_front(), 2);
+        assert!(model.settings_focus.poll(false, now));
+    }
+
+    #[test]
+    fn opening_history_brings_it_to_the_front_every_time() {
+        let (services, probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+        model.handle_command(TrayCommand::History, &services, now);
+        assert!(model.history_focus.poll(false, now));
+        assert!(!model.history_focus.poll(true, now));
+
+        model.handle_command(TrayCommand::History, &services, now);
+
+        assert_eq!(probe.times_brought_to_front(), 2);
+        assert!(model.history_focus.poll(false, now));
+        assert!(!model.settings_focus.poll(false, now));
+    }
+
+    #[test]
+    fn closing_a_window_stops_asking_for_focus() {
+        let (services, _probe) = test_services();
+        let now = Instant::now();
+        let mut model = AppModel::new(now);
+        model.handle_command(TrayCommand::Settings, &services, now);
+        model.handle_command(TrayCommand::History, &services, now);
+        model.close_settings();
+        model.close_history();
+        assert!(!model.settings_focus.poll(false, now));
+        assert!(!model.history_focus.poll(false, now));
+    }
+
+    #[test]
+    fn quitting_does_not_bring_the_app_to_the_front() {
+        let (services, probe) = test_services();
+        let mut model = AppModel::new(Instant::now());
+        model.handle_command(TrayCommand::Quit, &services, Instant::now());
+        assert_eq!(probe.times_brought_to_front(), 0);
+    }
+
+    #[test]
     fn quit_command_requests_quit() {
         let (services, _probe) = test_services();
         let mut model = AppModel::new(Instant::now());
         assert!(!model.quit_requested);
-        model.handle_command(TrayCommand::Quit, &services);
+        model.handle_command(TrayCommand::Quit, &services, Instant::now());
         assert!(model.quit_requested);
     }
 

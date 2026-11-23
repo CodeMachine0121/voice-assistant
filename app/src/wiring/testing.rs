@@ -73,9 +73,15 @@ pub struct Probe {
     status_tx: Sender<Status>,
     applied: Arc<Mutex<Vec<Settings>>>,
     secret: Arc<FlakySecret>,
+    brought_to_front: Arc<Mutex<usize>>,
 }
 
 impl Probe {
+    /// How often the app asked to be made the active app.
+    pub fn times_brought_to_front(&self) -> usize {
+        *self.brought_to_front.lock().unwrap()
+    }
+
     /// What the secret store (the Keychain in the real app) holds.
     pub fn saved_key(&self) -> Option<String> {
         self.secret.secret.lock().unwrap().clone()
@@ -124,6 +130,8 @@ pub fn test_services() -> (Services, Probe) {
     let recorded = updates.clone();
     let secret = Arc::new(FlakySecret::default());
     let speech_key = Arc::new(OpenAiKey::with_environment(secret.clone(), || None));
+    let brought_to_front = Arc::new(Mutex::new(0));
+    let front = brought_to_front.clone();
     let services = Services {
         settings_store: settings.clone(),
         history_store: history,
@@ -150,6 +158,7 @@ pub fn test_services() -> (Services, Probe) {
             settings_tx,
             move |s: &Settings| recorded.lock().unwrap().push(s.clone()),
         ),
+        bring_to_front: Arc::new(move || *front.lock().unwrap() += 1),
     };
     (
         services,
@@ -159,6 +168,7 @@ pub fn test_services() -> (Services, Probe) {
             status_tx,
             applied: updates,
             secret,
+            brought_to_front,
         },
     )
 }
