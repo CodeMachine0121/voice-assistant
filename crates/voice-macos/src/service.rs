@@ -179,17 +179,16 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::time::Instant;
-    use voice_core::Shortcut;
+    use voice_core::{Action, ActionShortcuts, Shortcut};
 
     const WAIT: Duration = Duration::from_secs(5);
     const FAST: Duration = Duration::from_millis(10);
     const NEVER: Duration = Duration::from_secs(3600);
 
-    fn config(push_to_talk: Shortcut) -> ShortcutConfig {
-        ShortcutConfig {
-            push_to_talk,
-            hands_free: Shortcut::ControlOptionSpace,
-        }
+    fn config(dictate: Shortcut) -> ShortcutConfig {
+        let mut shortcuts = ActionShortcuts::default();
+        shortcuts.set(Action::Dictate, dictate);
+        ShortcutConfig { shortcuts }
     }
 
     /// Records what the supervisor does with the listeners it starts.
@@ -224,7 +223,7 @@ mod tests {
     }
 
     /// A `start` that refuses `refusals` times, then succeeds, sending
-    /// `PushToTalkDown` through the sink it was given.
+    /// a dictation tap through the sink it was given.
     fn start_after(
         refusals: usize,
         log: &Arc<Log>,
@@ -235,7 +234,7 @@ mod tests {
         move |config, sink| {
             log.attempts.lock().unwrap().push(config);
             if refusals_left == 0 {
-                let _ = sink.send(ShortcutEvent::PushToTalkDown);
+                let _ = sink.send(ShortcutEvent::ActionTapped(Action::Dictate));
                 Ok(FakeListener(Arc::clone(&log)))
             } else {
                 refusals_left -= 1;
@@ -248,7 +247,7 @@ mod tests {
         let log = Arc::new(Log::default());
         let (sink, _) = unbounded();
         let handle = ShortcutService::spawn_with(
-            config(Shortcut::RightOption),
+            config(Shortcut::TapRightOption),
             sink,
             start_after(refusals, &log),
             retry,
@@ -269,7 +268,7 @@ mod tests {
         let (handle, log) = spawn(0, NEVER);
 
         wait_until("listening", || handle.is_listening());
-        assert_eq!(log.attempts(), [config(Shortcut::RightOption)]);
+        assert_eq!(log.attempts(), [config(Shortcut::TapRightOption)]);
     }
 
     #[test]
@@ -309,13 +308,16 @@ mod tests {
         let (sink, events) = unbounded();
 
         let _handle = ShortcutService::spawn_with(
-            config(Shortcut::RightOption),
+            config(Shortcut::TapRightOption),
             sink,
             start_after(0, &log),
             NEVER,
         );
 
-        assert_eq!(events.recv_timeout(WAIT), Ok(ShortcutEvent::PushToTalkDown));
+        assert_eq!(
+            events.recv_timeout(WAIT),
+            Ok(ShortcutEvent::ActionTapped(Action::Dictate))
+        );
     }
 
     #[test]
@@ -323,10 +325,10 @@ mod tests {
         let (handle, log) = spawn(0, NEVER);
         wait_until("listening", || handle.is_listening());
 
-        handle.apply(config(Shortcut::Fn));
+        handle.apply(config(Shortcut::TapFn));
 
         wait_until("update", || !log.updates().is_empty());
-        assert_eq!(log.updates(), [config(Shortcut::Fn)]);
+        assert_eq!(log.updates(), [config(Shortcut::TapFn)]);
         assert_eq!(log.attempts().len(), 1);
     }
 
@@ -335,14 +337,14 @@ mod tests {
         let (handle, log) = spawn(1, NEVER);
         wait_until("first attempt", || log.attempts().len() == 1);
 
-        handle.apply(config(Shortcut::RightCommand));
+        handle.apply(config(Shortcut::TapRightCommand));
 
         wait_until("listening", || handle.is_listening());
         assert_eq!(
             log.attempts(),
             [
-                config(Shortcut::RightOption),
-                config(Shortcut::RightCommand)
+                config(Shortcut::TapRightOption),
+                config(Shortcut::TapRightCommand)
             ]
         );
         assert!(log.updates().is_empty());
@@ -352,11 +354,11 @@ mod tests {
     fn newest_config_survives_further_refusals() {
         let (handle, log) = spawn(2, FAST);
         wait_until("first attempt", || !log.attempts().is_empty());
-        handle.apply(config(Shortcut::Fn));
+        handle.apply(config(Shortcut::TapFn));
 
         wait_until("listening", || handle.is_listening());
 
-        assert_eq!(log.attempts().last(), Some(&config(Shortcut::Fn)));
+        assert_eq!(log.attempts().last(), Some(&config(Shortcut::TapFn)));
     }
 
     #[test]
@@ -398,8 +400,8 @@ mod tests {
     fn real_service_starts_and_stops_cleanly() {
         let (sink, events) = unbounded();
 
-        let handle = ShortcutService::spawn(config(Shortcut::RightOption), sink);
-        handle.apply(config(Shortcut::Fn));
+        let handle = ShortcutService::spawn(config(Shortcut::TapRightOption), sink);
+        handle.apply(config(Shortcut::TapFn));
         drop(handle);
 
         assert!(events.try_recv().is_err());
