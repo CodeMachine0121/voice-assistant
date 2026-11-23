@@ -253,7 +253,9 @@ fn neutralise_tags(text: &str) -> String {
     out
 }
 
-/// Whether the bytes after a `<` are `[/][spaces]name` for one of our tag names.
+/// Whether the bytes after a `<` are `[/][spaces]name` for one of our tag names, with the
+/// name ending there: followed by `>`, whitespace or `/` (so `<selectionStart>` or
+/// `<instructions>` are other words, not our tags).
 fn looks_like_tag(after: &[u8]) -> bool {
     let rest = after.strip_prefix(b"/").unwrap_or(after);
     let rest = &rest[rest
@@ -261,7 +263,9 @@ fn looks_like_tag(after: &[u8]) -> bool {
         .position(|b| !b.is_ascii_whitespace())
         .unwrap_or(rest.len())..];
     TAG_NAMES.iter().any(|name| {
-        rest.len() >= name.len() && rest[..name.len()].eq_ignore_ascii_case(name.as_bytes())
+        rest.len() > name.len()
+            && rest[..name.len()].eq_ignore_ascii_case(name.as_bytes())
+            && (matches!(rest[name.len()], b'>' | b'/') || rest[name.len()].is_ascii_whitespace())
     })
 }
 
@@ -498,6 +502,35 @@ mod tests {
             assert!(!out.contains('<'), "{raw} -> {out}");
             assert!(out.contains('‹'), "{raw} -> {out}");
         }
+    }
+
+    #[test]
+    fn self_closing_tags_are_neutralised() {
+        for raw in [
+            "a <selection/> b",
+            "a <INSTRUCTION /> b",
+            "a <transcript\n> b",
+        ] {
+            let out = neutralise_tags(raw);
+            assert!(!out.contains('<'), "{raw} -> {out}");
+        }
+    }
+
+    #[test]
+    fn longer_words_starting_with_a_tag_name_are_kept() {
+        for raw in [
+            "see <instructions> here",
+            "a <transcription> b",
+            "a <selectionStart> b",
+            "a </Selections> b",
+            "ends with <selection",
+        ] {
+            assert_eq!(neutralise_tags(raw), raw);
+        }
+        assert_eq!(
+            last(&edit("x", "<instructions>keep</instructions>")),
+            "<instruction>x</instruction>\n<selection><instructions>keep</instructions></selection>"
+        );
     }
 
     #[test]
